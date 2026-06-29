@@ -8,7 +8,7 @@ setup(
     description="Vulkan API facade for python.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/lleonart1984/vk_project",
+    url="https://github.com/rendervous/vk_project",
     packages=find_packages(where="src"),  # Look for packages in "src"
     package_dir={"": "src"},  # Map the root package directory to "src"
     # packages=find_packages(),             # Automatically find packages in your project

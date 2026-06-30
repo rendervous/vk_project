@@ -2,9 +2,9 @@ name: Build wheels
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [ "master" ]
   pull_request:
+    branches: [ "master" ]
 
 jobs:
   build_wheels:

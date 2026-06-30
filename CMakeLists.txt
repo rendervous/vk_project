@@ -35,10 +35,11 @@ find_package(pybind11 CONFIG REQUIRED)
 # ---------------------------------------------------------------------------
 
 if(DEFINED ENV{VULKAN_SDK} AND NOT Vulkan_ROOT)
-    set(Vulkan_ROOT "$ENV{VULKAN_SDK}" CACHE PATH "")
+set(Vulkan_ROOT "$ENV{VULKAN_SDK}" CACHE PATH "" FORCE)
 endif()
 
-find_package(Vulkan REQUIRED)
+# IMPORTANT: prefer CONFIG mode when SDK exists
+find_package(Vulkan REQUIRED CONFIG)
 
 # ---------------------------------------------------------------------------
 # Python extension module (IMPORT NAME = vk)

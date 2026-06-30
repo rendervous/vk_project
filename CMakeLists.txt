@@ -34,12 +34,15 @@ find_package(pybind11 CONFIG REQUIRED)
 # Vulkan (required for build, provided by CI)
 # ---------------------------------------------------------------------------
 
-if(DEFINED ENV{VULKAN_SDK} AND NOT Vulkan_ROOT)
-set(Vulkan_ROOT "$ENV{VULKAN_SDK}" CACHE PATH "" FORCE)
+if(DEFINED ENV{VULKAN_SDK})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
 
-# IMPORTANT: prefer CONFIG mode when SDK exists
-find_package(Vulkan REQUIRED CONFIG)
+find_package(Vulkan REQUIRED CONFIG QUIET)
+
+if(NOT Vulkan_FOUND)
+    find_package(Vulkan REQUIRED)
+endif()
 
 # ---------------------------------------------------------------------------
 # Python extension module (IMPORT NAME = vk)

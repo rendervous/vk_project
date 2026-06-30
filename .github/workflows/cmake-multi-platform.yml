@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "master" ]
   pull_request:
-    branches: [ "master" ]
 
 jobs:
   build_wheels:
@@ -30,15 +29,11 @@ jobs:
         env:
           CIBW_BUILD: "cp310-* cp311-* cp312-*"
           CIBW_SKIP: "pp* *musllinux*"
-          CIBW_ARCHS_LINUX: "x86_64"
-          CIBW_ARCHS_WINDOWS: "AMD64"
 
-          # Linux Vulkan deps
+          # IMPORTANT: Vulkan headers must exist in CI environment
           CIBW_BEFORE_ALL_LINUX: >
-            sudo apt-get update &&
-            sudo apt-get install -y libvulkan-dev
+            yum install -y vulkan-loader-devel || true
 
-          # Windows Vulkan SDK
           CIBW_BEFORE_ALL_WINDOWS: >
             choco install vulkan-sdk -y
 

@@ -6,7 +6,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "vk"
+name = "vulky"
 version = "0.0.1"
 description = "Minimal Vulkan Python wrapper"
 readme = "README.md"
@@ -15,4 +15,4 @@ dependencies = []
 
 [tool.scikit-build]
 cmake.minimum-version = "3.18"
-wheel.packages = ["vk"]
+wheel.packages = ["src/vk"]

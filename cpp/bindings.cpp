@@ -6,7 +6,7 @@
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(_vk, m) {
+PYBIND11_MODULE(vk, m) {
 	m.doc() = "Minimal Vulkan bindings";
 
 	py::enum_<MemoryLocation>(m, "MemoryLocation")

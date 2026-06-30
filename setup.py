@@ -2,9 +2,9 @@ from setuptools import setup, find_packages
 
 setup(
     name="vk",                # Replace with your library name
-    version="2.0.0",                       # Semantic versioning
+    version="0.0.1",                       # Semantic versioning
     author="Ludwic Leonard",
-    author_email="lleonart1984@gmail.com",
+    author_email="rendervous.project@gmail.com",
     description="Vulkan API facade for python.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",

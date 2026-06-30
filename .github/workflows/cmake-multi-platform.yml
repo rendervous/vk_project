@@ -51,6 +51,11 @@ jobs:
       run: |
         python -m pip install pybind11
 
+    - name: Install Vulkan
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libvulkan-dev
+
     - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
       id: strings

@@ -29,42 +29,24 @@ jobs:
         run: python -m pip install --upgrade pip cibuildwheel
 
       # ----------------------------------------------------------------------
-      # Linux dependencies (system Vulkan headers)
-      # ----------------------------------------------------------------------
-      - name: Install Vulkan (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvulkan-dev
-
-      # ----------------------------------------------------------------------
-      # Windows Vulkan SDK (IMPORTANT: separate step + export env)
-      # ----------------------------------------------------------------------
-      - name: Install Vulkan SDK (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          choco install vulkan-sdk -y
-
-          # Find installed SDK directory
-          $sdk = Get-ChildItem "C:\VulkanSDK" |
-                 Sort-Object Name -Descending |
-                 Select-Object -First 1
-
-          echo "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "CMAKE_PREFIX_PATH=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          Write-Host "VULKAN_SDK set to $($sdk.FullName)"
-
-      # ----------------------------------------------------------------------
-      # Build wheels
+      # Linux Vulkan dependencies (inside manylinux container)
       # ----------------------------------------------------------------------
       - name: Build wheels
         env:
           CIBW_BUILD: "cp310-* cp311-* cp312-*"
           CIBW_SKIP: "pp* *musllinux*"
 
-          # IMPORTANT: avoid 32-bit Windows builds (Vulkan SDK is 64-bit only)
+          # IMPORTANT: Vulkan headers for Linux builds
+          CIBW_BEFORE_ALL_LINUX: >
+            yum install -y vulkan-loader-devel vulkan-headers || true
+
+          # IMPORTANT: Windows Vulkan SDK install + environment setup
+          CIBW_BEFORE_ALL_WINDOWS: >
+            choco install vulkan-sdk -y &&
+            for /d %%D in (C:\VulkanSDK\*) do set VULKAN_SDK=%%D &&
+            echo VULKAN_SDK=%VULKAN_SDK%
+
+          # IMPORTANT: Vulkan SDK is 64-bit only
           CIBW_ARCHS_WINDOWS: AMD64
 
         run: python -m cibuildwheel --output-dir wheelhouse

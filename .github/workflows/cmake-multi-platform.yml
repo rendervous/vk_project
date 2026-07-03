@@ -41,9 +41,9 @@ jobs:
 
           # ---------------- CRITICAL FIX ----------------
           # Windows Vulkan SDK passed into build environment
-          CIBW_ENVIRONMENT_WINDOWS: >
-            VULKAN_SDK=C:\VulkanSDK\1.4.350.0;
-            CMAKE_PREFIX_PATH=C:\VulkanSDK\1.4.350.0
+          CIBW_ENVIRONMENT_WINDOWS: |
+            VULKAN_SDK=${{ env.VULKAN_SDK }}
+            CMAKE_PREFIX_PATH=${{ env.VULKAN_SDK }}
 
         run: python -m cibuildwheel --output-dir wheelhouse
 

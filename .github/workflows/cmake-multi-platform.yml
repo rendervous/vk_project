@@ -17,9 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ----------------------------------------------------------------------
-      # Python + cibuildwheel
-      # ----------------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -38,33 +35,18 @@ jobs:
 
           CIBW_ARCHS_WINDOWS: AMD64
 
-          # Linux dependencies
+          # Linux Vulkan
           CIBW_BEFORE_ALL_LINUX: >
             yum install -y vulkan-loader-devel vulkan-headers || true
 
+          # ---------------- CRITICAL FIX ----------------
+          # Windows Vulkan SDK passed into build environment
+          CIBW_ENVIRONMENT_WINDOWS: >
+            VULKAN_SDK=C:\VulkanSDK\1.4.350.0;
+            CMAKE_PREFIX_PATH=C:\VulkanSDK\1.4.350.0
+
         run: python -m cibuildwheel --output-dir wheelhouse
 
-      # ----------------------------------------------------------------------
-      # Windows Vulkan SDK (REQUIRED FIX)
-      # ----------------------------------------------------------------------
-      - name: Install Vulkan SDK (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          choco install vulkan-sdk -y
-
-          $sdk = Get-ChildItem "C:\VulkanSDK" |
-                 Sort-Object Name -Descending |
-                 Select-Object -First 1
-
-          echo "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "CMAKE_PREFIX_PATH=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          Write-Host "VULKAN_SDK=$($sdk.FullName)"
-
-      # ----------------------------------------------------------------------
-      # Upload wheels
-      # ----------------------------------------------------------------------
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

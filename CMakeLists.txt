@@ -6,15 +6,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Python
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
-# ---------------------------------------------------------------------------
-# pybind11 (pip environment)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# pybind11 (installed in the active Python environment)
+# -----------------------------------------------------------------------------
 
 if(NOT pybind11_DIR)
     execute_process(
@@ -23,6 +23,7 @@ if(NOT pybind11_DIR)
             OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_QUIET
     )
+
     if(_pybind11_cmake_dir)
         list(PREPEND CMAKE_PREFIX_PATH "${_pybind11_cmake_dir}")
     endif()
@@ -30,23 +31,21 @@ endif()
 
 find_package(pybind11 CONFIG REQUIRED)
 
-# ---------------------------------------------------------------------------
-# Vulkan (required for build, provided by CI)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Vulkan
+# -----------------------------------------------------------------------------
 
-if(DEFINED ENV{VULKAN_SDK})
-    list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
+# On Windows, the Vulkan SDK normally sets VULKAN_SDK.
+# Help CMake locate the SDK if it is present.
+if(WIN32 AND DEFINED ENV{VULKAN_SDK})
+    set(Vulkan_ROOT "$ENV{VULKAN_SDK}" CACHE PATH "Vulkan SDK")
 endif()
 
-find_package(Vulkan REQUIRED CONFIG QUIET)
+find_package(Vulkan REQUIRED)
 
-if(NOT Vulkan_FOUND)
-    find_package(Vulkan REQUIRED)
-endif()
-
-# ---------------------------------------------------------------------------
-# Python extension module (IMPORT NAME = vk)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Python extension
+# -----------------------------------------------------------------------------
 
 pybind11_add_module(vk
         cpp/bindings.cpp
@@ -58,6 +57,11 @@ target_link_libraries(vk
         Vulkan::Vulkan
 )
 
+target_include_directories(vk
+        PRIVATE
+        ${Vulkan_INCLUDE_DIRS}
+)
+
 if(WIN32)
     target_compile_definitions(vk
             PRIVATE
@@ -66,9 +70,9 @@ if(WIN32)
     )
 endif()
 
-# ---------------------------------------------------------------------------
-# Install into Python package (CRITICAL FOR WHEELS)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Install into the Python package
+# -----------------------------------------------------------------------------
 
 install(TARGETS vk
         LIBRARY DESTINATION vk

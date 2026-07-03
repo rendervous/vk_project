@@ -39,6 +39,8 @@ find_package(pybind11 CONFIG REQUIRED)
 # Help CMake locate the SDK if it is present.
 if(WIN32 AND DEFINED ENV{VULKAN_SDK})
     set(Vulkan_ROOT "$ENV{VULKAN_SDK}" CACHE PATH "Vulkan SDK")
+elseif(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_sdk/Include/vulkan/vulkan.h")
+    set(Vulkan_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_sdk" CACHE PATH "Vulkan SDK")
 endif()
 
 find_package(Vulkan REQUIRED)

@@ -47,8 +47,9 @@ jobs:
             yum install -y vulkan-loader-devel vulkan-headers || true
 
           CIBW_ENVIRONMENT_WINDOWS: |
-            VULKAN_SDK=${{ steps.vulkan.outputs.path }}
-            CMAKE_PREFIX_PATH=${{ steps.vulkan.outputs.path }}
+            VULKAN_SDK=${{ github.workspace }}/vulkan_sdk
+            Vulkan_ROOT=${{ github.workspace }}/vulkan_sdk
+            CMAKE_PREFIX_PATH=${{ github.workspace }}/vulkan_sdk
 
         run: python -m cibuildwheel --output-dir wheelhouse
 

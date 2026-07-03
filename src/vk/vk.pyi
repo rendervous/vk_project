@@ -3,7 +3,13 @@ import enum
 
 class MemoryLocation(enum.Enum):
     HOST = 0
+    """
+    The memory is efficiently read/write by the host application
+    """
     DEVICE = 1
+    """
+    The memory is efficiently read/write by the gpu programs.
+    """
 
 
 class ScalarType(enum.Enum):

@@ -40,13 +40,7 @@ jobs:
           CIBW_BEFORE_ALL_LINUX: >
             yum install -y vulkan-loader-devel vulkan-headers || true
 
-          # IMPORTANT: Windows Vulkan SDK install + environment setup
-          CIBW_BEFORE_ALL_WINDOWS: >
-            choco install vulkan-sdk -y &&
-            for /d %%D in (C:\VulkanSDK\*) do set VULKAN_SDK=%%D &&
-            echo VULKAN_SDK=%VULKAN_SDK%
-
-          # IMPORTANT: Vulkan SDK is 64-bit only
+          # IMPORTANT: only 64-bit Windows (Vulkan SDK is x64 only)
           CIBW_ARCHS_WINDOWS: AMD64
 
         run: python -m cibuildwheel --output-dir wheelhouse

@@ -1,6 +1,8 @@
 #include "device.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -13,17 +15,8 @@ namespace py = pybind11;
 
 #if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
 #include <windows.h>
-#endif
-
-#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR) && defined(__has_include)
-#if __has_include(<cuda_runtime_api.h>)
-#include <cuda_runtime_api.h>
-#define VK_HAS_CUDA_RUNTIME_HEADERS 1
 #else
-#define VK_HAS_CUDA_RUNTIME_HEADERS 0
-#endif
-#else
-#define VK_HAS_CUDA_RUNTIME_HEADERS 0
+#include <dlfcn.h>
 #endif
 
 namespace {
@@ -217,63 +210,30 @@ py::object export_dltensor_py(DLManagedTensor* managed) {
     });
 }
 
-#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR) && VK_HAS_CUDA_RUNTIME_HEADERS
-bool try_import_cuda_external_memory(HANDLE memory_handle, std::uint64_t allocation_size, std::uint64_t* external_ptr, void** ext_mem) {
-    if (!memory_handle || !external_ptr || !ext_mem) {
-        return false;
+using ExternalImportMemoryFn = ExternalImportFn;
+
+std::string interop_library_base_name(uint32_t vendor_id) {
+    switch (vendor_id) {
+        case 0x10DE: // NVIDIA
+            return "vulky_cuda_interop";
+        default:
+            return {};
     }
-
-    HMODULE cudart = LoadLibraryA("cudart64_130.dll");
-    if (!cudart) {
-        cudart = LoadLibraryA("cudart64_120.dll");
-    }
-    if (!cudart) {
-        return false;
-    }
-
-    using ImportFn = cudaError_t (*)(cudaExternalMemory_t*, const cudaExternalMemoryHandleDesc*);
-    using MapFn = cudaError_t (*)(void**, cudaExternalMemory_t, const cudaExternalMemoryBufferDesc*);
-    using DestroyFn = cudaError_t (*)(cudaExternalMemory_t);
-
-    auto import_fn = reinterpret_cast<ImportFn>(GetProcAddress(cudart, "cudaImportExternalMemory"));
-    auto map_fn = reinterpret_cast<MapFn>(GetProcAddress(cudart, "cudaExternalMemoryGetMappedBuffer"));
-    auto destroy_fn = reinterpret_cast<DestroyFn>(GetProcAddress(cudart, "cudaDestroyExternalMemory"));
-
-    if (!import_fn || !map_fn || !destroy_fn) {
-        FreeLibrary(cudart);
-        return false;
-    }
-
-    cudaExternalMemoryHandleDesc desc{};
-    desc.type = cudaExternalMemoryHandleTypeOpaqueWin32;
-    desc.handle.win32.handle = memory_handle;
-    desc.size = static_cast<unsigned long long>(allocation_size);
-
-    cudaExternalMemory_t imported = nullptr;
-    if (import_fn(&imported, &desc) != cudaSuccess) {
-        FreeLibrary(cudart);
-        return false;
-    }
-
-    cudaExternalMemoryBufferDesc buffer_desc{};
-    buffer_desc.offset = 0;
-    buffer_desc.size = static_cast<unsigned long long>(allocation_size);
-
-    void* cuda_buffer = nullptr;
-    if (map_fn(&cuda_buffer, imported, &buffer_desc) != cudaSuccess) {
-        (void)destroy_fn(imported);
-        FreeLibrary(cudart);
-        return false;
-    }
-
-    *cuda_ptr = reinterpret_cast<std::uint64_t>(cuda_buffer);
-    *ext_mem = imported;
-    *mapped_buffer = cuda_buffer;
-
-    // Keep cudart loaded for the lifetime of imported memory handles.
-    return true;
 }
+
+std::string interop_library_filename(std::string_view base_name) {
+#if defined(_WIN32)
+    return std::string(base_name) + ".dll";
+#else
+    return "lib" + std::string(base_name) + ".so";
 #endif
+}
+
+std::filesystem::path module_install_dir() {
+    py::gil_scoped_acquire acquire;
+    py::module_ module = py::module_::import("vk");
+    return std::filesystem::path(std::string(py::str(module.attr("__file__")))).parent_path();
+}
 
 uint32_t find_memory_type_index(
     const vk::PhysicalDeviceMemoryProperties& props,
@@ -319,6 +279,115 @@ vk::BufferUsageFlags full_buffer_usage_flags() {
 }
 
 } // namespace
+
+class ExternalInteropLibraryImpl {
+public:
+    explicit ExternalInteropLibraryImpl(std::string library_base_name) {
+        load(std::move(library_base_name));
+    }
+
+    ~ExternalInteropLibraryImpl() noexcept {
+        unload();
+    }
+
+    ExternalInteropLibraryImpl(const ExternalInteropLibraryImpl&) = delete;
+    ExternalInteropLibraryImpl& operator=(const ExternalInteropLibraryImpl&) = delete;
+    ExternalInteropLibraryImpl(ExternalInteropLibraryImpl&&) = delete;
+    ExternalInteropLibraryImpl& operator=(ExternalInteropLibraryImpl&&) = delete;
+
+    [[nodiscard]] bool loaded() const noexcept {
+        return try_import_memory_ != nullptr;
+    }
+
+    [[nodiscard]] ExternalImportMemoryFn try_import_memory_fn() const noexcept {
+        return try_import_memory_;
+    }
+
+private:
+#if defined(_WIN32)
+    using LibraryHandle = HMODULE;
+
+    static LibraryHandle open_library(const std::filesystem::path& path) {
+        return LoadLibraryW(path.c_str());
+    }
+
+    static void close_library(LibraryHandle handle) {
+        if (handle) {
+            FreeLibrary(handle);
+        }
+    }
+
+    static void* load_symbol(LibraryHandle handle, const char* name) {
+        return handle ? reinterpret_cast<void*>(GetProcAddress(handle, name)) : nullptr;
+    }
+#else
+    using LibraryHandle = void*;
+
+    static LibraryHandle open_library(const std::filesystem::path& path) {
+        return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+
+    static void close_library(LibraryHandle handle) {
+        if (handle) {
+            dlclose(handle);
+        }
+    }
+
+    static void* load_symbol(LibraryHandle handle, const char* name) {
+        return handle ? dlsym(handle, name) : nullptr;
+    }
+#endif
+
+    void load(std::string library_base_name) {
+        if (library_base_name.empty()) {
+            return;
+        }
+
+        const std::string filename = interop_library_filename(library_base_name);
+        std::vector<std::filesystem::path> candidates;
+        try {
+            const auto install_dir = module_install_dir();
+            candidates.push_back(install_dir / filename);
+            if (install_dir.has_parent_path()) {
+                candidates.push_back(install_dir.parent_path() / filename);
+            }
+        } catch (const py::error_already_set&) {
+            // If Python cannot resolve the module path, fall back to the loader search path.
+        }
+        candidates.push_back(std::filesystem::current_path() / filename);
+        candidates.push_back(std::filesystem::path(filename));
+
+        for (const auto& candidate : candidates) {
+            handle_ = open_library(candidate);
+            if (handle_) {
+                break;
+            }
+        }
+
+        if (!handle_) {
+            return;
+        }
+
+        auto symbol = load_symbol(handle_, "try_import_memory");
+        if (!symbol) {
+            unload();
+            return;
+        }
+
+        try_import_memory_ = reinterpret_cast<ExternalImportMemoryFn>(symbol);
+    }
+
+    void unload() noexcept {
+        if (handle_) {
+            close_library(handle_);
+            handle_ = nullptr;
+        }
+        try_import_memory_ = nullptr;
+    }
+
+    LibraryHandle handle_ = nullptr;
+    ExternalImportMemoryFn try_import_memory_ = nullptr;
+};
 
 std::shared_ptr<Device> Device::create_device(uint32_t device_index, bool enable_validation_layers) {
     auto dev = std::shared_ptr<Device>(new Device(device_index, enable_validation_layers));
@@ -747,6 +816,8 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     add_extension_if_supported(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
 #if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
     add_extension_if_supported("VK_KHR_external_memory_win32");
+#else
+    add_extension_if_supported("VK_KHR_external_memory_fd");
 #endif
 
     vk::PhysicalDeviceProperties2 properties2{};
@@ -1116,7 +1187,13 @@ MemorySlice::~MemorySlice() noexcept {
 MemoryManager::MemoryManager(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible):
       device_(device),
       memory_type_index_(memory_type_index),
-      host_visible_(host_visible){}
+      host_visible_(host_visible) {
+    const auto vendor_id = device_->physical_device().getProperties().vendorID;
+    interop_library_ = std::make_shared<ExternalInteropLibraryImpl>(interop_library_base_name(vendor_id));
+    try_import_memory_ = interop_library_ && interop_library_->loaded()
+        ? interop_library_->try_import_memory_fn()
+        : nullptr;
+}
 
 MemoryManager::~MemoryManager() noexcept = default;
 
@@ -1133,7 +1210,7 @@ std::shared_ptr<MemorySlice> MemoryManager::allocate(int size, int alignment) {
 
     int page_capacity = std::max(size, next_page_capacity_); // big data create their own page.
 
-    pages_.push_back(std::make_shared<MemoryPage>(device_, memory_type_index_, host_visible_, page_capacity));
+    pages_.push_back(std::make_shared<MemoryPage>(device_, memory_type_index_, host_visible_, page_capacity, try_import_memory_));
     if (next_page_capacity_ <= std::numeric_limits<int>::max() / 2) {
         next_page_capacity_ *= 2;
     }
@@ -1161,12 +1238,13 @@ std::uint64_t MemoryManager::device_to_external(std::uint64_t device_ptr) const 
     return 0;
 }
 
-MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible, int capacity)
+MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible, int capacity, ExternalImportFn try_import_memory)
     : device_(device),
       memory_type_index_(memory_type_index),
       host_visible_(host_visible),
       capacity_(capacity),
-      allocator_(std::make_unique<MemoryAllocator>(capacity)) {
+      allocator_(std::make_unique<MemoryAllocator>(capacity)),
+      try_import_memory_(try_import_memory) {
     if (capacity <= 0) {
         throw std::runtime_error("Page capacity must be positive");
     }
@@ -1174,8 +1252,10 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
     auto dev = device->vk_device();
 
     vk::ExternalMemoryBufferCreateInfo external_buffer_info{};
-#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
+#if defined(_WIN32)
     external_buffer_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32;
+#else
+    external_buffer_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
 #endif
 
     vk::BufferCreateInfo buffer_info(
@@ -1184,21 +1264,23 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
         full_buffer_usage_flags(),
         vk::SharingMode::eExclusive
     );
-#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
-    buffer_info.pNext = &external_buffer_info;
-#endif
+    if (!host_visible_) {
+        buffer_info.pNext = &external_buffer_info;
+    }
     buffer_ = dev.createBuffer(buffer_info);
 
     const vk::MemoryRequirements requirements = dev.getBufferMemoryRequirements(buffer_);
     vk::ExportMemoryAllocateInfo export_alloc_info{};
-#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
+#if defined(_WIN32)
     export_alloc_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32;
+#else
+    export_alloc_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
 #endif
 
     vk::MemoryAllocateInfo alloc_info(requirements.size, memory_type_index_);
-#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
-    alloc_info.pNext = &export_alloc_info;
-#endif
+    if (!host_visible_) {
+        alloc_info.pNext = &export_alloc_info;
+    }
     memory_ = dev.allocateMemory(alloc_info);
     dev.bindBufferMemory(buffer_, memory_, 0);
 
@@ -1210,97 +1292,40 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
     }
 
     if (host_visible_) {
-        external_ptr_ = reinterpret_cast<uint64_t>(dev.mapMemory(memory_, 0, VK_WHOLE_SIZE));
-    }
-    else {
-        // external (CUDA, ROCm, etc) interop is not wired yet; keep a stable 0 sentinel until enabled.
-        external_ptr_ = 0;
-
-#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
-        try {
-            auto get_memory_win32_handle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
-                vkGetDeviceProcAddr(static_cast<VkDevice>(dev), "vkGetMemoryWin32HandleKHR")
-            );
-            if (!get_memory_win32_handle) {
-                throw std::runtime_error("vkGetMemoryWin32HandleKHR is not available");
-            }
-
-            VkMemoryGetWin32HandleInfoKHR handle_info{};
-            handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
-            handle_info.memory = static_cast<VkDeviceMemory>(memory_);
-            handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-
-            HANDLE exported = nullptr;
-            if (get_memory_win32_handle(static_cast<VkDevice>(dev), &handle_info, &exported) != VK_SUCCESS) {
-                throw std::runtime_error("vkGetMemoryWin32HandleKHR failed");
-            }
-#if VK_HAS_CUDA_RUNTIME_HEADERS
-            if (!try_import_cuda_external_memory(exported, static_cast<std::uint64_t>(requirements.size), &external_ptr_, &external_memory_)) {
-                external_ptr_ = 0;
-                external_memory_ = nullptr;
-            }
-#endif
-            if (exported) {
-                CloseHandle(exported);
-            }
-        } catch (...) {
-            external_ptr_ = 0;
-            external_memory_ = nullptr;
-        }
-#endif
+        external_ptr_ = reinterpret_cast<std::uint64_t>(dev.mapMemory(memory_, 0, VK_WHOLE_SIZE));
+    } else if (try_import_memory_) {
+        external_ptr_ = try_import_memory_(dev, device->device_index(), static_cast<VkDeviceMemory>(memory_));
     }
 
-    int device_id = device->device_index();
-    if (host_visible_)
-        dl_device_ = {1, device_id}; // CPU memory
-    else if (external_ptr_)
-        // TODO: check wether is cuda, or amd, etc.
+    const int device_id = device->device_index();
+    if (host_visible_) {
+        dl_device_ = {1, device_id};
+    } else if (external_ptr_) {
         dl_device_ = {2, device_id};
-    else
+    } else {
         dl_device_ = {0, device_id};
+    }
 }
 
 MemoryPage::~MemoryPage() noexcept {
-    if (device_) {
-        auto dev = device_->vk_device();
-#if VK_HAS_CUDA_RUNTIME_HEADERS
-        HMODULE cudart = GetModuleHandleA("cudart64_130.dll");
-        if (!cudart) {
-            cudart = GetModuleHandleA("cudart64_120.dll");
-        }
-
-        using FreeFn = cudaError_t (*)(void*);
-        using DestroyFn = cudaError_t (*)(cudaExternalMemory_t);
-        auto free_fn = cudart ? reinterpret_cast<FreeFn>(GetProcAddress(cudart, "cudaFree")) : nullptr;
-        auto destroy_fn = cudart ? reinterpret_cast<DestroyFn>(GetProcAddress(cudart, "cudaDestroyExternalMemory")) : nullptr;
-
-        if (cuda_buffer_ptr_) {
-            if (free_fn) {
-                (void)free_fn(cuda_buffer_ptr_);
-            }
-            cuda_buffer_ptr_ = nullptr;
-        }
-        if (cuda_external_memory_) {
-            if (destroy_fn) {
-                (void)destroy_fn(reinterpret_cast<cudaExternalMemory_t>(cuda_external_memory_));
-            }
-            cuda_external_memory_ = nullptr;
-        }
-#endif
-        if (host_visible_) {
-            dev.unmapMemory(memory_);
-        }
-        if (buffer_) {
-            dev.destroyBuffer(buffer_);
-            buffer_ = vk::Buffer{};
-        }
-        if (memory_) {
-            dev.freeMemory(memory_);
-            memory_ = vk::DeviceMemory{};
-        }
-        device_ptr_ = 0;
-        external_ptr_ = 0;
+    if (!device_) {
+        return;
     }
+
+    auto dev = device_->vk_device();
+    if (host_visible_ && memory_) {
+        dev.unmapMemory(memory_);
+    }
+    if (buffer_) {
+        dev.destroyBuffer(buffer_);
+        buffer_ = vk::Buffer{};
+    }
+    if (memory_) {
+        dev.freeMemory(memory_);
+        memory_ = vk::DeviceMemory{};
+    }
+    device_ptr_ = 0;
+    external_ptr_ = 0;
 }
 
 bool MemoryPage::can_allocate(int size, int alignment) const {

@@ -12,6 +12,7 @@ namespace pybind11 { class object; }
 class MemoryPage;
 class MemorySlice;
 class MemoryManager;
+class ExternalInteropLibraryImpl;
 class MemoryAllocator;
 class Resource;
 class Buffer;
@@ -24,6 +25,8 @@ enum class MemoryLocation : int {
     HOST = 0,
     DEVICE = 1,
 };
+
+using ExternalImportFn = std::uint64_t (*)(vk::Device device, int device_index, VkDeviceMemory memory);
 
 enum class ScalarType : int {
     UNDEFINED = 0,
@@ -391,7 +394,7 @@ private:
     std::vector<std::vector<Range*>> bins_;
     std::unordered_map<int, int> allocations_;
 
-    int bin_for_size(int size) const;
+    [[nodiscard]] int bin_for_size(int size) const;
     void clear_bins();
     void rebuild_bins();
     void remove_node(Range* node) noexcept;
@@ -413,8 +416,8 @@ public:
 
     std::shared_ptr<MemorySlice> allocate(int size, int alignment);
 
-    std::uint64_t external_to_device(std::uint64_t external_ptr) const noexcept;
-    std::uint64_t device_to_external(std::uint64_t device_ptr) const noexcept;
+    [[nodiscard]] std::uint64_t external_to_device(std::uint64_t external_ptr) const noexcept;
+    [[nodiscard]] std::uint64_t device_to_external(std::uint64_t device_ptr) const noexcept;
 
 private:
     std::shared_ptr<Device> device_;
@@ -422,6 +425,8 @@ private:
     bool host_visible_ = false;
     int next_page_capacity_ = 1 << 30; // Start with 1 GiB pages.
     std::vector<std::shared_ptr<MemoryPage>> pages_;
+    std::shared_ptr<ExternalInteropLibraryImpl> interop_library_;
+    ExternalImportFn try_import_memory_ = nullptr;
 };
 
 /**
@@ -429,7 +434,7 @@ private:
  */
 class MemoryPage : public std::enable_shared_from_this<MemoryPage> {
 public:
-    MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible, int capacity);
+    MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible, int capacity, ExternalImportFn try_import_memory);
     ~MemoryPage() noexcept;
 
     MemoryPage(const MemoryPage&) = delete;
@@ -467,7 +472,7 @@ private:
     vk::DeviceMemory memory_{};
     std::uint64_t device_ptr_ = 0;
     std::uint64_t external_ptr_ = 0;
-    void* external_memory_ = nullptr;
     std::unique_ptr<MemoryAllocator> allocator_;
     DLDevice dl_device_;
+    ExternalImportFn try_import_memory_ = nullptr;
 };

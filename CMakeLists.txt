@@ -46,6 +46,72 @@ endif()
 find_package(Vulkan REQUIRED)
 
 # -----------------------------------------------------------------------------
+# CUDA Interop Library (shared library)
+# -----------------------------------------------------------------------------
+
+add_library(vk_cuda_interop SHARED
+        cpp/vk_cuda_interop.cpp
+)
+
+target_link_libraries(vk_cuda_interop
+        PRIVATE
+        Vulkan::Vulkan
+)
+
+target_include_directories(vk_cuda_interop
+        PRIVATE
+        ${Vulkan_INCLUDE_DIRS}
+)
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(vk_cuda_interop PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
+if(WIN32)
+    target_compile_definitions(vk_cuda_interop
+            PRIVATE
+            VK_USE_PLATFORM_WIN32_KHR
+            NOMINMAX
+    )
+endif()
+
+# Set output directory for the library to be discoverable
+set_target_properties(vk_cuda_interop PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/vk_cuda_interop_lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/vk_cuda_interop_lib"
+)
+
+# Platform-specific naming
+if(WIN32)
+    set_target_properties(vk_cuda_interop PROPERTIES PREFIX "")
+    set_target_properties(vk_cuda_interop PROPERTIES SUFFIX ".dll")
+elseif(APPLE)
+    set_target_properties(vk_cuda_interop PROPERTIES PREFIX "lib")
+    set_target_properties(vk_cuda_interop PROPERTIES SUFFIX ".dylib")
+else()
+    set_target_properties(vk_cuda_interop PROPERTIES PREFIX "lib")
+    set_target_properties(vk_cuda_interop PROPERTIES SUFFIX ".so")
+endif()
+
+# Install the CUDA interop library to Vulkan bin folder
+if(WIN32)
+    install(TARGETS vk_cuda_interop
+            LIBRARY DESTINATION "${Vulkan_ROOT}/Bin"
+            RUNTIME DESTINATION "${Vulkan_ROOT}/Bin"
+    )
+else()
+    install(TARGETS vk_cuda_interop
+            LIBRARY DESTINATION "${Vulkan_ROOT}/lib"
+    )
+endif()
+
+# Also install to package for Python wheel
+install(TARGETS vk_cuda_interop
+        LIBRARY DESTINATION vk
+        RUNTIME DESTINATION vk
+)
+
+# -----------------------------------------------------------------------------
 # Python extension
 # -----------------------------------------------------------------------------
 
@@ -64,6 +130,10 @@ target_include_directories(vk
         ${Vulkan_INCLUDE_DIRS}
 )
 
+if(UNIX AND NOT APPLE)
+    target_link_libraries(vk PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 if(WIN32)
     target_compile_definitions(vk
             PRIVATE
@@ -71,6 +141,12 @@ if(WIN32)
             NOMINMAX
     )
 endif()
+
+# Add dependency so CUDA interop library is built before vk Python extension
+add_dependencies(vk vk_cuda_interop)
+
+# Note: vk_cuda_interop is a plugin that is dynamically loaded at runtime,
+# not linked at compile time. It will be discovered via the Vulkan SDK path or wheel package.
 
 # -----------------------------------------------------------------------------
 # Install into the Python package

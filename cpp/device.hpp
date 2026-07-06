@@ -434,6 +434,7 @@ private:
  */
 class MemoryPage : public std::enable_shared_from_this<MemoryPage> {
 public:
+
     MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible, int capacity, ExternalImportFn try_import_memory);
     ~MemoryPage() noexcept;
 

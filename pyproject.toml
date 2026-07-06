@@ -16,5 +16,5 @@ authors = [{name = "Ludwic Leonard Mendez", email = "lleonart1984@gmail.com"}]
 license = {text = "MIT"}  # or your license
 
 [tool.scikit-build]
-cmake.minimum-version = "3.18"
+cmake.minimum-version = ">=3.18"
 wheel.packages = ["src/vk"]

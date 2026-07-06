@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "vulky"
-version = "0.0.1"
+version = "0.0.2"
 description = "Minimal Vulkan Python wrapper"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -15,15 +15,28 @@ extern "C" {
 // The plugin exposes a C symbol with this signature.
 // It receives the Vulkan device handle and the device memory and should
 // return an external pointer (e.g., CUDA device pointer) or 0 on failure.
-uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory memory) {
+#ifdef _WIN32
+#  define PLUGIN_EXPORT extern "C" __declspec(dllexport)
+#else
+#  define PLUGIN_EXPORT extern "C"
+#endif
+
+PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory memory, unsigned long long size) {
+    printf("Importing memory...");
 #if defined(_WIN32)
     // Try to obtain the vkGetDeviceProcAddr function and then obtain
     // vkGetMemoryWin32HandleKHR dynamically. If anything fails, return 0.
     PFN_vkGetDeviceProcAddr pfnGetDeviceProcAddr = &vkGetDeviceProcAddr;
-    if (!pfnGetDeviceProcAddr) return 0;
+    if (!pfnGetDeviceProcAddr) {
+        printf("Failed to get vkGetDeviceProcAddr\n");
+        return 0;
+    }
 
     auto pfnGetMemoryWin32Handle = (PFN_vkGetMemoryWin32HandleKHR)pfnGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR");
-    if (!pfnGetMemoryWin32Handle) return 0;
+    if (!pfnGetMemoryWin32Handle) {
+        printf("Failed to get vkGetMemoryWin32HandleKHR\n");
+        return 0;
+    }
 
     VkMemoryGetWin32HandleInfoKHR handle_info{};
     handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
@@ -31,15 +44,22 @@ uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory mem
     handle_info.memory = memory;
 
     HANDLE h = NULL;
-    if (pfnGetMemoryWin32Handle(device, &handle_info, &h) != VK_SUCCESS) return 0;
+    if (pfnGetMemoryWin32Handle(device, &handle_info, &h) != VK_SUCCESS) {
+        printf("Failed to get Win32 handle for Vulkan memory\n");
+        return 0;
+    }
 
-    if (!h) return 0;
+    if (!h) {
+        printf("Win32 handle is NULL\n");
+        return 0;
+    }
 
     // Dynamically load CUDA runtime and import external memory.
-    HMODULE cudart = LoadLibraryA("cudart64_130.dll");
-    if (!cudart) cudart = LoadLibraryA("cudart64_120.dll");
+    HMODULE cudart = LoadLibraryA("cudart64_12.dll");
+    if (!cudart) cudart = LoadLibraryA("cudart64_110.dll");
     if (!cudart) {
         CloseHandle(h);
+        printf("Failed to load CUDA runtime library\n");
         return 0;
     }
 
@@ -54,24 +74,28 @@ uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory mem
     if (!import_fn || !map_fn || !destroy_fn) {
         FreeLibrary(cudart);
         CloseHandle(h);
+        printf("Failed to get CUDA import/map/destroy functions\n");
         return 0;
     }
 
     // Minimal opaque structs (we avoid including CUDA headers to keep build simple).
-    struct CUDAExternalMemoryHandleDesc {
+    struct CUDAExternalMemoryHandleDesc_Win32 {
         int type;
         void* handle;
+        const void *name;
         unsigned long long size;
+        unsigned int flags;
     } desc{};
     // Opaque: choose a sensible constant (PLATFORM DEPENDENT). If import fails, we return 0.
-    desc.type = 1; // opaque win32
+    desc.type = 2; // opaque win32
     desc.handle = h;
-    desc.size = 0; // unknown; driver may accept zero or ignore
+    desc.size = size; // unknown; driver may accept zero or ignore
 
     void* imported = nullptr;
     if (import_fn(&imported, &desc) != 0) {
         FreeLibrary(cudart);
         CloseHandle(h);
+        printf("Failed to import external memory into CUDA\n");
         return 0;
     }
 
@@ -81,7 +105,7 @@ uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory mem
         unsigned int flags;
     } bufdesc{};
     bufdesc.offset = 0;
-    bufdesc.size = 0; // whole allocation
+    bufdesc.size = size;
     bufdesc.flags = 0;
 
     void* mapped_buffer = nullptr;
@@ -89,6 +113,7 @@ uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory mem
         destroy_fn(imported);
         FreeLibrary(cudart);
         CloseHandle(h);
+        printf("Failed to map external memory buffer into CUDA\n");
         return 0;
     }
 
@@ -134,7 +159,7 @@ uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory mem
     } desc{};
     desc.type = 1; // opaque fd
     desc.fd = fd;
-    desc.size = 0;
+    desc.size = size;
 
     void* imported = nullptr;
     if (import_fn(&imported, &desc) != 0) { dlclose(libcudart); close(fd); return 0; }
@@ -145,7 +170,7 @@ uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory mem
         unsigned int flags;
     } bufdesc{};
     bufdesc.offset = 0;
-    bufdesc.size = 0;
+    bufdesc.size = size;
     bufdesc.flags = 0;
 
     void* mapped_buffer = nullptr;

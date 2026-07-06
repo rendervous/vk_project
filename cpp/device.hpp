@@ -26,7 +26,7 @@ enum class MemoryLocation : int {
     DEVICE = 1,
 };
 
-using ExternalImportFn = std::uint64_t (*)(vk::Device device, int device_index, VkDeviceMemory memory);
+using ExternalImportFn = std::uint64_t (*)(vk::Device device, int device_index, VkDeviceMemory memory, long long size);
 
 enum class ScalarType : int {
     UNDEFINED = 0,

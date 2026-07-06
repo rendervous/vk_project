@@ -215,7 +215,7 @@ using ExternalImportMemoryFn = ExternalImportFn;
 std::string interop_library_base_name(uint32_t vendor_id) {
     switch (vendor_id) {
         case 0x10DE: // NVIDIA
-            return "vulky_cuda_interop";
+            return "vk_cuda_interop";
         default:
             return {};
     }
@@ -340,6 +340,7 @@ private:
 
     void load(std::string library_base_name) {
         if (library_base_name.empty()) {
+            printf("[ERROR] Library name was empty");
             return;
         }
 
@@ -353,6 +354,7 @@ private:
             }
         } catch (const py::error_already_set&) {
             // If Python cannot resolve the module path, fall back to the loader search path.
+            printf("[ERROR] Module Install dir could not be resolved.");
         }
         candidates.push_back(std::filesystem::current_path() / filename);
         candidates.push_back(std::filesystem::path(filename));
@@ -365,11 +367,13 @@ private:
         }
 
         if (!handle_) {
+            printf("[ERROR] Library could not be opened for any of the possible folders.");
             return;
         }
 
         auto symbol = load_symbol(handle_, "try_import_memory");
         if (!symbol) {
+            printf("[ERROR] Could not be loaded symbol try_import_memory");
             unload();
             return;
         }
@@ -1171,7 +1175,7 @@ bool MemorySlice::host_visible() const noexcept { return page_ && page_->host_vi
 DLDevice MemorySlice::dl_device() const noexcept { return page_ ? page_->dl_device() : DLDevice{0, 0}; }
 
 void MemorySlice::release() noexcept {
-    printf("MemorySlice::release() called for offset %d, size %d\n", allocated_offset_, allocated_size_);
+    //printf("MemorySlice::release() called for offset %d, size %d\n", allocated_offset_, allocated_size_);
     if (page_) {
         page_->free_memory(allocated_offset_);
     }
@@ -1189,10 +1193,17 @@ MemoryManager::MemoryManager(std::shared_ptr<Device> device, uint32_t memory_typ
       memory_type_index_(memory_type_index),
       host_visible_(host_visible) {
     const auto vendor_id = device_->physical_device().getProperties().vendorID;
+    printf("[INFO] Loading interop library for vendor ID: 0x%04X\n", vendor_id);
     interop_library_ = std::make_shared<ExternalInteropLibraryImpl>(interop_library_base_name(vendor_id));
+    if (!interop_library_) {
+        printf("[WARNING] Library not found.");
+    }
     try_import_memory_ = interop_library_ && interop_library_->loaded()
         ? interop_library_->try_import_memory_fn()
         : nullptr;
+    if (!try_import_memory_) {
+        printf("[WARNING] try_import_memory could not be loaded.");
+    }
 }
 
 MemoryManager::~MemoryManager() noexcept = default;
@@ -1277,10 +1288,13 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
     export_alloc_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
 #endif
 
+    vk::MemoryAllocateFlagsInfo alloc_flags_info{};
+    alloc_flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
     vk::MemoryAllocateInfo alloc_info(requirements.size, memory_type_index_);
     if (!host_visible_) {
-        alloc_info.pNext = &export_alloc_info;
+        alloc_flags_info.pNext = &export_alloc_info;
     }
+    alloc_info.pNext = &alloc_flags_info;
     memory_ = dev.allocateMemory(alloc_info);
     dev.bindBufferMemory(buffer_, memory_, 0);
 
@@ -1294,7 +1308,7 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
     if (host_visible_) {
         external_ptr_ = reinterpret_cast<std::uint64_t>(dev.mapMemory(memory_, 0, VK_WHOLE_SIZE));
     } else if (try_import_memory_) {
-        external_ptr_ = try_import_memory_(dev, device->device_index(), static_cast<VkDeviceMemory>(memory_));
+        external_ptr_ = try_import_memory_(dev, device->device_index(), static_cast<VkDeviceMemory>(memory_), capacity_);
     }
 
     const int device_id = device->device_index();

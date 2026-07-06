@@ -1,6 +1,8 @@
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <cstdio>
+#include <iostream>
+#include <ostream>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -22,19 +24,19 @@ extern "C" {
 #endif
 
 PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDeviceMemory memory, unsigned long long size) {
-    printf("Importing memory...");
+    std::cout << "try_import_memory" << std::endl;
 #if defined(_WIN32)
     // Try to obtain the vkGetDeviceProcAddr function and then obtain
     // vkGetMemoryWin32HandleKHR dynamically. If anything fails, return 0.
     PFN_vkGetDeviceProcAddr pfnGetDeviceProcAddr = &vkGetDeviceProcAddr;
     if (!pfnGetDeviceProcAddr) {
-        printf("Failed to get vkGetDeviceProcAddr\n");
+        std::cout << "Failed to get vkGetDeviceProcAddr" << std::endl;
         return 0;
     }
 
     auto pfnGetMemoryWin32Handle = (PFN_vkGetMemoryWin32HandleKHR)pfnGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR");
     if (!pfnGetMemoryWin32Handle) {
-        printf("Failed to get vkGetMemoryWin32HandleKHR\n");
+        std::cout << "Failed to get vkGetMemoryWin32HandleKHR" << std::endl;
         return 0;
     }
 
@@ -45,12 +47,12 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
 
     HANDLE h = NULL;
     if (pfnGetMemoryWin32Handle(device, &handle_info, &h) != VK_SUCCESS) {
-        printf("Failed to get Win32 handle for Vulkan memory\n");
+        std::cout << "Failed to get Win32 handle for Vulkan memory" << std::endl;
         return 0;
     }
 
     if (!h) {
-        printf("Win32 handle is NULL\n");
+        std::cout << "Win32 handle is NULL" << std::endl;
         return 0;
     }
 
@@ -59,7 +61,7 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     if (!cudart) cudart = LoadLibraryA("cudart64_110.dll");
     if (!cudart) {
         CloseHandle(h);
-        printf("Failed to load CUDA runtime library\n");
+        std::cout << "Failed to load CUDA runtime library" << std::endl;
         return 0;
     }
 
@@ -74,7 +76,7 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     if (!import_fn || !map_fn || !destroy_fn) {
         FreeLibrary(cudart);
         CloseHandle(h);
-        printf("Failed to get CUDA import/map/destroy functions\n");
+        std::cout << "Failed to get CUDA import/map/destroy functions" << std::endl;
         return 0;
     }
 
@@ -95,7 +97,7 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     if (import_fn(&imported, &desc) != 0) {
         FreeLibrary(cudart);
         CloseHandle(h);
-        printf("Failed to import external memory into CUDA\n");
+        std::cout << "Failed to import external memory into CUDA" << std::endl;
         return 0;
     }
 
@@ -113,7 +115,7 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
         destroy_fn(imported);
         FreeLibrary(cudart);
         CloseHandle(h);
-        printf("Failed to map external memory buffer into CUDA\n");
+        std::cout << "Failed to map external memory buffer into CUDA" << std::endl;
         return 0;
     }
 
@@ -124,10 +126,16 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
 #else
     // On POSIX systems, attempt to get an fd and import via libcudart (if available).
     auto pfnGetDeviceProcAddr = &vkGetDeviceProcAddr;
-    if (!pfnGetDeviceProcAddr) return 0;
+    if (!pfnGetDeviceProcAddr) {
+        std::cout << "Failed to get vkGetDeviceProcAddr" << std::endl;
+        return 0;
+    }
 
     auto pfnGetMemoryFd = (PFN_vkGetMemoryFdKHR)pfnGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
-    if (!pfnGetMemoryFd) return 0;
+    if (!pfnGetMemoryFd) {
+        std::cout << "Failed to get vkGetMemoryFdKHR" << std::endl;
+        return 0;
+    }
 
     VkMemoryGetFdInfoKHR fd_info{};
     fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
@@ -136,11 +144,18 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
 
     int fd = -1;
     if (pfnGetMemoryFd(device, &fd_info, &fd) != VK_SUCCESS) return 0;
-    if (fd < 0) return 0;
+    if (fd < 0) {
+        std::cout << "Failed to get valid file descriptor for Vulkan memory" << std::endl;
+        return 0;
+    }
 
     void* libcudart = dlopen("libcudart.so", RTLD_NOW | RTLD_LOCAL);
     if (!libcudart) libcudart = dlopen("libcudart.so.11.0", RTLD_NOW | RTLD_LOCAL);
-    if (!libcudart) { close(fd); return 0; }
+    if (!libcudart) libcudart = dlopen("libcudart.so.12.0", RTLD_NOW | RTLD_LOCAL);
+    if (!libcudart) { close(fd);
+        std::cout << "Failed to load CUDA library" << std::endl;
+        return 0;
+    }
 
     using ImportFn = int (*)(void**, const void*);
     using MapFn = int (*)(void**, void*, const void*);
@@ -150,7 +165,10 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     auto map_fn = (MapFn)dlsym(libcudart, "cudaExternalMemoryGetMappedBuffer");
     auto destroy_fn = (DestroyFn)dlsym(libcudart, "cudaDestroyExternalMemory");
 
-    if (!import_fn || !map_fn || !destroy_fn) { dlclose(libcudart); close(fd); return 0; }
+    if (!import_fn || !map_fn || !destroy_fn) { dlclose(libcudart); close(fd);
+        std::cout << "Failed to get CUDA import/map/destroy functions" << std::endl;
+        return 0;
+    }
 
     struct CUDAExternalMemoryHandleDesc {
         int type;
@@ -162,7 +180,9 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     desc.size = size;
 
     void* imported = nullptr;
-    if (import_fn(&imported, &desc) != 0) { dlclose(libcudart); close(fd); return 0; }
+    if (import_fn(&imported, &desc) != 0) { dlclose(libcudart); close(fd);
+        std::cout << "Failed to import external memory into CUDA" << std::endl;
+        return 0; }
 
     struct CUDAExternalMemoryBufferDesc {
         unsigned long long offset;
@@ -174,7 +194,9 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     bufdesc.flags = 0;
 
     void* mapped_buffer = nullptr;
-    if (map_fn(&mapped_buffer, imported, &bufdesc) != 0) { destroy_fn(imported); dlclose(libcudart); close(fd); return 0; }
+    if (map_fn(&mapped_buffer, imported, &bufdesc) != 0) { destroy_fn(imported); dlclose(libcudart); close(fd);
+        std::cout << "Failed to map external memory buffer into CUDA" << std::endl;
+        return 0; }
 
     uint64_t ptr = reinterpret_cast<uint64_t>(mapped_buffer);
     // keep libcudart loaded

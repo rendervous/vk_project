@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -1193,16 +1194,17 @@ MemoryManager::MemoryManager(std::shared_ptr<Device> device, uint32_t memory_typ
       memory_type_index_(memory_type_index),
       host_visible_(host_visible) {
     const auto vendor_id = device_->physical_device().getProperties().vendorID;
-    printf("[INFO] Loading interop library for vendor ID: 0x%04X\n", vendor_id);
+    std::cout << "[INFO] Loading interop library for vendor ID" << vendor_id << std::endl;
+    // printf("[INFO] Loading interop library for vendor ID: 0x%04X\n", vendor_id);
     interop_library_ = std::make_shared<ExternalInteropLibraryImpl>(interop_library_base_name(vendor_id));
     if (!interop_library_) {
-        printf("[WARNING] Library not found.");
+        std::cout << "[WARNING] Library not found." << std::endl;
     }
     try_import_memory_ = interop_library_ && interop_library_->loaded()
         ? interop_library_->try_import_memory_fn()
         : nullptr;
     if (!try_import_memory_) {
-        printf("[WARNING] try_import_memory could not be loaded.");
+        std::cout << "[WARNING] Library not loaded." << std::endl;
     }
 }
 

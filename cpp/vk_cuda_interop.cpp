@@ -92,6 +92,7 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     desc.type = 2; // opaque win32
     desc.handle = h;
     desc.size = size; // unknown; driver may accept zero or ignore
+    desc.flags = 0;
 
     void* imported = nullptr;
     if (import_fn(&imported, &desc) != 0) {
@@ -170,7 +171,7 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     auto destroy_fn = (DestroyFn)dlsym(libcudart, "cudaDestroyExternalMemory");
 
     if (!import_fn || !map_fn || !destroy_fn) { dlclose(libcudart); close(fd);
-        throw std::runtime_error("Failed to import external memory into CUDA");
+        throw std::runtime_error("Failed to get CUDA import/map/destroy functions");
         // std::cout << "Failed to get CUDA import/map/destroy functions" << std::endl;
         return 0;
     }
@@ -179,10 +180,12 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
         int type;
         int fd;
         unsigned long long size;
+        int flags;
     } desc{};
     desc.type = 1; // opaque fd
     desc.fd = fd;
     desc.size = size;
+    desc.flags = 0;
 
     void* imported = nullptr;
     if (import_fn(&imported, &desc) != 0) { dlclose(libcudart); close(fd);

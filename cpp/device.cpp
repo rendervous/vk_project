@@ -354,8 +354,9 @@ private:
                 candidates.push_back(install_dir.parent_path() / filename);
             }
         } catch (const py::error_already_set&) {
+            throw std::runtime_error("Failed to resolve module install directory for interop library");
             // If Python cannot resolve the module path, fall back to the loader search path.
-            printf("[ERROR] Module Install dir could not be resolved.");
+            // printf("[ERROR] Module Install dir could not be resolved.");
         }
         candidates.push_back(std::filesystem::current_path() / filename);
         candidates.push_back(std::filesystem::path(filename));
@@ -368,13 +369,15 @@ private:
         }
 
         if (!handle_) {
-            printf("[ERROR] Library could not be opened for any of the possible folders.");
+            throw std::runtime_error("Library could not be opened for any of the possible folders.");
+            // printf("[ERROR] Library could not be opened for any of the possible folders.");
             return;
         }
 
         auto symbol = load_symbol(handle_, "try_import_memory");
         if (!symbol) {
-            printf("[ERROR] Could not be loaded symbol try_import_memory");
+            throw std::runtime_error("Could not be loaded symbol try_import_memory");
+            // printf("[ERROR] Could not be loaded symbol try_import_memory");
             unload();
             return;
         }
@@ -702,7 +705,7 @@ pybind11::object Buffer::dlpack() const {
     auto memory = data_->get_memory();
     DLDevice device = memory->dl_device();
     if (external_ptr() == 0) {
-        throw std::runtime_error("DEVICE tensor requested but external pointer is unavailable");
+        throw std::runtime_error("A DEVICE tensor was requested but the external pointer is unavailable");
     }
     ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(external_ptr()));
 
@@ -1198,13 +1201,15 @@ MemoryManager::MemoryManager(std::shared_ptr<Device> device, uint32_t memory_typ
     // printf("[INFO] Loading interop library for vendor ID: 0x%04X\n", vendor_id);
     interop_library_ = std::make_shared<ExternalInteropLibraryImpl>(interop_library_base_name(vendor_id));
     if (!interop_library_) {
-        std::cout << "[WARNING] Library not found." << std::endl;
+        throw std::runtime_error("Unable to load interop library");
+        // std::cout << "[WARNING] Library not found." << std::endl;
     }
     try_import_memory_ = interop_library_ && interop_library_->loaded()
         ? interop_library_->try_import_memory_fn()
         : nullptr;
     if (!try_import_memory_) {
-        std::cout << "[WARNING] Library not loaded." << std::endl;
+        throw std::runtime_error("Unable to load interop library");
+        // std::cout << "[WARNING] Library not loaded." << std::endl;
     }
 }
 

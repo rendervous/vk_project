@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="vk",                # Replace with your library name
-    version="0.0.5",                       # Semantic versioning
+    version="0.0.6",                       # Semantic versioning
     author="Ludwic Leonard",
     author_email="rendervous.project@gmail.com",
     description="Vulkan API facade for python.",

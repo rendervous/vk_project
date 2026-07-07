@@ -81,16 +81,22 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
     }
 
     // Minimal opaque structs (we avoid including CUDA headers to keep build simple).
-    struct CUDAExternalMemoryHandleDesc_Win32 {
+    struct CUDAExternalMemoryHandleDesc {
         int type;
-        void* handle;
-        const void *name;
+        union {
+            int fd;
+            struct {
+                void *handle;
+                const void *name;
+            } win32;
+            const void *nvSciBufObject;
+        } handle;
         unsigned long long size;
         unsigned int flags;
     } desc{};
     // Opaque: choose a sensible constant (PLATFORM DEPENDENT). If import fails, we return 0.
     desc.type = 2; // opaque win32
-    desc.handle = h;
+    desc.handle.win32.handle = h;
     desc.size = size; // unknown; driver may accept zero or ignore
     desc.flags = 0;
 
@@ -178,12 +184,19 @@ PLUGIN_EXPORT uint64_t try_import_memory(VkDevice device, int device_index, VkDe
 
     struct CUDAExternalMemoryHandleDesc {
         int type;
-        int fd;
+        union {
+            int fd;
+            struct {
+                void *handle;
+                const void *name;
+            } win32;
+            const void *nvSciBufObject;
+        } handle;
         unsigned long long size;
-        int flags;
+        unsigned int flags;
     } desc{};
     desc.type = 1; // opaque fd
-    desc.fd = fd;
+    desc.handle.fd = fd;
     desc.size = size;
     desc.flags = 0;
 

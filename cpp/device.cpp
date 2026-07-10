@@ -768,13 +768,13 @@ void vk_Engine::wait() {
 void vk_Engine::vk_wait_for(std::uint64_t submission_id) {
     // gpu waits for signal submission_id
     if (auto d = device_.lock()) {
-        auto result = d->logical_device().waitSemaphores(vk::SemaphoreWaitInfo{
+        if (d->logical_device().waitSemaphores(vk::SemaphoreWaitInfo{
             vk::SemaphoreWaitFlagBits::eAny,
             1,
             &timeline_semaphore_,
             &submission_id
-        }, std::numeric_limits<uint64_t>::max());
-        resultCheck(result, "Failed to wait for timeline semaphore");
+        }, std::numeric_limits<uint64_t>::max()) != vk::Result::eSuccess)
+            throw std::runtime_error("vk_wait_for failed while waitSemaphores.");
     }
     // all tasks with submission_id <= submission_id will be notified and removed from pending
     vk_collect_all_completed(submission_id);
@@ -783,8 +783,8 @@ void vk_Engine::vk_wait_for(std::uint64_t submission_id) {
 std::uint64_t vk_Engine::vk_check_completation() {
     std::uint64_t gpu_timeline_value = std::numeric_limits<std::uint64_t>::max();
     if (auto d = device_.lock()) {
-        auto result = d->logical_device().getSemaphoreCounterValue(timeline_semaphore_, &gpu_timeline_value);
-        resultCheck(result, "Failed to get semaphore counter value");
+        if (d->logical_device().getSemaphoreCounterValue(timeline_semaphore_, &gpu_timeline_value) != vk::Result::eSuccess)
+            throw std::runtime_error("Failed to get semaphore counter value");
     }
     // all tasks with submission_id <= submission_id will be notified and removed from pending
     vk_collect_all_completed(gpu_timeline_value);

@@ -53,8 +53,9 @@ bool supports_extension(const std::vector<vk::ExtensionProperties>& extensions, 
     });
 }
 
-uint32_t formatSize(vk::Format format) {
-    switch (format)
+uint32_t formatSize(Format format) {
+    vk::Format vk_format = (vk::Format) format;
+    switch (vk_format)
     {
         case vk::Format::eR8Unorm:
         case vk::Format::eR8Snorm:
@@ -116,10 +117,6 @@ uint32_t formatSize(vk::Format format) {
     }
 }
 
-py::object torch_module() {
-    return py::module_::import("torch");
-}
-
 struct DLDataType {
     std::uint8_t code;
     std::uint8_t bits;
@@ -165,26 +162,6 @@ DLDataType dlpack_dtype (ScalarType scalar) {
         default:
             throw std::invalid_argument("Wrong scalar type");
     }
-}
-
-DLDataType dlpack_dtype(const py::object& dtype) {
-    const std::string name = py::str(dtype);
-    if (name.find("float16") != std::string::npos) return {2, 16, 1};
-    if (name.find("bfloat16") != std::string::npos) return {4, 16, 1};
-    if (name.find("float32") != std::string::npos) return {2, 32, 1};
-    if (name.find("float64") != std::string::npos) return {2, 64, 1};
-    if (name.find("int8") != std::string::npos) return {0, 8, 1};
-    if (name.find("uint8") != std::string::npos) return {1, 8, 1};
-    if (name.find("int16") != std::string::npos) return {0, 16, 1};
-    if (name.find("uint16") != std::string::npos) return {1, 16, 1};
-    if (name.find("int32") != std::string::npos) return {0, 32, 1};
-    if (name.find("int64") != std::string::npos) return {0, 64, 1};
-    if (name.find("bool") != std::string::npos) return {6, 8, 1};
-    throw std::runtime_error("Unsupported dtype");
-}
-
-std::size_t dtype_itemsize(const py::object& dtype) {
-    return dlpack_dtype(dtype).bits / 8;
 }
 
 void dlmanaged_tensor_deleter(DLManagedTensor* self) {
@@ -399,7 +376,7 @@ private:
 
 std::shared_ptr<Device> Device::create_device(uint32_t device_index, bool enable_validation_layers) {
     auto dev = std::shared_ptr<Device>(new Device(device_index, enable_validation_layers));
-    dev->init();
+    dev->vk_init(); // initializes all components of the device that requires a pointer to the Device object.
     return dev;
 }
 
@@ -427,9 +404,10 @@ int scalar_type_size(ScalarType type) {
 }
 
 
-ScalarType format_scalar_type(vk::Format format)
+ScalarType format_scalar_type(Format format)
 {
-    switch (format)
+    vk::Format vk_format = (vk::Format) format;
+    switch (vk_format)
     {
         // =======================
         // 8-bit UNSIGNED INT
@@ -542,42 +520,48 @@ ScalarType format_scalar_type(vk::Format format)
 }
 
 
-ResourceData::ResourceData(
-    std::shared_ptr<Device> device, std::shared_ptr<MemorySlice> memory,
-    vk::Image image, vk::ImageCreateInfo image_info): device_(device), memory_(memory), image_(image), image_info_(image_info), resource_type_(image ? ResourceType::IMAGE : ResourceType::BUFFER) {
+vk_ResourceData::vk_ResourceData(
+    std::shared_ptr<Device> device, const std::shared_ptr<MemorySlice>& memory,
+    vk::Image image, vk::ImageCreateInfo image_info): device_(std::move(device)), memory_(memory), image_(image), image_info_(image_info), resource_type_(image ? ResourceType::IMAGE : ResourceType::BUFFER) {
     buffer_ = memory->page_buffer();
 }
 
-ResourceData::~ResourceData() noexcept {
+vk_ResourceData::~vk_ResourceData() noexcept {
     dispose();
 }
 
-void ResourceData::dispose() {
-    this->device_->destroy_data(shared_from_this());
+void vk_ResourceData::dispose() {
+    if (!this->device_)
+        return;
+    if (this->image_) {
+        auto device = this->device_->logical_device();
+        device.destroyImage(this->image_);
+    }
+    auto dev = this->device_;
     this->device_ = nullptr;
     this->memory_ = nullptr;
     this->buffer_ = nullptr;
     this->image_ = nullptr;
 }
 
-std::uint64_t ResourceData::device_ptr() const {
+std::uint64_t vk_ResourceData::device_ptr() const {
     if (memory_) {
         return memory_->device_ptr();
     }
     return 0;
 }
 
-std::uint64_t ResourceData::external_ptr() const {
+std::uint64_t vk_ResourceData::external_ptr() const {
     if (memory_) {
         return memory_->external_ptr();
     }
     return 0;
 }
 
-bool ResourceData::is_cpu() const noexcept { return memory_ && memory_->host_visible(); }
+bool vk_ResourceData::is_cpu() const noexcept { return memory_ && memory_->host_visible(); }
 
-Resource::Resource(std::shared_ptr<ResourceData> resource_data, ResourceSlice view_slice) {
-    data_ = resource_data;
+Resource::Resource(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice) {
+    data_ = std::move(resource_data);
     slice_ = view_slice;
 }
 
@@ -585,12 +569,12 @@ Resource::~Resource() noexcept {
     dispose();
 }
 
-vk::BufferView Buffer::get_view() noexcept {
+vk::BufferView Buffer::get_view() {
     if (!buffer_view_) {
         vk::BufferViewCreateInfo info{};
         info.buffer = data_->get_buffer();
         info.format = slice_.buffer.format;
-        info.offset = slice_.buffer.offset;
+        info.offset = data_->get_memory()->offset() + slice_.buffer.offset;
         info.range = slice_.buffer.size;
         auto device = this->data_->device()->logical_device();
         buffer_view_ = device.createBufferView(info);
@@ -598,7 +582,7 @@ vk::BufferView Buffer::get_view() noexcept {
     return buffer_view_;
 }
 
-vk::ImageView Image::get_view() noexcept {
+vk::ImageView Image::get_view() {
     if (!image_view_) {
         auto image_info = data_->get_image_info();
         vk::ImageViewCreateInfo info{};
@@ -621,12 +605,218 @@ vk::ImageView Image::get_view() noexcept {
     return image_view_;
 }
 
+SubmittedTask::SubmittedTask(std::weak_ptr<vk_Engine> engine, std::uint64_t submission_id) {
+    submission_id_ = submission_id;
+    engine_ = std::move(engine);
+}
+
+void SubmittedTask::wait() {
+    auto e = engine_.lock();
+    if (!e) return;
+    e->vk_wait_for(submission_id_);
+}
+
+bool SubmittedTask::is_complete() {
+    auto e = engine_.lock();
+    if (!e) return true;
+    return submission_id_ <= e->vk_check_completation();
+}
+
+void SubmittedTask::vk_notify_completion() {
+    for (auto& cb : submitted_) {
+        cb->vk_command_buffer()->notify_executed();
+    }
+    submitted_.clear();
+}
+
+vk_CommandBuffer::vk_CommandBuffer(vk::CommandBuffer command_buffer) noexcept {
+    this->command_buffer = command_buffer;
+    this->state = vk_CommandBufferInternalState::CREATED;
+}
+
+void vk_CommandBuffer::begin() {
+    assert(state == vk_CommandBufferInternalState::CREATED || state == vk_CommandBufferInternalState::EXECUTABLE);
+    if (state == EXECUTABLE) {
+        command_buffer.reset({});
+    }
+    command_buffer.begin(vk::CommandBufferBeginInfo{});
+    state = RECORDING;
+}
+
+void vk_CommandBuffer::end() {
+    assert(state == vk_CommandBufferInternalState::RECORDING);
+    command_buffer.end();
+    state = EXECUTABLE;
+}
+
+void vk_CommandBuffer::notify_submitted() {
+    assert(state == vk_CommandBufferInternalState::EXECUTABLE);
+    state = SUBMITTED;
+}
+
+void vk_CommandBuffer::notify_executed() {
+    assert(state == vk_CommandBufferInternalState::SUBMITTED);
+    state = EXECUTABLE;
+}
+
+void CommandBuffer::close() {
+    command_buffer_->end();
+}
+
+void CommandBuffer::transfer(const std::shared_ptr<Buffer>& source, const std::shared_ptr<Buffer>& destination, int bytes) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot record a transfer into a closed command buffer");
+    }
+    if (bytes <= 0 || bytes > source->size() || bytes > destination->size()) {
+        throw std::runtime_error("Invalid transfer size");
+    }
+    vk::BufferCopy region(source->vk_buffer_offset(), destination->vk_buffer_offset(), static_cast<vk::DeviceSize>(bytes));
+    command_buffer_->command_buffer.copyBuffer(source->vk_buffer(), destination->vk_buffer(), region);
+}
+
+void CommandBuffer::release() {
+    if (device_ == nullptr)
+        return;
+    if (command_buffer_->state == SUBMITTED) {
+        throw std::runtime_error("Command buffer can not be released while submitted. Explicitly use wait before releasing.");
+    }
+    engine_->vk_release_command_buffer(command_buffer_);
+    command_buffer_.reset();
+    device_.reset();
+    engine_.reset();
+}
+
+void vk_Engine::dispose() noexcept {
+    if (!queue_) return; // already disposed.
+    wait();
+    if (auto d = device_.lock()) {
+        d->logical_device().destroySemaphore(timeline_semaphore_);
+    }
+    reusable_command_buffers_.clear();
+    queue_ = nullptr;
+    command_pool_ = nullptr; // not owned here
+    device_.reset();
+    timeline_semaphore_ = nullptr;
+}
+
+std::shared_ptr<vk_CommandBuffer> vk_Engine::create_command_buffer() {
+    std::shared_ptr<vk_CommandBuffer> command_buffer;
+    if (!reusable_command_buffers_.empty()) {
+        command_buffer = reusable_command_buffers_.back();
+        reusable_command_buffers_.pop_back();
+    }
+    else {
+        auto dev = device_.lock();
+        if (dev && !dev->is_disposed()) {
+            vk::CommandBufferAllocateInfo alloc_info{};
+            alloc_info.commandPool = command_pool_;
+            alloc_info.level = vk::CommandBufferLevel::ePrimary;
+            alloc_info.commandBufferCount = 1;
+            auto command_buffers = dev->logical_device().allocateCommandBuffers(alloc_info);
+            command_buffers_.push_back(command_buffers[0]);
+            command_buffer = std::make_shared<vk_CommandBuffer>(command_buffers[0]);
+        }
+        else {
+            throw std::runtime_error("Device is disposed.");
+        }
+    }
+    command_buffer->begin();
+    return command_buffer;
+}
+
+void vk_Engine::release_command_buffer(std::shared_ptr<vk_CommandBuffer> command_buffer) {
+    if (command_buffer->state == RECORDING)
+        command_buffer->end(); // close unfinished command buffer first before reset
+    assert(command_buffer->state == vk_CommandBufferInternalState::EXECUTABLE);
+    reusable_command_buffers_.push_back(command_buffer);
+}
+
+std::shared_ptr<SubmittedTask> vk_Engine::submit(std::uint32_t count, vk::CommandBuffer* command_buffers) {
+    // submit the command buffers in command_buffers to the queue
+    // map command_buffers to a vec of vk::CommandBuffer
+    if (count == 0) { // important silent behaviour for dynamic submission cases. Empty submission will preserve submission id from previous task.
+        return std::make_shared<SubmittedTask>(shared_from_this(), current_submission_id_);
+    }
+    current_submission_id_ ++; // if there is something to send to the GPU, there is something to wait for
+    auto task = std::make_shared<SubmittedTask>(shared_from_this(), current_submission_id_);
+    vk::TimelineSemaphoreSubmitInfo timeline_submit_info{
+        0,
+        nullptr,
+        1,
+        &current_submission_id_,
+    };
+    vk::SubmitInfo submit_info{
+        0,
+        nullptr,
+        nullptr,
+        count,
+        command_buffers,
+        1,
+        &timeline_semaphore_,
+    };
+    submit_info.setPNext(&timeline_submit_info);
+    queue_.submit(submit_info);
+    pending_submitted_tasks_.push_back(task);
+    return task;
+}
+
+void vk_Engine::wait() {
+    queue_.waitIdle(); // waits for all submitted task to be completed
+    vk_collect_all_completed(std::numeric_limits<std::uint64_t>::max()); // clear all pending tasks
+}
+
+void vk_Engine::vk_wait_for(std::uint64_t submission_id) {
+    // gpu waits for signal submission_id
+    if (auto d = device_.lock()) {
+        auto result = d->logical_device().waitSemaphores(vk::SemaphoreWaitInfo{
+            vk::SemaphoreWaitFlagBits::eAny,
+            1,
+            &timeline_semaphore_,
+            &submission_id
+        }, std::numeric_limits<uint64_t>::max());
+        resultCheck(result, "Failed to wait for timeline semaphore");
+    }
+    // all tasks with submission_id <= submission_id will be notified and removed from pending
+    vk_collect_all_completed(submission_id);
+}
+
+std::uint64_t vk_Engine::vk_check_completation() {
+    std::uint64_t gpu_timeline_value = std::numeric_limits<std::uint64_t>::max();
+    if (auto d = device_.lock()) {
+        auto result = d->logical_device().getSemaphoreCounterValue(timeline_semaphore_, &gpu_timeline_value);
+        resultCheck(result, "Failed to get semaphore counter value");
+    }
+    // all tasks with submission_id <= submission_id will be notified and removed from pending
+    vk_collect_all_completed(gpu_timeline_value);
+    return gpu_timeline_value;
+}
+
+void vk_Engine::vk_collect_all_completed(std::uint64_t submission_id) {
+    // all tasks with submission_id <= submission_id will be notified and removed from pending
+    while (!pending_submitted_tasks_.empty()) {
+        if (pending_submitted_tasks_.front()->vk_submission_id() <= submission_id) {
+            pending_submitted_tasks_.front()->vk_notify_completion();
+            pending_submitted_tasks_.pop_front();
+        }
+        else {
+            break;
+        }
+    }
+}
+
+Engine::Engine(std::shared_ptr<Device> device, std::shared_ptr<vk_Engine> engine, uint32_t index) noexcept {
+    device_ = std::move(device);
+    engine_ = std::move(engine);
+    engine_index_ = index;
+}
+
 void Resource::dispose() {
     data_ = nullptr;
     slice_ = {};
 }
 
-Buffer::Buffer(std::shared_ptr<ResourceData> resource_data, ResourceSlice view_slice): Resource(resource_data, view_slice) {
+Buffer::Buffer(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice): Resource(resource_data, view_slice) {
+    assert (view_slice.type == ResourceType::BUFFER);
 }
 
 std::uint64_t Buffer::device_ptr() const {
@@ -637,6 +827,14 @@ std::uint64_t Buffer::external_ptr() const {
     return data_->external_ptr() + slice_.buffer.offset;
 }
 
+std::uint64_t Buffer::vk_buffer_offset() const noexcept {
+    return data_->get_memory()->offset() + slice_.buffer.offset;
+}
+
+std::uint64_t Buffer::vk_buffer_size() const noexcept {
+    return slice_.buffer.size;
+}
+
 Buffer::~Buffer() noexcept{
     if (buffer_view_) {
         auto device = this->data_->device()->logical_device();
@@ -645,7 +843,7 @@ Buffer::~Buffer() noexcept{
     }
 }
 
-Image::Image(std::shared_ptr<ResourceData> resource_data, ResourceSlice view_slice):Resource(resource_data, view_slice) {
+Image::Image(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice):Resource(resource_data, view_slice) {
 }
 
 Image::~Image() noexcept {
@@ -656,14 +854,15 @@ Image::~Image() noexcept {
     }
 }
 
-std::shared_ptr<Buffer> Buffer::cast_format(vk::Format new_format) const {
+std::shared_ptr<Buffer> Buffer::cast_format(Format new_format) const {
     if (data_->resource_type() != ResourceType::BUFFER) {
         throw std::runtime_error("buffer_cast can only be called on buffer resources");
     }
     ResourceSlice view_slice{};
+    view_slice.type = ResourceType::BUFFER;
     view_slice.buffer.offset = slice_.buffer.offset;
     view_slice.buffer.size = slice_.buffer.size;
-    view_slice.buffer.format = new_format;
+    view_slice.buffer.format = (vk::Format)new_format;
     view_slice.buffer.scalar = slice_.buffer.scalar;
     return std::make_shared<Buffer>(data_, view_slice);
 }
@@ -673,6 +872,7 @@ std::shared_ptr<Buffer> Buffer::cast_scalar(ScalarType new_scalar) const {
         throw std::runtime_error("buffer_cast can only be called on buffer resources");
     }
     ResourceSlice view_slice{};
+    view_slice.type = ResourceType::BUFFER;
     view_slice.buffer.offset = slice_.buffer.offset;
     view_slice.buffer.size = slice_.buffer.size;
     view_slice.buffer.format = slice_.buffer.format;
@@ -688,6 +888,7 @@ std::shared_ptr<Buffer> Buffer::slice(int offset, int size) const {
         throw std::runtime_error("Invalid buffer slice range");
     }
     ResourceSlice view_slice{};
+    view_slice.type = ResourceType::BUFFER;
     view_slice.buffer.offset = slice_.buffer.offset + offset;
     view_slice.buffer.size = size;
     view_slice.buffer.format = slice_.buffer.format;
@@ -738,6 +939,7 @@ std::shared_ptr<Image> Image::cast_format(vk::Format new_format) const {
         throw std::runtime_error("image_cast can only be called on image resources");
     }
     ResourceSlice view_slice{};
+    view_slice.type = ResourceType::IMAGE;
     view_slice.image.mip_start = slice_.image.mip_start;
     view_slice.image.mip_count = slice_.image.mip_count;
     view_slice.image.array_start = slice_.image.array_start;
@@ -759,6 +961,7 @@ std::shared_ptr<Image> Image::slice(int mip_start, int mip_count, int array_star
         throw std::runtime_error("Invalid image slice range");
     }
     ResourceSlice view_slice{};
+    view_slice.type = ResourceType::IMAGE;
     view_slice.image.mip_start = slice_.image.mip_start + mip_start;
     view_slice.image.mip_count = mip_count;
     view_slice.image.array_start = slice_.image.array_start + array_start;
@@ -887,15 +1090,6 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     dci.ppEnabledExtensionNames = enabled_extensions.empty() ? nullptr : enabled_extensions.data();
 
     device_ = physical_.createDevice(dci);
-
-    queues_.resize(queue_families.size());
-    for (uint32_t family_index = 0; family_index < queue_families.size(); ++family_index) {
-        const auto& family = queue_families[family_index];
-        queues_[family_index].resize(family.queueCount);
-        for (uint32_t queue_index = 0; queue_index < family.queueCount; ++queue_index) {
-            queues_[family_index][queue_index] = device_.getQueue(family_index, queue_index);
-        }
-    }
 }
 
 vk::PhysicalDevice Device::physical_device() const noexcept {
@@ -910,7 +1104,9 @@ uint32_t Device::device_index() const noexcept {
     return device_index_;
 }
 
-void Device::init() {
+void Device::vk_init() {
+    engines_.resize(8); // one slot per EngineType bitmask combination (1..7)
+
     const auto memory_properties = physical_.getMemoryProperties();
     bool found_cpu = false;
     const uint32_t cpu_type = find_memory_type_index(
@@ -934,47 +1130,87 @@ void Device::init() {
     }
     const auto gpu_flags = memory_properties.memoryTypes[gpu_type].propertyFlags;
     const bool gpu_host_visible = (gpu_flags & vk::MemoryPropertyFlagBits::eHostVisible) == vk::MemoryPropertyFlagBits::eHostVisible;
-    host_memory_manager_ = std::make_unique<MemoryManager>(shared_from_this(), cpu_type, true);
-    device_memory_manager_ = std::make_unique<MemoryManager>(shared_from_this(), gpu_type, gpu_host_visible);
-}
+    host_memory_manager_ = std::make_shared<MemoryManager>(shared_from_this(), cpu_type, true);
+    device_memory_manager_ = std::make_shared<MemoryManager>(shared_from_this(), gpu_type, gpu_host_visible);
 
-MemoryManager& Device::host_memory_manager() {
-    return *host_memory_manager_;
-}
+    const auto queue_families = physical_.getQueueFamilyProperties();
 
-MemoryManager& Device::device_memory_manager() {
-    return *device_memory_manager_;
-}
+    command_pools_.resize(queue_families.size()); // holds one command pool for each family if necessary
 
-std::shared_ptr<Buffer> Device::create_buffer(int size, MemoryLocation location) {
-    if (size <= 0) {
-        throw std::runtime_error("Buffer size must be positive");
+    for (uint32_t family_index = 0; family_index < queue_families.size(); ++family_index) {
+        const auto& family = queue_families[family_index];
+        for (uint32_t engine_combination_index = 1; engine_combination_index < 8; ++engine_combination_index) {
+            std::uint32_t fflags = (std::uint32_t)family.queueFlags;
+            if ((fflags & engine_combination_index) == engine_combination_index) {
+                if (engine_type_index_[engine_combination_index] == -1 || fflags < engine_queue_flags_[engine_combination_index]) {
+                    engine_type_index_[engine_combination_index] = family_index;
+                    engine_queue_flags_[engine_combination_index] = fflags;
+                    engine_queue_count_[engine_combination_index] = family.queueCount;
+                }
+            }
+        }
     }
-    MemoryManager& manager = (location == MemoryLocation::HOST) ? host_memory_manager() : device_memory_manager();
-    auto memory = manager.allocate(size, 256);
-    auto data = std::make_shared<ResourceData>(shared_from_this(), memory, vk::Image{}, vk::ImageCreateInfo{});
+}
+
+std::shared_ptr<Engine> Device::create_engine(EngineType type, uint32_t index) {
+    int engine_index = (int)type;
+    assert (engine_index > 0 && engine_index < 8);
+
+    int family_index = engine_type_index_[engine_index];
+    if (family_index == -1) {
+        throw std::runtime_error("No suitable queue family found for requested engine type");
+    }
+
+    if (engines_[engine_index].size() == 0) {
+        engines_[engine_index].resize(engine_queue_count_[engine_index]);
+    }
+
+    uint32_t queue_index = index % engine_queue_count_[engine_index];
+
+    if (engines_[engine_index][queue_index] == nullptr) {
+        auto dev = logical_device();
+        vk::Queue queue = dev.getQueue(family_index, queue_index);
+        if (!command_pools_[family_index]) {
+            vk::CommandPoolCreateInfo pool_info{};
+            pool_info.queueFamilyIndex = family_index;
+            pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+            command_pools_[family_index] = dev.createCommandPool(pool_info);
+        }
+        engines_[engine_index][queue_index] = std::make_shared<vk_Engine>(shared_from_this(), queue, command_pools_[family_index], type);
+    }
+
+    return std::make_shared<Engine>(shared_from_this(), engines_[engine_index][queue_index], index);
+}
+
+std::shared_ptr<Pipeline> Device::create_pipeline(PipelineType type) {
+    return nullptr;
+}
+
+std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t size, MemoryLocation location) {
+    auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
+    auto memory = manager->allocate(size, 256);
+    auto data = std::make_shared<vk_ResourceData>(shared_from_this(), memory, vk::Image{}, vk::ImageCreateInfo{});
+    resources_.push_back(data); // save a weak reference to force destroy of hanging resources.
     ResourceSlice full_slice {};
-    full_slice.buffer.offset = memory->offset();
+    // Relative to this resource's own memory slice (see Buffer::device_ptr/external_ptr
+    // and Buffer::offset()), not the absolute offset within the underlying page.
+    full_slice.type = ResourceType::BUFFER;
+    full_slice.buffer.offset = 0;
     full_slice.buffer.size = size;
     full_slice.buffer.format = vk::Format::eUndefined;
     full_slice.buffer.scalar = ScalarType::UINT8;
-    return std::make_shared<Buffer>(data, full_slice);
+    auto result = std::make_shared<Buffer>(data, full_slice);
+    return result;
 }
 
-std::shared_ptr<Buffer> Device::create_array(int elements, ScalarType type, MemoryLocation location) {
-    if (elements <= 0) {
-        throw std::runtime_error("Array elements must be positive");
-    }
+std::shared_ptr<Buffer> Device::create_array(std::uint64_t elements, ScalarType type, MemoryLocation location) {
     const int itemsize = scalar_type_size(type);
-    const int bytes = elements * itemsize;
+    const std::uint64_t bytes = elements * itemsize;
     return create_buffer(bytes, location)->cast_scalar(type);
 }
 
-std::shared_ptr<Buffer> Device::create_texels(int elements, vk::Format format, MemoryLocation location) {
-    if (elements <= 0) {
-        throw std::runtime_error("Texel elements must be positive");
-    }
-    const int bytes = elements * formatSize(format);
+std::shared_ptr<Buffer> Device::create_texels(std::uint64_t elements, Format format, MemoryLocation location) {
+    const std::uint64_t bytes = elements * formatSize(format);
     return create_buffer(bytes, location)->cast_format(format)->cast_scalar(format_scalar_type(format));
 }
 
@@ -983,21 +1219,18 @@ std::shared_ptr<Image> Device::create_image(int width, int height, int depth, in
     return nullptr;
 }
 
-void Device::destroy_data(std::shared_ptr<ResourceData> data) noexcept {
-}
-
-pybind11::object Device::allocate_tensor_dlpack(const std::vector<int>& shape, ScalarType type, MemoryLocation location) {
+pybind11::object Device::create_tensor_dlpack(const std::vector<std::uint64_t>& shape, ScalarType type, MemoryLocation location) {
     int dimension = shape.size();
     if (dimension <= 0) {
         throw std::runtime_error("Dimension must be positive");
     }
-    int elements = 1;
+    std::int64_t elements = 1;
     for (int i = 0; i < dimension; ++i) {
         elements *= shape[i];
     }
     int element_size = scalar_type_size(type);
-    auto& manager = location == MemoryLocation::HOST ? host_memory_manager() : device_memory_manager();
-    auto memory = manager.allocate(elements * element_size, 256);
+    auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
+    auto memory = manager->allocate(elements * element_size, 256);
     auto ptr = memory->external_ptr();
     if (ptr == 0) {
         throw std::runtime_error("DEVICE tensor requested but external pointer is unavailable");
@@ -1026,51 +1259,6 @@ pybind11::object Device::allocate_tensor_dlpack(const std::vector<int>& shape, S
     return export_dltensor_py(managed);
 }
 
-
-// py::object Device::tensor(int elements, const py::object& dtype, MemoryLocation location) {
-//     if (elements <= 0) {
-//         throw std::runtime_error("tensor elements must be positive");
-//     }
-//
-//     const std::size_t itemsize = dtype_itemsize(dtype);
-//     const int bytes = static_cast<int>(elements * itemsize);
-//     MemoryManager& manager = (location == MemoryLocation::HOST) ? host_memory_manager() : device_memory_manager();
-//     MemorySlice memory = manager.allocate(bytes);
-//
-//     void* ptr = nullptr;
-//     DLDevice device;
-//     if (location == MemoryLocation::HOST) {
-//         device = dl_device_for_host_;
-//         ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(memory.cpu_ptr()));
-//     } else {
-//         if (memory.external_ptr() == 0) {
-//             throw std::runtime_error("DEVICE tensor requested but external pointer is unavailable");
-//         }
-//         device = dl_device_for_device_;
-//         ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(memory.external_ptr()));
-//     }
-//
-//     auto* owner = new TensorOwner();
-//     owner->memory = std::make_shared<MemorySlice>(std::move(memory));
-//     owner->shape = std::make_unique<std::int64_t[]>(1);
-//     owner->strides = std::make_unique<std::int64_t[]>(1);
-//     owner->shape[0] = elements;
-//     owner->strides[0] = 1;
-//
-//     auto* managed = new DLManagedTensor{};
-//     managed->dl_tensor.data = ptr;
-//     managed->dl_tensor.device = device;
-//     managed->dl_tensor.ndim = 1;
-//     managed->dl_tensor.dtype = dlpack_dtype(dtype);
-//     managed->dl_tensor.shape = owner->shape.get();
-//     managed->dl_tensor.strides = owner->strides.get();
-//     managed->dl_tensor.byte_offset = 0;
-//     managed->manager_ctx = owner;
-//     managed->deleter = dlmanaged_tensor_deleter;
-//
-//     return from_dlpack(managed);
-// }
-
 void Device::dispose() noexcept {
     try {
         if (device_) {
@@ -1080,15 +1268,37 @@ void Device::dispose() noexcept {
         // Destructors and dispose must not throw.
     }
 
+    // dispose all created engines
+    for (auto& engine_family : engines_) {
+        for (auto& engine : engine_family) {
+            if (engine) {
+                engine->dispose();
+            }
+        }
+        engine_family.clear();
+    }
+    engines_.clear();
+
+    // destroy all command pools
+    for (auto& pool : command_pools_) {
+        if (pool) {
+            auto dev = logical_device();
+            dev.destroyCommandPool(pool);
+        }
+    }
+    command_pools_.clear();
+
     // Destroy now any pending resource
-    for (auto r: resources_)
-        destroy_data(r);
+    for (const auto& r: resources_) {
+        auto res = r.lock();
+        if (res)
+            res->dispose();
+    }
+    resources_.clear();
 
     device_memory_manager_.reset();
     host_memory_manager_.reset();
     device_index_ = 0;
-
-    queues_.clear();
 
     if (device_) {
         device_.destroy();
@@ -1107,16 +1317,35 @@ Device::~Device() noexcept {
     dispose();
 }
 
+vk_Engine::vk_Engine(std::weak_ptr<Device> device, vk::Queue queue, vk::CommandPool pool, EngineType type)
+    : device_(std::move(device)), queue_(queue), command_pool_(pool), engine_type_(type) {
+    auto d = device_.lock();
+    if (d && !d->is_disposed()) {
+        auto semaphore_type_create_info = vk::SemaphoreTypeCreateInfo(
+                vk::SemaphoreType::eTimeline,
+                0,
+                nullptr
+        );
+        timeline_semaphore_ = d->logical_device().createSemaphore(vk::SemaphoreCreateInfo{
+            vk::SemaphoreCreateFlags{},
+            &semaphore_type_create_info
+        });
+    }
+    current_submission_id_ = 0;
+}
+
 MemorySlice::MemorySlice() = default;
 
 MemorySlice::MemorySlice(
+    std::shared_ptr<Device> device,
     std::shared_ptr<MemoryPage> page,
-    int allocated_offset,
-    int allocated_size,
-    int offset,
-    int size
+    std::uint64_t allocated_offset,
+    std::uint64_t allocated_size,
+    std::uint64_t offset,
+    std::uint64_t size
 ) noexcept
-    : page_(page),
+    : device_(device),
+      page_(page),
       allocated_offset_(allocated_offset),
       allocated_size_(allocated_size),
       offset_(offset),
@@ -1184,6 +1413,7 @@ void MemorySlice::release() noexcept {
         page_->free_memory(allocated_offset_);
     }
     page_.reset();
+    device_.reset();
     offset_ = 0;
     size_ = 0;
 }
@@ -1192,11 +1422,12 @@ MemorySlice::~MemorySlice() noexcept {
     release();
 }
 
-MemoryManager::MemoryManager(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible):
+MemoryManager::MemoryManager(std::weak_ptr<Device> device, uint32_t memory_type_index, bool host_visible):
       device_(device),
       memory_type_index_(memory_type_index),
       host_visible_(host_visible) {
-    const auto vendor_id = device_->physical_device().getProperties().vendorID;
+    auto dev = device_.lock();
+    const auto vendor_id = dev->physical_device().getProperties().vendorID;
     std::cout << "[INFO] Loading interop library for vendor ID" << vendor_id << std::endl;
     // printf("[INFO] Loading interop library for vendor ID: 0x%04X\n", vendor_id);
     interop_library_ = std::make_shared<ExternalInteropLibraryImpl>(interop_library_base_name(vendor_id));
@@ -1216,10 +1447,13 @@ MemoryManager::MemoryManager(std::shared_ptr<Device> device, uint32_t memory_typ
 MemoryManager::~MemoryManager() noexcept = default;
 
 std::shared_ptr<MemorySlice> MemoryManager::allocate(int size, int alignment) {
+    auto d = device_.lock();
+    if (!d) {
+        throw std::runtime_error("Unable to allocate new memory in a disposed device");
+    }
     if (size <= 0) {
         throw std::runtime_error("Allocation size must be positive");
     }
-
     for (auto& page : pages_) {
         if (page->can_allocate(size, alignment)) {
             return page->allocate(size, alignment);
@@ -1228,7 +1462,7 @@ std::shared_ptr<MemorySlice> MemoryManager::allocate(int size, int alignment) {
 
     int page_capacity = std::max(size, next_page_capacity_); // big data create their own page.
 
-    pages_.push_back(std::make_shared<MemoryPage>(device_, memory_type_index_, host_visible_, page_capacity, try_import_memory_));
+    pages_.push_back(std::make_shared<MemoryPage>(d, memory_type_index_, host_visible_, page_capacity, try_import_memory_));
     if (next_page_capacity_ <= std::numeric_limits<int>::max() / 2) {
         next_page_capacity_ *= 2;
     }
@@ -1256,7 +1490,7 @@ std::uint64_t MemoryManager::device_to_external(std::uint64_t device_ptr) const 
     return 0;
 }
 
-MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_index, bool host_visible, int capacity, ExternalImportFn try_import_memory)
+MemoryPage::MemoryPage(std::weak_ptr<Device> device, uint32_t memory_type_index, bool host_visible, std::uint64_t capacity, ExternalImportFn try_import_memory)
     : device_(device),
       memory_type_index_(memory_type_index),
       host_visible_(host_visible),
@@ -1267,7 +1501,9 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
         throw std::runtime_error("Page capacity must be positive");
     }
 
-    auto dev = device->vk_device();
+    auto device_ptr = device_.lock();
+
+    auto dev = device_ptr->vk_device();
 
     vk::ExternalMemoryBufferCreateInfo external_buffer_info{};
 #if defined(_WIN32)
@@ -1315,10 +1551,10 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
     if (host_visible_) {
         external_ptr_ = reinterpret_cast<std::uint64_t>(dev.mapMemory(memory_, 0, VK_WHOLE_SIZE));
     } else if (try_import_memory_) {
-        external_ptr_ = try_import_memory_(dev, device->device_index(), static_cast<VkDeviceMemory>(memory_), capacity_);
+        external_ptr_ = try_import_memory_(dev, device_ptr->device_index(), static_cast<VkDeviceMemory>(memory_), capacity_);
     }
 
-    const int device_id = device->device_index();
+    const int device_id = device_ptr->device_index();
     if (host_visible_) {
         dl_device_ = {1, device_id};
     } else if (external_ptr_) {
@@ -1329,37 +1565,39 @@ MemoryPage::MemoryPage(std::shared_ptr<Device> device, uint32_t memory_type_inde
 }
 
 MemoryPage::~MemoryPage() noexcept {
-    if (!device_) {
-        return;
+    if (auto device_ptr = device_.lock(); device_ptr && !device_ptr->is_disposed()) {
+        auto dev = device_ptr->vk_device();
+        if (host_visible_ && memory_) {
+            dev.unmapMemory(memory_);
+        }
+        if (buffer_) {
+            dev.destroyBuffer(buffer_);
+        }
+        if (memory_) {
+            dev.freeMemory(memory_);
+        }
     }
-
-    auto dev = device_->vk_device();
-    if (host_visible_ && memory_) {
-        dev.unmapMemory(memory_);
-    }
-    if (buffer_) {
-        dev.destroyBuffer(buffer_);
-        buffer_ = vk::Buffer{};
-    }
-    if (memory_) {
-        dev.freeMemory(memory_);
-        memory_ = vk::DeviceMemory{};
-    }
+    buffer_ = vk::Buffer{};
+    memory_ = vk::DeviceMemory{};
     device_ptr_ = 0;
     external_ptr_ = 0;
 }
 
-bool MemoryPage::can_allocate(int size, int alignment) const {
+bool MemoryPage::can_allocate(std::uint64_t size, std::uint64_t alignment) const {
     return allocator_->can_allocate(size + alignment - 1);
 }
 
-std::shared_ptr<MemorySlice> MemoryPage::allocate(int size, int alignment) {
+std::shared_ptr<MemorySlice> MemoryPage::allocate(std::uint64_t size, std::uint64_t alignment) {
+    auto device = device_.lock(); // get the device
+    if (!device) {
+        throw std::runtime_error("Page can not allocate memory in a disposed device");
+    }
     const int offset = allocator_->allocate(size + alignment - 1);
     int aligned_offset = (offset + alignment - 1) & ~(alignment - 1);
-    return std::make_shared<MemorySlice>(shared_from_this(), offset, size + alignment - 1, aligned_offset, size);
+    return std::make_shared<MemorySlice>(device, shared_from_this(), offset, size + alignment - 1, aligned_offset, size);
 }
 
-void MemoryPage::free_memory(int allocated_offset) noexcept {
+void MemoryPage::free_memory(std::uint64_t allocated_offset) noexcept {
     allocator_->free_memory(allocated_offset);
 }
 
@@ -1389,11 +1627,7 @@ std::uint64_t MemoryPage::device_to_external(std::uint64_t device_ptr) const noe
     return external_ptr_ + (device_ptr - device_ptr_);
 }
 
-MemoryAllocator::MemoryAllocator(int capacity) : capacity_(capacity), bins_(32) {
-    if (capacity_ <= 0) {
-        throw std::runtime_error("Allocator capacity must be positive");
-    }
-
+MemoryAllocator::MemoryAllocator(std::uint64_t capacity) : capacity_(capacity), bins_(32) {
     auto node = std::make_unique<Range>();
     node->offset = 0;
     node->size = capacity_;
@@ -1404,8 +1638,8 @@ MemoryAllocator::MemoryAllocator(int capacity) : capacity_(capacity), bins_(32) 
 
 MemoryAllocator::~MemoryAllocator() noexcept = default;
 
-int MemoryAllocator::bin_for_size(int size) const {
-    int value = 1;
+int MemoryAllocator::bin_for_size(std::uint64_t size) const {
+    std::uint64_t value = 1;
     int bin = 0;
     while (value < size && bin < static_cast<int>(bins_.size()) - 1) {
         value <<= 1;
@@ -1450,10 +1684,7 @@ void MemoryAllocator::remove_node(Range* node) noexcept {
     }
 }
 
-bool MemoryAllocator::can_allocate(int size) const {
-    if (size <= 0) {
-        return false;
-    }
+bool MemoryAllocator::can_allocate(std::uint64_t size) const {
     const int start_bin = bin_for_size(size);
     for (int bin = start_bin; bin < static_cast<int>(bins_.size()); ++bin) {
         for (const Range* node : bins_[bin]) {
@@ -1465,11 +1696,7 @@ bool MemoryAllocator::can_allocate(int size) const {
     return false;
 }
 
-int MemoryAllocator::allocate(int size) {
-    if (size <= 0) {
-        throw std::runtime_error("Allocation size must be positive");
-    }
-
+std::uint64_t MemoryAllocator::allocate(std::uint64_t size) {
     const int start_bin = bin_for_size(size);
     Range* selected = nullptr;
     for (int bin = start_bin; bin < static_cast<int>(bins_.size()) && !selected; ++bin) {
@@ -1485,7 +1712,7 @@ int MemoryAllocator::allocate(int size) {
         throw std::runtime_error("Out of memory in page allocator");
     }
 
-    const int offset = selected->offset;
+    const std::uint64_t offset = selected->offset;
     if (selected->size == size) {
         remove_node(selected);
     } else {
@@ -1498,7 +1725,7 @@ int MemoryAllocator::allocate(int size) {
     return offset;
 }
 
-void MemoryAllocator::free_memory(int offset) noexcept {
+void MemoryAllocator::free_memory(std::uint64_t offset) noexcept {
     const auto allocation = allocations_.find(offset);
     if (allocation == allocations_.end()) {
         return;

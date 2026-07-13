@@ -2,13 +2,18 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <pybind11/pybind11.h>
 
@@ -115,6 +120,175 @@ uint32_t formatSize(Format format) {
         default:
             throw std::runtime_error("Unsupported or compressed format");
     }
+}
+
+// Maps a scalar component type/count (as found in a vertex-layout struct
+// field) to the named Format entry Vulkan expects for a vertex attribute.
+Format vertex_attribute_format(ScalarType component_type, int components) {
+    switch (component_type) {
+        case ScalarType::FLOAT32:
+            switch (components) {
+                case 1: return Format::R32_Float;
+                case 2: return Format::RG32_Float;
+                case 3: return Format::RGB32_Float;
+                case 4: return Format::RGBA32_Float;
+                default: break;
+            }
+            break;
+        case ScalarType::INT32:
+            switch (components) {
+                case 1: return Format::R32_SInt;
+                case 2: return Format::RG32_SInt;
+                case 3: return Format::RGB32_SInt;
+                case 4: return Format::RGBA32_SInt;
+                default: break;
+            }
+            break;
+        case ScalarType::UINT32:
+            switch (components) {
+                case 1: return Format::R32_UInt;
+                case 2: return Format::RG32_UInt;
+                case 3: return Format::RGB32_UInt;
+                case 4: return Format::RGBA32_UInt;
+                default: break;
+            }
+            break;
+        case ScalarType::FLOAT64:
+            switch (components) {
+                case 1: return Format::R64_Float;
+                case 2: return Format::RG64_Float;
+                case 3: return Format::RGB64_Float;
+                case 4: return Format::RGBA64_Float;
+                default: break;
+            }
+            break;
+        case ScalarType::INT64:
+            switch (components) {
+                case 1: return Format::R64_SInt;
+                case 2: return Format::RG64_SInt;
+                case 3: return Format::RGB64_SInt;
+                case 4: return Format::RGBA64_SInt;
+                default: break;
+            }
+            break;
+        case ScalarType::UINT64:
+            switch (components) {
+                case 1: return Format::R64_UInt;
+                case 2: return Format::RG64_UInt;
+                case 3: return Format::RGB64_UInt;
+                case 4: return Format::RGBA64_UInt;
+                default: break;
+            }
+            break;
+        case ScalarType::FLOAT16:
+            switch (components) {
+                case 1: return Format::R16_Float;
+                case 2: return Format::RG16_Float;
+                case 3: return Format::RGB16_Float;
+                case 4: return Format::RGBA16_Float;
+                default: break;
+            }
+            break;
+        case ScalarType::INT16:
+            switch (components) {
+                case 1: return Format::R16_SInt;
+                case 2: return Format::RG16_SInt;
+                case 3: return Format::RGB16_SInt;
+                case 4: return Format::RGBA16_SInt;
+                default: break;
+            }
+            break;
+        case ScalarType::UINT16:
+            switch (components) {
+                case 1: return Format::R16_UInt;
+                case 2: return Format::RG16_UInt;
+                case 3: return Format::RGB16_UInt;
+                case 4: return Format::RGBA16_UInt;
+                default: break;
+            }
+            break;
+        case ScalarType::INT8:
+            switch (components) {
+                case 1: return Format::R8_SInt;
+                case 2: return Format::RG8_SInt;
+                case 3: return Format::RGB8_SInt;
+                case 4: return Format::RGBA8_SInt;
+                default: break;
+            }
+            break;
+        case ScalarType::UINT8:
+        case ScalarType::BOOL:
+            switch (components) {
+                case 1: return Format::R8_UInt;
+                case 2: return Format::RG8_UInt;
+                case 3: return Format::RGB8_UInt;
+                case 4: return Format::RGBA8_UInt;
+                default: break;
+            }
+            break;
+        default:
+            break;
+    }
+    throw std::runtime_error("vertex_layout: unsupported scalar/vector component type or count for a vertex attribute");
+}
+
+vk::DescriptorType to_vk_descriptor_type(DescriptorType type) {
+    switch (type) {
+        case DescriptorType::STORAGE_BUFFER: return vk::DescriptorType::eStorageBuffer;
+        case DescriptorType::UNIFORM_BUFFER: return vk::DescriptorType::eUniformBuffer;
+        case DescriptorType::STORAGE_IMAGE: return vk::DescriptorType::eStorageImage;
+        case DescriptorType::SAMPLED_IMAGE: return vk::DescriptorType::eSampledImage;
+        case DescriptorType::SAMPLER: return vk::DescriptorType::eSampler;
+        case DescriptorType::COMBINED_IMAGE_SAMPLER: return vk::DescriptorType::eCombinedImageSampler;
+        case DescriptorType::ACCELERATION_STRUCTURE: return vk::DescriptorType::eAccelerationStructureKHR;
+        default: throw std::runtime_error("Unsupported descriptor type");
+    }
+}
+
+vk::ShaderStageFlagBits to_vk_shader_stage(ShaderStageType type) {
+    switch (type) {
+        case ShaderStageType::VERTEX: return vk::ShaderStageFlagBits::eVertex;
+        case ShaderStageType::FRAGMENT: return vk::ShaderStageFlagBits::eFragment;
+        case ShaderStageType::GEOMETRY: return vk::ShaderStageFlagBits::eGeometry;
+        case ShaderStageType::TESS_CONTROL: return vk::ShaderStageFlagBits::eTessellationControl;
+        case ShaderStageType::TESS_EVAL: return vk::ShaderStageFlagBits::eTessellationEvaluation;
+        case ShaderStageType::COMPUTE: return vk::ShaderStageFlagBits::eCompute;
+        default: throw std::runtime_error("Unsupported shader stage type");
+    }
+}
+
+// Stage name understood by glslangValidator's `-S` flag.
+const char* to_glslang_stage_name(ShaderStageType type) {
+    switch (type) {
+        case ShaderStageType::VERTEX: return "vert";
+        case ShaderStageType::FRAGMENT: return "frag";
+        case ShaderStageType::GEOMETRY: return "geom";
+        case ShaderStageType::TESS_CONTROL: return "tesc";
+        case ShaderStageType::TESS_EVAL: return "tese";
+        case ShaderStageType::COMPUTE: return "comp";
+        default: throw std::runtime_error("Unsupported shader stage type");
+    }
+}
+
+// Locates the glslangValidator executable: relies on it being on PATH by
+// default (this project has no build- or link-time dependency on the Vulkan
+// SDK for shader compilation), falling back to $VULKAN_SDK/Bin as a
+// convenience if that environment variable happens to be set and PATH
+// wasn't configured.
+std::string glslang_validator_path() {
+#if defined(_WIN32)
+    constexpr const char* exe_name = "glslangValidator.exe";
+#else
+    constexpr const char* exe_name = "glslangValidator";
+#endif
+    if (const char* sdk = std::getenv("VULKAN_SDK")) {
+        std::filesystem::path candidate = std::filesystem::path(sdk) / "Bin" / exe_name;
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) {
+            return candidate.string();
+        }
+    }
+    return exe_name;
 }
 
 struct DLDataType {
@@ -403,6 +577,138 @@ int scalar_type_size(ScalarType type) {
     }
 }
 
+TypeDescriptor TypeDescriptor::scalar(ScalarType type) {
+    TypeDescriptor td;
+    td.payload_ = ScalarDesc{ type };
+    return td;
+}
+
+TypeDescriptor TypeDescriptor::vector(ScalarType component_type, int components) {
+    if (components < 2 || components > 4)
+        throw std::runtime_error("Vector components must be in [2, 4]");
+    TypeDescriptor td;
+    td.payload_ = VectorDesc{ component_type, components };
+    return td;
+}
+
+TypeDescriptor TypeDescriptor::matrix(ScalarType component_type, int rows, int columns) {
+    if (rows < 2 || rows > 4 || columns < 2 || columns > 4)
+        throw std::runtime_error("Matrix rows/columns must be in [2, 4]");
+    TypeDescriptor td;
+    td.payload_ = MatrixDesc{ component_type, rows, columns };
+    return td;
+}
+
+TypeDescriptor TypeDescriptor::array_of(std::shared_ptr<TypeDescriptor> element_type, std::uint64_t count) {
+    TypeDescriptor td;
+    td.payload_ = ArrayDesc{ std::move(element_type), count };
+    return td;
+}
+
+TypeDescriptor TypeDescriptor::struct_of(std::vector<StructField> fields) {
+    TypeDescriptor td;
+    td.payload_ = StructDesc{ std::move(fields) };
+    return td;
+}
+
+TypeKind TypeDescriptor::kind() const noexcept {
+    // Payload variant alternatives are declared in the same order as TypeKind's values.
+    return static_cast<TypeKind>(payload_.index());
+}
+
+namespace {
+    std::uint64_t round_up(std::uint64_t value, std::uint64_t align) {
+        return align == 0 ? value : ((value + align - 1) / align) * align;
+    }
+
+    // Alignment of an ARRAY/MATRIX built from elements/columns with this
+    // layout, under `rule` (a matrix is laid out as an array of columns).
+    std::uint64_t compute_array_alignment(const std::shared_ptr<Layout>& element_layout, LayoutRule rule) {
+        return rule == LayoutRule::Std140 ? round_up(element_layout->alignment, 16) : element_layout->alignment;
+    }
+
+    // Propagates `root` (the outermost Layout compute_layout() was called for)
+    // into every LayoutField reachable from `layout`, however deeply nested,
+    // so any field can resolve `array_index * root.aligned_size + offset` on
+    // its own (see LayoutField::root). Safe to call redundantly on nested
+    // layouts during construction: the outermost call always runs last and
+    // overwrites everything to point at the true root.
+    void assign_root(const std::shared_ptr<Layout>& layout, const std::weak_ptr<Layout>& root) {
+        if (layout->kind == TypeKind::STRUCT) {
+            for (auto& field : layout->fields) {
+                field.root = root;
+                assign_root(field.layout, root);
+            }
+        } else if (layout->element_layout) {
+            assign_root(layout->element_layout, root);
+        }
+    }
+}
+
+std::shared_ptr<Layout> compute_layout(const TypeDescriptor& type, LayoutRule rule) {
+    auto layout = std::make_shared<Layout>();
+    std::visit([&](auto&& desc) {
+        using T = std::decay_t<decltype(desc)>;
+        if constexpr (std::is_same_v<T, ScalarDesc>) {
+            const std::uint64_t base = static_cast<std::uint64_t>(scalar_type_size(desc.type));
+            layout->kind = TypeKind::SCALAR;
+            layout->size = base;
+            layout->alignment = base;
+            layout->component_type = desc.type;
+        } else if constexpr (std::is_same_v<T, VectorDesc>) {
+            const std::uint64_t base = static_cast<std::uint64_t>(scalar_type_size(desc.component_type));
+            layout->kind = TypeKind::VECTOR;
+            layout->size = static_cast<std::uint64_t>(desc.components) * base;
+            if (rule == LayoutRule::Scalar)
+                layout->alignment = base;
+            else
+                layout->alignment = (desc.components == 2) ? 2 * base : 4 * base;
+            layout->component_type = desc.component_type;
+        } else if constexpr (std::is_same_v<T, MatrixDesc>) {
+            TypeDescriptor column = TypeDescriptor::vector(desc.component_type, desc.rows);
+            auto column_layout = compute_layout(column, rule);
+            layout->kind = TypeKind::MATRIX;
+            layout->element_layout = column_layout;
+            layout->stride = column_layout->aligned_size;
+            layout->count = static_cast<std::uint64_t>(desc.columns);
+            layout->size = layout->stride * layout->count;
+            layout->alignment = compute_array_alignment(column_layout, rule);
+            layout->component_type = desc.component_type;
+        } else if constexpr (std::is_same_v<T, ArrayDesc>) {
+            auto element_layout = compute_layout(*desc.element_type, rule);
+            layout->kind = TypeKind::ARRAY;
+            layout->element_layout = element_layout;
+            layout->stride = element_layout->aligned_size;
+            layout->count = desc.count;
+            layout->size = layout->stride * layout->count;
+            layout->alignment = compute_array_alignment(element_layout, rule);
+        } else if constexpr (std::is_same_v<T, StructDesc>) {
+            std::uint64_t running_offset = 0;
+            std::uint64_t struct_align = 1;
+            std::vector<LayoutField> fields;
+            fields.reserve(desc.fields.size());
+            for (const auto& field : desc.fields) {
+                auto field_layout = compute_layout(*field.type, rule);
+                running_offset = round_up(running_offset, field_layout->alignment);
+                fields.push_back(LayoutField{ field.name, running_offset, field_layout });
+                running_offset += field_layout->size;
+                struct_align = std::max(struct_align, field_layout->alignment);
+            }
+            const std::uint64_t align = (rule == LayoutRule::Std140) ? round_up(struct_align, 16) : struct_align;
+            layout->kind = TypeKind::STRUCT;
+            layout->fields = std::move(fields);
+            layout->alignment = align;
+            layout->size = round_up(running_offset, align);
+        }
+    }, type.payload());
+    // Size this layout would occupy as one element of an array of itself
+    // (see Layout::aligned_size).
+    layout->aligned_size = (rule == LayoutRule::Std140)
+        ? round_up(std::max(layout->size, layout->alignment), 16)
+        : round_up(layout->size, layout->alignment);
+    assign_root(layout, layout);
+    return layout;
+}
 
 ScalarType format_scalar_type(Format format)
 {
@@ -519,7 +825,6 @@ ScalarType format_scalar_type(Format format)
     }
 }
 
-
 vk_ResourceData::vk_ResourceData(
     std::shared_ptr<Device> device, const std::shared_ptr<MemorySlice>& memory,
     vk::Image image, vk::ImageCreateInfo image_info): device_(std::move(device)), memory_(memory), image_(image), image_info_(image_info), resource_type_(image ? ResourceType::IMAGE : ResourceType::BUFFER) {
@@ -573,7 +878,7 @@ vk::BufferView Buffer::get_view() {
     if (!buffer_view_) {
         vk::BufferViewCreateInfo info{};
         info.buffer = data_->get_buffer();
-        info.format = slice_.buffer.format;
+        info.format = (vk::Format)slice_.buffer.format;
         info.offset = data_->get_memory()->offset() + slice_.buffer.offset;
         info.range = slice_.buffer.size;
         auto device = this->data_->device()->logical_device();
@@ -587,7 +892,7 @@ vk::ImageView Image::get_view() {
         auto image_info = data_->get_image_info();
         vk::ImageViewCreateInfo info{};
         info.image = data_->get_image();
-        info.format = slice_.image.format;
+        info.format = (vk::Format)slice_.image.format;
         info.components = vk::ComponentMapping{
             vk::ComponentSwizzle::eIdentity,
             vk::ComponentSwizzle::eIdentity,
@@ -619,7 +924,7 @@ void SubmittedTask::wait() {
 bool SubmittedTask::is_complete() {
     auto e = engine_.lock();
     if (!e) return true;
-    return submission_id_ <= e->vk_check_completation();
+    return submission_id_ <= e->vk_check_completion();
 }
 
 void SubmittedTask::vk_notify_completion() {
@@ -636,54 +941,118 @@ vk_CommandBuffer::vk_CommandBuffer(vk::CommandBuffer command_buffer) noexcept {
 
 void vk_CommandBuffer::begin() {
     assert(state == vk_CommandBufferInternalState::CREATED || state == vk_CommandBufferInternalState::EXECUTABLE);
-    if (state == EXECUTABLE) {
+    if (state == vk_CommandBufferInternalState::EXECUTABLE) {
         command_buffer.reset({});
     }
     command_buffer.begin(vk::CommandBufferBeginInfo{});
-    state = RECORDING;
+    state = vk_CommandBufferInternalState::RECORDING;
 }
 
 void vk_CommandBuffer::end() {
     assert(state == vk_CommandBufferInternalState::RECORDING);
     command_buffer.end();
-    state = EXECUTABLE;
+    state = vk_CommandBufferInternalState::EXECUTABLE;
 }
 
 void vk_CommandBuffer::notify_submitted() {
     assert(state == vk_CommandBufferInternalState::EXECUTABLE);
-    state = SUBMITTED;
+    state = vk_CommandBufferInternalState::SUBMITTED;
 }
 
 void vk_CommandBuffer::notify_executed() {
     assert(state == vk_CommandBufferInternalState::SUBMITTED);
-    state = EXECUTABLE;
+    state = vk_CommandBufferInternalState::EXECUTABLE;
 }
 
 void CommandBuffer::close() {
     command_buffer_->end();
 }
 
-void CommandBuffer::transfer(const std::shared_ptr<Buffer>& source, const std::shared_ptr<Buffer>& destination, int bytes) {
+void CommandBuffer::transfer(const std::shared_ptr<Buffer>& source, const std::shared_ptr<Buffer>& destination) {
     if (is_closed()) {
         throw std::runtime_error("Cannot record a transfer into a closed command buffer");
     }
-    if (bytes <= 0 || bytes > source->size() || bytes > destination->size()) {
-        throw std::runtime_error("Invalid transfer size");
-    }
+    std::uint64_t bytes = source->size();
+    assert(destination->size() == bytes);
     vk::BufferCopy region(source->vk_buffer_offset(), destination->vk_buffer_offset(), static_cast<vk::DeviceSize>(bytes));
     command_buffer_->command_buffer.copyBuffer(source->vk_buffer(), destination->vk_buffer(), region);
+}
+
+void CommandBuffer::set_pipeline(const std::shared_ptr<Pipeline>& pipeline) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot set a pipeline on a closed command buffer");
+    }
+    auto vk_pipeline = pipeline->vk_pipeline();
+    if (!vk_pipeline->is_closed()) {
+        throw std::runtime_error("CommandBuffer::set_pipeline: pipeline must be closed first");
+    }
+    const vk::PipelineBindPoint bind_point = vk_pipeline->type() == PipelineType::COMPUTE
+        ? vk::PipelineBindPoint::eCompute
+        : vk::PipelineBindPoint::eGraphics;
+    command_buffer_->command_buffer.bindPipeline(bind_point, vk_pipeline->vk_handle());
+    // Appended, not overwritten: a command buffer may bind several
+    // pipelines over the course of one recording, and every one of them
+    // must stay alive (its raw vk::Pipeline handle is already baked into
+    // this command buffer) for as long as this command buffer is.
+    bound_pipelines_.push_back(pipeline);
+}
+
+void CommandBuffer::bind(int initial_set, const std::vector<std::shared_ptr<DescriptorSet>>& descriptor_sets) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot bind descriptor sets on a closed command buffer");
+    }
+    if (bound_pipelines_.empty()) {
+        throw std::runtime_error("CommandBuffer::bind: no pipeline is currently bound (call set_pipeline first)");
+    }
+    if (descriptor_sets.empty()) return;
+    auto vk_pipeline = bound_pipelines_.back()->vk_pipeline();
+    const vk::PipelineBindPoint bind_point = vk_pipeline->type() == PipelineType::COMPUTE
+        ? vk::PipelineBindPoint::eCompute
+        : vk::PipelineBindPoint::eGraphics;
+    std::vector<vk::DescriptorSet> sets;
+    sets.reserve(descriptor_sets.size());
+    for (const auto& ds : descriptor_sets) {
+        sets.push_back(ds->vk_descriptor_set()->vk_handle());
+    }
+    command_buffer_->command_buffer.bindDescriptorSets(
+        bind_point, vk_pipeline->vk_pipeline_layout(), static_cast<std::uint32_t>(initial_set), sets, {});
+    // Appended, not overwritten: see bound_pipelines_ above -- the same
+    // applies to every descriptor set ever bound during this recording.
+    bound_descriptor_sets_.insert(bound_descriptor_sets_.end(), descriptor_sets.begin(), descriptor_sets.end());
+}
+
+void CommandBuffer::dispatch_threads(std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot dispatch on a closed command buffer");
+    }
+    if (bound_pipelines_.empty()) {
+        throw std::runtime_error("CommandBuffer::dispatch_threads: no pipeline is currently bound (call set_pipeline first)");
+    }
+    auto vk_pipeline = bound_pipelines_.back()->vk_pipeline();
+    if (vk_pipeline->type() != PipelineType::COMPUTE) {
+        throw std::runtime_error("CommandBuffer::dispatch_threads: bound pipeline is not a COMPUTE pipeline");
+    }
+    auto group_count = [](std::uint32_t threads, std::uint32_t local_size) {
+        return (threads + local_size - 1) / local_size;
+    };
+    command_buffer_->command_buffer.dispatch(
+        group_count(x, vk_pipeline->vk_local_size_x()),
+        group_count(y, vk_pipeline->vk_local_size_y()),
+        group_count(z, vk_pipeline->vk_local_size_z()));
 }
 
 void CommandBuffer::release() {
     if (device_ == nullptr)
         return;
-    if (command_buffer_->state == SUBMITTED) {
+    if (command_buffer_->state == vk_CommandBufferInternalState::SUBMITTED) {
         throw std::runtime_error("Command buffer can not be released while submitted. Explicitly use wait before releasing.");
     }
     engine_->vk_release_command_buffer(command_buffer_);
     command_buffer_.reset();
     device_.reset();
     engine_.reset();
+    bound_pipelines_.clear();
+    bound_descriptor_sets_.clear();
 }
 
 void vk_Engine::dispose() noexcept {
@@ -725,7 +1094,7 @@ std::shared_ptr<vk_CommandBuffer> vk_Engine::create_command_buffer() {
 }
 
 void vk_Engine::release_command_buffer(std::shared_ptr<vk_CommandBuffer> command_buffer) {
-    if (command_buffer->state == RECORDING)
+    if (command_buffer->state == vk_CommandBufferInternalState::RECORDING)
         command_buffer->end(); // close unfinished command buffer first before reset
     assert(command_buffer->state == vk_CommandBufferInternalState::EXECUTABLE);
     reusable_command_buffers_.push_back(command_buffer);
@@ -780,7 +1149,7 @@ void vk_Engine::vk_wait_for(std::uint64_t submission_id) {
     vk_collect_all_completed(submission_id);
 }
 
-std::uint64_t vk_Engine::vk_check_completation() {
+std::uint64_t vk_Engine::vk_check_completion() {
     std::uint64_t gpu_timeline_value = std::numeric_limits<std::uint64_t>::max();
     if (auto d = device_.lock()) {
         if (d->logical_device().getSemaphoreCounterValue(timeline_semaphore_, &gpu_timeline_value) != vk::Result::eSuccess)
@@ -862,7 +1231,7 @@ std::shared_ptr<Buffer> Buffer::cast_format(Format new_format) const {
     view_slice.type = ResourceType::BUFFER;
     view_slice.buffer.offset = slice_.buffer.offset;
     view_slice.buffer.size = slice_.buffer.size;
-    view_slice.buffer.format = (vk::Format)new_format;
+    view_slice.buffer.format = new_format;
     view_slice.buffer.scalar = slice_.buffer.scalar;
     return std::make_shared<Buffer>(data_, view_slice);
 }
@@ -880,7 +1249,7 @@ std::shared_ptr<Buffer> Buffer::cast_scalar(ScalarType new_scalar) const {
     return std::make_shared<Buffer>(data_, view_slice);
 }
 
-std::shared_ptr<Buffer> Buffer::slice(int offset, int size) const {
+std::shared_ptr<Buffer> Buffer::slice(std::uint64_t offset, std::uint64_t size) const {
     if (data_->resource_type() != ResourceType::BUFFER) {
         throw std::runtime_error("buffer_slice can only be called on buffer resources");
     }
@@ -896,12 +1265,12 @@ std::shared_ptr<Buffer> Buffer::slice(int offset, int size) const {
     return std::make_shared<Buffer>(data_, view_slice);
 }
 
-std::shared_ptr<Buffer> Buffer::slice_array(int start, int count) const {
+std::shared_ptr<Buffer> Buffer::slice_array(std::uint64_t start, std::uint64_t count) const {
     int scalar_size = scalar_type_size(slice_.buffer.scalar);
     return slice(start * scalar_size, count * scalar_size);
 }
 
-pybind11::object Buffer::dlpack() const {
+pybind11::object Buffer::vk_dlpack() const {
     void* ptr = nullptr;
     auto memory = data_->get_memory();
     DLDevice device = memory->dl_device();
@@ -934,7 +1303,106 @@ pybind11::object Buffer::dlpack() const {
     return export_dltensor_py(managed);
 }
 
-std::shared_ptr<Image> Image::cast_format(vk::Format new_format) const {
+DLDevice Buffer::vk_dlpack_device() const noexcept {
+    return data_->get_memory()->dl_device();
+}
+
+namespace {
+    // Leaf scalar component type of `layout`: itself for SCALAR/VECTOR/MATRIX,
+    // or recursively its element's for ARRAY. Throws for STRUCT (and any
+    // layout that somehow has neither a component_type nor an element_layout),
+    // since a struct isn't a single numeric type.
+    ScalarType resolve_component_type(const Layout& layout) {
+        if (layout.component_type != ScalarType::UNDEFINED) {
+            return layout.component_type;
+        }
+        if (layout.element_layout) {
+            return resolve_component_type(*layout.element_layout);
+        }
+        throw std::runtime_error("Cannot resolve a scalar component type for this layout");
+    }
+
+    // Appends the tensor dimensions (shape + strides, in elements of
+    // `scalar_size`-byte components) contributed by `layout` itself: none for
+    // SCALAR, one for VECTOR, two for MATRIX (columns, rows), and one plus
+    // whatever its element contributes for ARRAY. Throws for STRUCT.
+    void append_tensor_dims(const Layout& layout, std::uint64_t scalar_size,
+        std::vector<std::int64_t>& shape, std::vector<std::int64_t>& strides) {
+        switch (layout.kind) {
+            case TypeKind::SCALAR:
+                break;
+            case TypeKind::VECTOR:
+                shape.push_back(static_cast<std::int64_t>(layout.size / scalar_size));
+                strides.push_back(1);
+                break;
+            case TypeKind::MATRIX:
+                shape.push_back(static_cast<std::int64_t>(layout.count));
+                shape.push_back(static_cast<std::int64_t>(layout.element_layout->size / scalar_size));
+                strides.push_back(static_cast<std::int64_t>(layout.stride / scalar_size));
+                strides.push_back(1);
+                break;
+            case TypeKind::ARRAY:
+                shape.push_back(static_cast<std::int64_t>(layout.count));
+                strides.push_back(static_cast<std::int64_t>(layout.stride / scalar_size));
+                append_tensor_dims(*layout.element_layout, scalar_size, shape, strides);
+                break;
+            case TypeKind::STRUCT:
+                throw std::runtime_error("Cannot create a dlpack tensor view over a struct field; "
+                    "select a scalar/vector/matrix/array field instead");
+        }
+    }
+}
+
+pybind11::object Buffer::field(const LayoutField& field) const {
+    auto root = field.root.lock();
+    if (!root) {
+        throw std::runtime_error("LayoutField has no root layout (was it obtained from compute_layout()?)");
+    }
+    if (field.layout->kind == TypeKind::STRUCT) {
+        throw std::runtime_error("Cannot create a dlpack tensor view over a struct field; "
+            "select a scalar/vector/matrix/array field instead");
+    }
+    if (external_ptr() == 0) {
+        throw std::runtime_error("A DEVICE tensor was requested but the external pointer is unavailable");
+    }
+
+    const ScalarType component_type = resolve_component_type(*field.layout);
+    const std::uint64_t scalar_size = static_cast<std::uint64_t>(scalar_type_size(component_type));
+
+    std::vector<std::int64_t> shape;
+    std::vector<std::int64_t> strides;
+    // Outer dimension: how many instances of `root` this buffer holds.
+    const std::uint64_t instance_count = root->aligned_size > 0 ? size() / root->aligned_size : 1;
+    shape.push_back(static_cast<std::int64_t>(instance_count));
+    strides.push_back(static_cast<std::int64_t>(root->aligned_size / scalar_size));
+    append_tensor_dims(*field.layout, scalar_size, shape, strides);
+
+    auto memory = data_->get_memory();
+    const int dimension = static_cast<int>(shape.size());
+    auto* owner = new TensorOwner();
+    owner->memory = memory;
+    owner->shape = std::make_unique<std::int64_t[]>(dimension);
+    owner->strides = std::make_unique<std::int64_t[]>(dimension);
+    for (int i = 0; i < dimension; ++i) {
+        owner->shape[i] = shape[i];
+        owner->strides[i] = strides[i];
+    }
+
+    auto* managed = new DLManagedTensor{};
+    managed->dl_tensor.data = reinterpret_cast<char*>(static_cast<std::uintptr_t>(external_ptr())) + field.offset;
+    managed->dl_tensor.device = memory->dl_device();
+    managed->dl_tensor.ndim = dimension;
+    managed->dl_tensor.dtype = dlpack_dtype(component_type);
+    managed->dl_tensor.shape = owner->shape.get();
+    managed->dl_tensor.strides = owner->strides.get();
+    managed->dl_tensor.byte_offset = 0;
+    managed->manager_ctx = owner;
+    managed->deleter = dlmanaged_tensor_deleter;
+
+    return export_dltensor_py(managed);
+}
+
+std::shared_ptr<Image> Image::cast_format(Format new_format) const {
     if (data_->resource_type() != ResourceType::IMAGE) {
         throw std::runtime_error("image_cast can only be called on image resources");
     }
@@ -1183,7 +1651,527 @@ std::shared_ptr<Engine> Device::create_engine(EngineType type, uint32_t index) {
 }
 
 std::shared_ptr<Pipeline> Device::create_pipeline(PipelineType type) {
-    return nullptr;
+    auto pipeline = std::make_shared<vk_Pipeline>(shared_from_this(), type);
+    return std::make_shared<Pipeline>(shared_from_this(), pipeline);
+}
+
+ShaderSource ShaderSource::from_spirv(std::vector<std::uint32_t> code, const std::string& entry_point) {
+    ShaderSource source;
+    source.code_ = std::move(code);
+    source.entry_point_ = entry_point;
+    return source;
+}
+
+ShaderSource ShaderSource::from_glsl(
+    const std::string& source_text,
+    ShaderStageType stage,
+    const std::string& entry_point,
+    const std::vector<std::string>& include_dirs) {
+    namespace fs = std::filesystem;
+
+    // Shells out to glslangValidator rather than linking shaderc, so this
+    // project has no build- or link-time dependency on the Vulkan SDK --
+    // only a runtime dependency on glslangValidator being available. The
+    // source is piped through the child's stdin (no temp input file needed);
+    // the compiled SPIR-V and any diagnostics always land in the same two
+    // fixed-name temp files (calls are expected to happen one at a time, not
+    // concurrently from multiple threads).
+    const fs::path dir = fs::temp_directory_path();
+    const fs::path output_path = dir / "temp_shader_compilation_output.temp.spv";
+    const fs::path log_path = dir / "temp_shader_compilation_output.temp.log";
+
+    std::string command =
+        "\"" + glslang_validator_path() + "\" --stdin -V -S " + to_glslang_stage_name(stage) +
+        " --source-entrypoint " + entry_point + " -e " + entry_point;
+    for (const auto& include_dir : include_dirs) {
+        command += " -I\"" + include_dir + "\"";
+    }
+    command += " -o \"" + output_path.string() + "\" > \"" + log_path.string() + "\" 2>&1";
+#if defined(_WIN32)
+    // Both system() and _popen() on Windows run the command through
+    // `cmd.exe /c`, which has a well known quirk: a command line whose
+    // first token is itself quoted (as ours is, to handle spaces in the
+    // executable path) gets mis-parsed ("The filename, directory name, or
+    // volume label syntax is incorrect.") unless the entire command is
+    // wrapped in one more, outer pair of quotes.
+    command = "\"" + command + "\"";
+    FILE* pipe = _popen(command.c_str(), "wb");
+#else
+    FILE* pipe = popen(command.c_str(), "w");
+#endif
+    if (!pipe) {
+        throw std::runtime_error("ShaderSource::from_glsl: failed to launch glslangValidator");
+    }
+    std::fwrite(source_text.data(), 1, source_text.size(), pipe);
+#if defined(_WIN32)
+    const int exit_code = _pclose(pipe);
+#else
+    const int exit_code = pclose(pipe);
+#endif
+
+    std::string log;
+    {
+        std::ifstream log_file(log_path, std::ios::binary);
+        if (log_file) {
+            std::ostringstream oss;
+            oss << log_file.rdbuf();
+            log = oss.str();
+        }
+    }
+    std::error_code ec;
+    fs::remove(log_path, ec);
+
+    if (exit_code != 0) {
+        fs::remove(output_path, ec);
+        throw std::runtime_error(
+            "ShaderSource::from_glsl: glslangValidator failed (is it installed and on PATH?):\n" + log);
+    }
+
+    std::vector<std::uint32_t> code;
+    {
+        std::ifstream output_file(output_path, std::ios::binary | std::ios::ate);
+        if (!output_file) {
+            throw std::runtime_error("ShaderSource::from_glsl: glslangValidator did not produce an output file");
+        }
+        const std::streamsize length = output_file.tellg();
+        output_file.seekg(0);
+        code.resize(static_cast<std::size_t>(length) / 4);
+        output_file.read(reinterpret_cast<char*>(code.data()), length);
+    }
+    fs::remove(output_path, ec);
+
+    return from_spirv(std::move(code), entry_point);
+}
+
+ShaderSource ShaderSource::from_file(
+    const std::string& path,
+    ShaderStageType stage,
+    const std::string& entry_point,
+    const std::vector<std::string>& include_dirs) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        throw std::runtime_error("ShaderSource::from_file: cannot open '" + path + "'");
+    }
+    const std::streamsize length = file.tellg();
+    file.seekg(0);
+
+    const bool is_spirv_binary = path.size() >= 4 && path.compare(path.size() - 4, 4, ".spv") == 0;
+    if (is_spirv_binary) {
+        if (length % 4 != 0) {
+            throw std::runtime_error("ShaderSource::from_file: '" + path + "' is not a valid SPIR-V binary (size not a multiple of 4)");
+        }
+        std::vector<std::uint32_t> code(static_cast<std::size_t>(length) / 4);
+        file.read(reinterpret_cast<char*>(code.data()), length);
+        return from_spirv(std::move(code), entry_point);
+    }
+
+    std::string text(static_cast<std::size_t>(length), '\0');
+    file.read(text.data(), length);
+    return from_glsl(text, stage, entry_point, include_dirs);
+}
+
+vk_Pipeline::vk_Pipeline(std::weak_ptr<Device> device, PipelineType type)
+    : device_(std::move(device)), type_(type) {}
+
+vk_Pipeline::~vk_Pipeline() noexcept {
+    auto device = device_.lock();
+    if (!device || device->is_disposed()) return;
+    vk::Device dev = device->logical_device();
+    for (const auto& stage : stages_) {
+        dev.destroyShaderModule(stage.module);
+    }
+    if (pipeline_) dev.destroyPipeline(pipeline_);
+    if (pipeline_layout_) dev.destroyPipelineLayout(pipeline_layout_);
+    if (render_pass_) dev.destroyRenderPass(render_pass_);
+    if (descriptor_pool_) dev.destroyDescriptorPool(descriptor_pool_);
+    for (auto& set_layout : descriptor_set_layouts_) {
+        if (set_layout) dev.destroyDescriptorSetLayout(set_layout);
+    }
+}
+
+void vk_Pipeline::vk_stage(ShaderStageType type, const ShaderSource& source) {
+    if (closed_) throw std::runtime_error("Pipeline::stage: pipeline is already closed");
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Pipeline::stage: device has been disposed");
+    vk::ShaderModuleCreateInfo info{};
+    info.codeSize = source.vk_code().size() * sizeof(std::uint32_t);
+    info.pCode = source.vk_code().data();
+    vk::ShaderModule module = device->logical_device().createShaderModule(info);
+    stages_.push_back({ type, module, source.vk_entry_point() });
+}
+
+int vk_Pipeline::vk_layout(int set, int binding, DescriptorType description, int count) {
+    if (closed_) throw std::runtime_error("Pipeline::layout: pipeline is already closed");
+    if (set < 0 || binding < 0 || count <= 0) throw std::runtime_error("Pipeline::layout: invalid set/binding/count");
+    bindings_.push_back({ set, binding, description, count });
+    return static_cast<int>(bindings_.size()) - 1;
+}
+
+void vk_Pipeline::vk_vertex_layout(int start_location, const Layout& layout) {
+    if (closed_) throw std::runtime_error("Pipeline::vertex_layout: pipeline is already closed");
+    if (type_ != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::vertex_layout: only valid for RASTERIZATION pipelines");
+    if (layout.kind != TypeKind::STRUCT) throw std::runtime_error("Pipeline::vertex_layout: layout must describe a struct");
+
+    VertexBinding binding{};
+    binding.stride = layout.aligned_size;
+    int location = start_location;
+    for (const auto& field : layout.fields) {
+        const Layout& field_layout = *field.layout;
+        if (field_layout.kind == TypeKind::MATRIX) {
+            const int column_components = static_cast<int>(field_layout.element_layout->size / scalar_type_size(field_layout.component_type));
+            const Format fmt = vertex_attribute_format(field_layout.component_type, column_components);
+            for (std::uint64_t c = 0; c < field_layout.count; ++c) {
+                binding.fields.push_back({ location++, (vk::Format)fmt, field.offset + c * field_layout.stride });
+            }
+        } else if (field_layout.kind == TypeKind::SCALAR || field_layout.kind == TypeKind::VECTOR) {
+            const int components = field_layout.kind == TypeKind::SCALAR
+                ? 1
+                : static_cast<int>(field_layout.size / scalar_type_size(field_layout.component_type));
+            const Format fmt = vertex_attribute_format(field_layout.component_type, components);
+            binding.fields.push_back({ location++, (vk::Format)fmt, field.offset });
+        } else {
+            throw std::runtime_error("Pipeline::vertex_layout: fields must be scalar, vector or matrix");
+        }
+    }
+    vertex_bindings_.push_back(std::move(binding));
+}
+
+int vk_Pipeline::vk_attach(int slot, Format format) {
+    if (closed_) throw std::runtime_error("Pipeline::attach: pipeline is already closed");
+    if (type_ != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::attach: only valid for RASTERIZATION pipelines");
+    for (const auto& attachment : attachments_) {
+        if (attachment.slot == slot) throw std::runtime_error("Pipeline::attach: slot already attached");
+    }
+    attachments_.push_back({ slot, format });
+    return slot;
+}
+
+void vk_Pipeline::vk_set_local_size(std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    if (closed_) throw std::runtime_error("Pipeline::local_size: pipeline is already closed");
+    if (type_ != PipelineType::COMPUTE) throw std::runtime_error("Pipeline::local_size: only valid for COMPUTE pipelines");
+    if (x == 0 || y == 0 || z == 0) throw std::runtime_error("Pipeline::local_size: dimensions must be positive");
+    local_size_x_ = x;
+    local_size_y_ = y;
+    local_size_z_ = z;
+}
+
+void vk_Pipeline::vk_close() {
+    if (closed_) throw std::runtime_error("Pipeline::close: already closed");
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Pipeline::close: device has been disposed");
+    vk::Device dev = device->logical_device();
+
+    int max_set = -1;
+    for (const auto& binding : bindings_) max_set = std::max(max_set, binding.set);
+    descriptor_set_layouts_.assign(static_cast<std::size_t>(max_set + 1), vk::DescriptorSetLayout{});
+    for (int set = 0; set <= max_set; ++set) {
+        std::vector<vk::DescriptorSetLayoutBinding> vk_bindings;
+        for (const auto& binding : bindings_) {
+            if (binding.set != set) continue;
+            vk::DescriptorSetLayoutBinding vk_binding{};
+            vk_binding.binding = static_cast<std::uint32_t>(binding.binding);
+            vk_binding.descriptorType = to_vk_descriptor_type(binding.type);
+            vk_binding.descriptorCount = static_cast<std::uint32_t>(binding.count);
+            vk_binding.stageFlags = vk::ShaderStageFlagBits::eAll;
+            vk_bindings.push_back(vk_binding);
+        }
+        vk::DescriptorSetLayoutCreateInfo layout_info{};
+        layout_info.bindingCount = static_cast<std::uint32_t>(vk_bindings.size());
+        layout_info.pBindings = vk_bindings.data();
+        descriptor_set_layouts_[static_cast<std::size_t>(set)] = dev.createDescriptorSetLayout(layout_info);
+    }
+
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.setLayoutCount = static_cast<std::uint32_t>(descriptor_set_layouts_.size());
+    pipeline_layout_info.pSetLayouts = descriptor_set_layouts_.data();
+    pipeline_layout_ = dev.createPipelineLayout(pipeline_layout_info);
+
+    if (max_set >= 0) {
+        // Sized to allow a handful of independently-allocated descriptor sets
+        // per declared set index (e.g. for multi-buffering); not a hard
+        // architectural limit, just a pragmatic default pool size.
+        constexpr std::uint32_t kMaxSetInstances = 16;
+        std::unordered_map<VkDescriptorType, std::uint32_t> counts;
+        for (const auto& binding : bindings_) {
+            counts[static_cast<VkDescriptorType>(to_vk_descriptor_type(binding.type))] += static_cast<std::uint32_t>(binding.count) * kMaxSetInstances;
+        }
+        std::vector<vk::DescriptorPoolSize> pool_sizes;
+        pool_sizes.reserve(counts.size());
+        for (auto& [vk_type, count] : counts) {
+            pool_sizes.push_back({ static_cast<vk::DescriptorType>(vk_type), count });
+        }
+        vk::DescriptorPoolCreateInfo pool_info{};
+        pool_info.maxSets = static_cast<std::uint32_t>(descriptor_set_layouts_.size()) * kMaxSetInstances;
+        pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
+        pool_info.pPoolSizes = pool_sizes.data();
+        pool_info.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
+        descriptor_pool_ = dev.createDescriptorPool(pool_info);
+    }
+
+    std::vector<vk::PipelineShaderStageCreateInfo> stage_infos;
+    stage_infos.reserve(stages_.size());
+    for (const auto& stage : stages_) {
+        vk::PipelineShaderStageCreateInfo info{};
+        info.stage = to_vk_shader_stage(stage.type);
+        info.module = stage.module;
+        info.pName = stage.entry_point.c_str();
+        stage_infos.push_back(info);
+    }
+
+    if (type_ == PipelineType::COMPUTE) {
+        if (stage_infos.size() != 1 || stages_[0].type != ShaderStageType::COMPUTE) {
+            throw std::runtime_error("Pipeline::close: a COMPUTE pipeline requires exactly one COMPUTE stage");
+        }
+        vk::ComputePipelineCreateInfo info{};
+        info.stage = stage_infos[0];
+        info.layout = pipeline_layout_;
+        auto result = dev.createComputePipeline(nullptr, info);
+        if (result.result != vk::Result::eSuccess) throw std::runtime_error("Pipeline::close: failed to create compute pipeline");
+        pipeline_ = result.value;
+    } else if (type_ == PipelineType::RASTERIZATION) {
+        std::vector<vk::AttachmentDescription> attachment_descs;
+        std::vector<vk::AttachmentReference> attachment_refs;
+        attachment_descs.reserve(attachments_.size());
+        attachment_refs.reserve(attachments_.size());
+        for (std::size_t i = 0; i < attachments_.size(); ++i) {
+            vk::AttachmentDescription desc{};
+            desc.format = (vk::Format)attachments_[i].format;
+            desc.samples = vk::SampleCountFlagBits::e1;
+            desc.loadOp = vk::AttachmentLoadOp::eClear;
+            desc.storeOp = vk::AttachmentStoreOp::eStore;
+            desc.stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+            desc.stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+            desc.initialLayout = vk::ImageLayout::eUndefined;
+            desc.finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+            attachment_descs.push_back(desc);
+            attachment_refs.push_back({ static_cast<std::uint32_t>(i), vk::ImageLayout::eColorAttachmentOptimal });
+        }
+        vk::SubpassDescription subpass{};
+        subpass.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
+        subpass.colorAttachmentCount = static_cast<std::uint32_t>(attachment_refs.size());
+        subpass.pColorAttachments = attachment_refs.data();
+
+        vk::RenderPassCreateInfo render_pass_info{};
+        render_pass_info.attachmentCount = static_cast<std::uint32_t>(attachment_descs.size());
+        render_pass_info.pAttachments = attachment_descs.data();
+        render_pass_info.subpassCount = 1;
+        render_pass_info.pSubpasses = &subpass;
+        render_pass_ = dev.createRenderPass(render_pass_info);
+
+        std::vector<vk::VertexInputBindingDescription> binding_descs;
+        std::vector<vk::VertexInputAttributeDescription> attribute_descs;
+        for (std::size_t b = 0; b < vertex_bindings_.size(); ++b) {
+            binding_descs.push_back({
+                static_cast<std::uint32_t>(b),
+                static_cast<std::uint32_t>(vertex_bindings_[b].stride),
+                vk::VertexInputRate::eVertex
+            });
+            for (const auto& field : vertex_bindings_[b].fields) {
+                attribute_descs.push_back({
+                    static_cast<std::uint32_t>(field.location),
+                    static_cast<std::uint32_t>(b),
+                    field.format,
+                    static_cast<std::uint32_t>(field.offset)
+                });
+            }
+        }
+        vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
+        vertex_input_info.vertexBindingDescriptionCount = static_cast<std::uint32_t>(binding_descs.size());
+        vertex_input_info.pVertexBindingDescriptions = binding_descs.data();
+        vertex_input_info.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attribute_descs.size());
+        vertex_input_info.pVertexAttributeDescriptions = attribute_descs.data();
+
+        vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+        input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+
+        vk::PipelineViewportStateCreateInfo viewport_state{};
+        viewport_state.viewportCount = 1;
+        viewport_state.scissorCount = 1;
+
+        vk::PipelineRasterizationStateCreateInfo rasterization{};
+        rasterization.polygonMode = vk::PolygonMode::eFill;
+        rasterization.cullMode = vk::CullModeFlagBits::eNone;
+        rasterization.frontFace = vk::FrontFace::eCounterClockwise;
+        rasterization.lineWidth = 1.0f;
+
+        vk::PipelineMultisampleStateCreateInfo multisample{};
+        multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+
+        std::vector<vk::PipelineColorBlendAttachmentState> blend_attachments(attachments_.size());
+        for (auto& blend : blend_attachments) {
+            blend.blendEnable = VK_FALSE;
+            blend.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG
+                | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        }
+        vk::PipelineColorBlendStateCreateInfo color_blend{};
+        color_blend.attachmentCount = static_cast<std::uint32_t>(blend_attachments.size());
+        color_blend.pAttachments = blend_attachments.data();
+
+        std::array<vk::DynamicState, 2> dynamic_states{ vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+        vk::PipelineDynamicStateCreateInfo dynamic_state{};
+        dynamic_state.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+        dynamic_state.pDynamicStates = dynamic_states.data();
+
+        vk::GraphicsPipelineCreateInfo info{};
+        info.stageCount = static_cast<std::uint32_t>(stage_infos.size());
+        info.pStages = stage_infos.data();
+        info.pVertexInputState = &vertex_input_info;
+        info.pInputAssemblyState = &input_assembly;
+        info.pViewportState = &viewport_state;
+        info.pRasterizationState = &rasterization;
+        info.pMultisampleState = &multisample;
+        info.pColorBlendState = &color_blend;
+        info.pDynamicState = &dynamic_state;
+        info.layout = pipeline_layout_;
+        info.renderPass = render_pass_;
+        info.subpass = 0;
+
+        auto result = dev.createGraphicsPipeline(nullptr, info);
+        if (result.result != vk::Result::eSuccess) throw std::runtime_error("Pipeline::close: failed to create graphics pipeline");
+        pipeline_ = result.value;
+    } else {
+        throw std::runtime_error("Pipeline::close: RAYTRACING pipelines are not yet supported");
+    }
+
+    for (const auto& stage : stages_) dev.destroyShaderModule(stage.module);
+    stages_.clear();
+
+    closed_ = true;
+}
+
+vk::DescriptorSet vk_Pipeline::vk_allocate_descriptor_set(int set) {
+    if (!closed_) throw std::runtime_error("Pipeline::create_descriptor_set: pipeline must be closed first");
+    if (set < 0 || set >= static_cast<int>(descriptor_set_layouts_.size())) {
+        throw std::runtime_error("Pipeline::create_descriptor_set: invalid set index");
+    }
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Pipeline::create_descriptor_set: device has been disposed");
+    vk::DescriptorSetAllocateInfo alloc_info{};
+    alloc_info.descriptorPool = descriptor_pool_;
+    alloc_info.descriptorSetCount = 1;
+    alloc_info.pSetLayouts = &descriptor_set_layouts_[static_cast<std::size_t>(set)];
+    return device->logical_device().allocateDescriptorSets(alloc_info)[0];
+}
+
+const vk_DescriptorBinding& vk_Pipeline::vk_binding(int layout_id) const {
+    if (layout_id < 0 || layout_id >= static_cast<int>(bindings_.size())) {
+        throw std::runtime_error("Invalid layout_id");
+    }
+    return bindings_[static_cast<std::size_t>(layout_id)];
+}
+
+std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<int, std::shared_ptr<Image>>> attachments) {
+    if (!pipeline_->is_closed()) throw std::runtime_error("Pipeline::create_framebuffer: pipeline must be closed first");
+    if (pipeline_->type() != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::create_framebuffer: only valid for RASTERIZATION pipelines");
+
+    const auto& attachment_descs = pipeline_->vk_attachments();
+    std::vector<vk::ImageView> views(attachment_descs.size());
+    std::vector<bool> filled(attachment_descs.size(), false);
+    std::uint32_t width = 0, height = 0;
+
+    for (auto& [slot, image] : attachments) {
+        int index = -1;
+        for (std::size_t i = 0; i < attachment_descs.size(); ++i) {
+            if (attachment_descs[i].slot == slot) { index = static_cast<int>(i); break; }
+        }
+        if (index < 0) throw std::runtime_error("Pipeline::create_framebuffer: no attachment declared for this slot");
+        if (image->format() != attachment_descs[static_cast<std::size_t>(index)].format) {
+            throw std::runtime_error("Pipeline::create_framebuffer: image format does not match the attachment's declared format");
+        }
+        const vk::Extent3D extent = image->vk_image_info().extent;
+        if (width == 0) {
+            width = extent.width;
+            height = extent.height;
+        } else if (width != extent.width || height != extent.height) {
+            throw std::runtime_error("Pipeline::create_framebuffer: attachment images have mismatched dimensions");
+        }
+        views[static_cast<std::size_t>(index)] = image->get_view();
+        filled[static_cast<std::size_t>(index)] = true;
+    }
+    for (bool f : filled) {
+        if (!f) throw std::runtime_error("Pipeline::create_framebuffer: missing an image for one of the declared attachments");
+    }
+
+    vk::FramebufferCreateInfo info{};
+    info.renderPass = pipeline_->vk_render_pass();
+    info.attachmentCount = static_cast<std::uint32_t>(views.size());
+    info.pAttachments = views.data();
+    info.width = width;
+    info.height = height;
+    info.layers = 1;
+
+    vk::Framebuffer framebuffer = device_->logical_device().createFramebuffer(info);
+    auto vk_fb = std::make_shared<vk_Framebuffer>(device_, framebuffer, width, height);
+    return std::make_shared<Framebuffer>(std::move(vk_fb));
+}
+
+std::shared_ptr<DescriptorSet> Pipeline::create_descriptor_set(int set) {
+    vk::DescriptorSet ds = pipeline_->vk_allocate_descriptor_set(set);
+    auto vk_ds = std::make_shared<vk_DescriptorSet>(device_, pipeline_, set, ds);
+    return std::make_shared<DescriptorSet>(std::move(vk_ds));
+}
+
+vk_Framebuffer::vk_Framebuffer(std::weak_ptr<Device> device, vk::Framebuffer framebuffer, std::uint32_t width, std::uint32_t height) noexcept
+    : device_(std::move(device)), framebuffer_(framebuffer), width_(width), height_(height) {}
+
+vk_Framebuffer::~vk_Framebuffer() noexcept {
+    auto device = device_.lock();
+    if (!device || device->is_disposed()) return;
+    if (framebuffer_) device->logical_device().destroyFramebuffer(framebuffer_);
+}
+
+vk_DescriptorSet::vk_DescriptorSet(std::weak_ptr<Device> device, std::shared_ptr<vk_Pipeline> pipeline, int set, vk::DescriptorSet descriptor_set) noexcept
+    : device_(std::move(device)), pipeline_(std::move(pipeline)), set_(set), descriptor_set_(descriptor_set) {}
+
+void vk_DescriptorSet::vk_bind_buffer(int layout_id, const std::shared_ptr<Buffer>& buffer) {
+    const auto& binding = pipeline_->vk_binding(layout_id);
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+    if (binding.type != DescriptorType::STORAGE_BUFFER && binding.type != DescriptorType::UNIFORM_BUFFER) {
+        throw std::runtime_error("DescriptorSet::bind: this binding does not expect a buffer");
+    }
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    vk::DescriptorBufferInfo buffer_info{};
+    buffer_info.buffer = buffer->vk_buffer();
+    buffer_info.offset = buffer->vk_buffer_offset();
+    buffer_info.range = buffer->vk_buffer_size();
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.descriptorCount = 1;
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pBufferInfo = &buffer_info;
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+void vk_DescriptorSet::vk_bind_image(int layout_id, const std::shared_ptr<Image>& image) {
+    const auto& binding = pipeline_->vk_binding(layout_id);
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+    if (binding.type != DescriptorType::STORAGE_IMAGE && binding.type != DescriptorType::SAMPLED_IMAGE) {
+        throw std::runtime_error("DescriptorSet::bind: this binding type requires a sampler, not yet supported");
+    }
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    vk::DescriptorImageInfo image_info{};
+    image_info.imageView = image->get_view();
+    // No layout-tracking exists yet for images (Image has no method to record
+    // or transition its current vk::ImageLayout), so eGeneral is used here as
+    // the one layout valid for both storage-image and sampled-image access
+    // without requiring a prior explicit transition.
+    image_info.imageLayout = vk::ImageLayout::eGeneral;
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.descriptorCount = 1;
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pImageInfo = &image_info;
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
 std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t size, MemoryLocation location) {
@@ -1197,7 +2185,7 @@ std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t size, MemoryLocation
     full_slice.type = ResourceType::BUFFER;
     full_slice.buffer.offset = 0;
     full_slice.buffer.size = size;
-    full_slice.buffer.format = vk::Format::eUndefined;
+    full_slice.buffer.format = Format::Undefined;
     full_slice.buffer.scalar = ScalarType::UINT8;
     auto result = std::make_shared<Buffer>(data, full_slice);
     return result;
@@ -1214,9 +2202,29 @@ std::shared_ptr<Buffer> Device::create_texels(std::uint64_t elements, Format for
     return create_buffer(bytes, location)->cast_format(format)->cast_scalar(format_scalar_type(format));
 }
 
+std::shared_ptr<Buffer> Device::create_structured_buffer(const Layout& layout, MemoryLocation location, int count) {
+    if (count <= 0)
+        throw std::runtime_error("create_structured_buffer: count must be positive");
+    // Always uses aligned_size (not the possibly-tighter size), even for count == 1,
+    // so that buffer_size / layout.aligned_size reliably recovers `count` later
+    // (e.g. in Buffer::field(field)).
+    const std::uint64_t size = layout.aligned_size * static_cast<std::uint64_t>(count);
+    if (size == 0)
+        throw std::runtime_error("create_structured_buffer: computed size is 0");
+    return create_buffer(size, location);
+}
+
 std::shared_ptr<Image> Device::create_image(int width, int height, int depth, int mip_levels,
-    int array_layers, vk::Format format, MemoryLocation location) {
+    int array_layers, Format format, MemoryLocation location) {
     return nullptr;
+}
+
+std::shared_ptr<Buffer> Device::create_staging(const std::shared_ptr<Buffer>& buffer, MemoryLocation location) {
+    return create_buffer(buffer->size(), location);
+}
+
+std::shared_ptr<Buffer> Device::create_staging(const std::shared_ptr<Image>& image, MemoryLocation location) {
+    throw std::runtime_error("create_staging: image staging is not yet supported (Image does not expose its byte size)");
 }
 
 pybind11::object Device::create_tensor_dlpack(const std::vector<std::uint64_t>& shape, ScalarType type, MemoryLocation location) {
@@ -1334,8 +2342,6 @@ vk_Engine::vk_Engine(std::weak_ptr<Device> device, vk::Queue queue, vk::CommandP
     current_submission_id_ = 0;
 }
 
-MemorySlice::MemorySlice() = default;
-
 MemorySlice::MemorySlice(
     std::shared_ptr<Device> device,
     std::shared_ptr<MemoryPage> page,
@@ -1350,37 +2356,6 @@ MemorySlice::MemorySlice(
       allocated_size_(allocated_size),
       offset_(offset),
       size_(size) {}
-
-MemorySlice::MemorySlice(MemorySlice&& other) noexcept
-    : page_(std::move(other.page_)),
-      allocated_offset_(other.allocated_offset_),
-      allocated_size_(other.allocated_size_),
-      offset_(other.offset_),
-      size_(other.size_) {
-    other.page_.reset();
-    other.allocated_offset_ = 0;
-    other.allocated_size_ = 0;
-    other.offset_ = 0;
-    other.size_ = 0;
-}
-
-MemorySlice& MemorySlice::operator=(MemorySlice&& other) noexcept {
-    if (this != &other) {
-        release();
-        page_ = other.page_;
-        allocated_offset_ = other.allocated_offset_;
-        allocated_size_ = other.allocated_size_;
-        offset_ = other.offset_;
-        size_ = other.size_;
-
-        other.page_.reset();
-        other.allocated_offset_ = 0;
-        other.allocated_size_ = 0;
-        other.offset_ = 0;
-        other.size_ = 0;
-    }
-    return *this;
-}
 
 vk::Buffer MemorySlice::page_buffer() const noexcept {
     if (page_) {
@@ -1446,7 +2421,7 @@ MemoryManager::MemoryManager(std::weak_ptr<Device> device, uint32_t memory_type_
 
 MemoryManager::~MemoryManager() noexcept = default;
 
-std::shared_ptr<MemorySlice> MemoryManager::allocate(int size, int alignment) {
+std::shared_ptr<MemorySlice> MemoryManager::allocate(std::uint64_t size, int alignment) {
     auto d = device_.lock();
     if (!d) {
         throw std::runtime_error("Unable to allocate new memory in a disposed device");
@@ -1460,7 +2435,7 @@ std::shared_ptr<MemorySlice> MemoryManager::allocate(int size, int alignment) {
         }
     }
 
-    int page_capacity = std::max(size, next_page_capacity_); // big data create their own page.
+    std::uint64_t page_capacity = std::max(size, next_page_capacity_); // big data create their own page.
 
     pages_.push_back(std::make_shared<MemoryPage>(d, memory_type_index_, host_visible_, page_capacity, try_import_memory_));
     if (next_page_capacity_ <= std::numeric_limits<int>::max() / 2) {
@@ -1601,7 +2576,7 @@ void MemoryPage::free_memory(std::uint64_t allocated_offset) noexcept {
     allocator_->free_memory(allocated_offset);
 }
 
-int MemoryPage::capacity() const noexcept { return capacity_; }
+std::uint64_t MemoryPage::capacity() const noexcept { return capacity_; }
 vk::Buffer MemoryPage::buffer() const noexcept { return buffer_; }
 vk::DeviceMemory MemoryPage::memory() const noexcept { return memory_; }
 std::uint64_t MemoryPage::device_ptr() const noexcept { return device_ptr_; }
@@ -1731,7 +2706,7 @@ void MemoryAllocator::free_memory(std::uint64_t offset) noexcept {
         return;
     }
 
-    const int size = allocation->second;
+    const std::uint64_t size = allocation->second;
     allocations_.erase(allocation);
 
     Range* prev = nullptr;

@@ -11,12 +11,74 @@
 
 namespace py = pybind11;
 
+namespace {
+
+// Typecode for Python's built-in `array` module matching `type`, used to
+// accept a plain list/tuple for Buffer::write() on a VECTOR/MATRIX field
+// (see iterable_to_buffer below). No dependency on numpy: `array.array`
+// already implements the buffer protocol Buffer::write() expects.
+char scalar_type_to_array_typecode(ScalarType type) {
+	switch (type) {
+		case ScalarType::FLOAT32: return 'f';
+		case ScalarType::FLOAT64: return 'd';
+		case ScalarType::INT8: return 'b';
+		case ScalarType::UINT8: return 'B';
+		case ScalarType::INT16: return 'h';
+		case ScalarType::UINT16: return 'H';
+		case ScalarType::INT32: return 'i';
+		case ScalarType::UINT32: return 'I';
+		case ScalarType::INT64: return 'q';
+		case ScalarType::UINT64: return 'Q';
+		default:
+			throw std::runtime_error(
+				"write(): a plain list/tuple isn't supported for this scalar type; pass a numpy array or torch tensor instead");
+	}
+}
+
+// Recursively flattens a nested Python list/tuple (matching a vector's
+// flat shape, or a matrix's row-major nested shape) into `out`, preserving
+// each leaf's original Python number so array.array() below converts it
+// itself (no precision loss going through an intermediate C++ numeric type).
+void flatten_iterable_into(const py::handle& value, py::list& out) {
+	if (py::isinstance<py::list>(value) || py::isinstance<py::tuple>(value)) {
+		for (auto item : value) {
+			flatten_iterable_into(item, out);
+		}
+	} else {
+		out.append(value);
+	}
+}
+
+// Converts a plain Python list/tuple `value` (for a VECTOR or MATRIX field
+// with scalar component type `component_type`) into a Python array.array
+// of the matching typecode, tightly packed in the same row-major order a
+// numpy array of the same nested shape would export via the buffer
+// protocol -- so it can be hand off directly to the existing, unmodified
+// Buffer::write() without any change to its C++ implementation.
+py::object iterable_to_buffer(ScalarType component_type, const py::object& value) {
+	py::list flat;
+	flatten_iterable_into(value, flat);
+	const char typecode = scalar_type_to_array_typecode(component_type);
+	py::object array_module = py::module_::import("array");
+	return array_module.attr("array")(std::string(1, typecode), flat);
+}
+
+} // namespace
+
 PYBIND11_MODULE(vk, m) {
 	m.doc() = "Minimal Vulkan bindings";
 
 	py::enum_<MemoryLocation>(m, "MemoryLocation")
 		.value("HOST", MemoryLocation::HOST)
 		.value("DEVICE", MemoryLocation::DEVICE)
+		.export_values();
+
+	// C++ enumerator names avoid the literal IN/OUT (Windows headers
+	// #define these), but the Python-facing names are exactly IN/OUT/INOUT.
+	py::enum_<WrapMode>(m, "WrapMode")
+		.value("IN", WrapMode::CopyIn)
+		.value("OUT", WrapMode::CopyOut)
+		.value("INOUT", WrapMode::CopyInOut)
 		.export_values();
 
 	py::enum_<ScalarType>(m, "ScalarType")
@@ -82,10 +144,16 @@ PYBIND11_MODULE(vk, m) {
 		.value("COMBINED_IMAGE_SAMPLER", DescriptorType::COMBINED_IMAGE_SAMPLER)
 		.value("ACCELERATION_STRUCTURE", DescriptorType::ACCELERATION_STRUCTURE);
 
+	py::enum_<Filter>(m, "Filter")
+		.value("NEAREST", Filter::NEAREST)
+		.value("LINEAR", Filter::LINEAR)
+		.export_values();
+
 	py::enum_<Format>(m, "Format")
 		.value("Undefined", Format::Undefined)
 		.value("R8_UNorm", Format::R8_UNorm).value("RG8_UNorm", Format::RG8_UNorm)
 		.value("RGB8_UNorm", Format::RGB8_UNorm).value("RGBA8_UNorm", Format::RGBA8_UNorm)
+		.value("BGRA8_UNorm", Format::BGRA8_UNorm)
 		.value("R8_SNorm", Format::R8_SNorm).value("RG8_SNorm", Format::RG8_SNorm)
 		.value("RGB8_SNorm", Format::RGB8_SNorm).value("RGBA8_SNorm", Format::RGBA8_SNorm)
 		.value("R8_UInt", Format::R8_UInt).value("RG8_UInt", Format::RG8_UInt)
@@ -134,7 +202,79 @@ PYBIND11_MODULE(vk, m) {
 			}
 		)
 		.def("field", &Buffer::field, py::arg("field"))
-		.def_property_readonly("size", &Buffer::size);
+		.def("read", &Buffer::read, py::arg("field"))
+		.def(
+			"write",
+			[](const Buffer& self, const LayoutField& field, py::object value) {
+				// Python-side convenience only: a plain list/tuple for a
+				// VECTOR/MATRIX field is converted to an array.array before
+				// reaching Buffer::write(), which itself only ever sees a
+				// buffer-protocol/DLPack object, unchanged.
+				const bool is_iterable = py::isinstance<py::list>(value) || py::isinstance<py::tuple>(value);
+				const bool is_vec_or_matrix = field.layout
+					&& (field.layout->kind == TypeKind::VECTOR || field.layout->kind == TypeKind::MATRIX);
+				if (is_iterable && is_vec_or_matrix) {
+					value = iterable_to_buffer(field.layout->component_type, value);
+				}
+				self.write(field, value);
+			},
+			py::arg("field"), py::arg("value")
+		)
+		.def("load", &Buffer::load, py::arg("source"))
+		.def("save", &Buffer::save, py::arg("target"))
+		.def(
+			"cast",
+			py::overload_cast<ScalarType>(&Buffer::cast, py::const_),
+			py::arg("scalar")
+		)
+		.def(
+			"cast",
+			py::overload_cast<Format>(&Buffer::cast, py::const_),
+			py::arg("format")
+		)
+		.def(
+			"cast",
+			py::overload_cast<const std::shared_ptr<Layout>&>(&Buffer::cast, py::const_),
+			py::arg("layout")
+		)
+		.def("slice", &Buffer::slice, py::arg("start_element"), py::arg("count"))
+		.def("element", &Buffer::element, py::arg("index"))
+		.def_property_readonly("element_layout", &Buffer::element_layout)
+		.def_property_readonly("size", &Buffer::size)
+		.def_property_readonly("device_ptr", &Buffer::device_ptr);
+
+	py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
+		.def(
+			"__dlpack__",
+			[](const Tensor& self, py::object /*stream*/) { return self.vk_dlpack(); },
+			py::arg("stream") = py::none()
+		)
+		.def(
+			"__dlpack_device__",
+			[](const Tensor& self) {
+				DLDevice d = self.vk_dlpack_device();
+				return py::make_tuple(d.device_type, d.device_id);
+			}
+		)
+		.def("load", &Tensor::load, py::arg("source"))
+		.def("save", &Tensor::save, py::arg("target"))
+		.def_property_readonly("shape", &Tensor::shape)
+		.def_property_readonly("scalar_type", &Tensor::scalar_type)
+		.def_property_readonly("size", &Tensor::size)
+		.def_property_readonly("device_ptr", &Tensor::device_ptr);
+
+	py::class_<WrappedMemory, std::shared_ptr<WrappedMemory>>(m, "WrappedMemory")
+		.def("unwrap", &WrappedMemory::unwrap)
+		.def_property_readonly("device_ptr", &WrappedMemory::device_ptr)
+		.def_property_readonly("shape", &WrappedMemory::shape)
+		.def_property_readonly("scalar_type", &WrappedMemory::scalar_type);
+
+	py::class_<Image, std::shared_ptr<Image>>(m, "Image")
+		.def("cast_format", &Image::cast_format, py::arg("format"))
+		.def("slice", &Image::slice, py::arg("mip_start"), py::arg("mip_count"), py::arg("array_start"), py::arg("array_count"))
+		.def_property_readonly("format", &Image::format)
+		.def_property_readonly("mip_count", &Image::mip_count)
+		.def_property_readonly("array_count", &Image::array_count);
 
 	py::class_<TypeDescriptor, std::shared_ptr<TypeDescriptor>>(m, "TypeDescriptor")
 		.def_static("scalar", &TypeDescriptor::scalar, py::arg("type"))
@@ -205,6 +345,50 @@ PYBIND11_MODULE(vk, m) {
 			py::arg("y") = 1,
 			py::arg("z") = 1
 		)
+		.def(
+			"set_framebuffer",
+			&CommandBuffer::set_framebuffer,
+			py::arg("framebuffer")
+		)
+		.def(
+			"set_viewport",
+			&CommandBuffer::set_viewport,
+			py::arg("x"),
+			py::arg("y"),
+			py::arg("width"),
+			py::arg("height")
+		)
+		.def(
+			"blit_image",
+			&CommandBuffer::blit_image,
+			py::arg("src"),
+			py::arg("dst"),
+			py::arg("filter") = Filter::LINEAR
+		)
+		.def(
+			"bind_vertices",
+			&CommandBuffer::bind_vertices,
+			py::arg("binding"),
+			py::arg("vertex_buffer")
+		)
+		.def(
+			"bind_indices",
+			&CommandBuffer::bind_indices,
+			py::arg("index_buffer")
+		)
+		.def(
+			"dispatch_primitives",
+			&CommandBuffer::dispatch_primitives,
+			py::arg("vertices"),
+			py::arg("vertex_start") = 0
+		)
+		.def(
+			"dispatch_indexed_primitives",
+			&CommandBuffer::dispatch_indexed_primitives,
+			py::arg("indices"),
+			py::arg("index_start") = 0,
+			py::arg("vertex_offset") = 0
+		)
 		.def_property_readonly("is_submitted", &CommandBuffer::is_submitted)
 		.def_property_readonly("is_executable", &CommandBuffer::is_executable)
 		.def_property_readonly("is_closed", &CommandBuffer::is_closed)
@@ -247,16 +431,86 @@ PYBIND11_MODULE(vk, m) {
 		.def_property_readonly("width", &Framebuffer::width)
 		.def_property_readonly("height", &Framebuffer::height);
 
+	py::class_<Frame, std::shared_ptr<Frame>>(m, "Frame")
+		.def("render_target", &Frame::render_target)
+		.def("image_target", &Frame::image_target)
+		.def("buffer_target", &Frame::buffer_target)
+		.def("tensor_target", &Frame::tensor_target)
+		.def_property_readonly("index", &Frame::index)
+		.def_property_readonly("is_target_acquired", &Frame::is_target_acquired)
+		.def_property_readonly("is_render_target", &Frame::is_render_target)
+		.def_property_readonly("is_image_target", &Frame::is_image_target)
+		.def_property_readonly("is_buffer_target", &Frame::is_buffer_target)
+		.def_property_readonly("is_tensor_target", &Frame::is_tensor_target)
+		.def_property_readonly("presented", &Frame::presented)
+		.def("present", &Frame::present);
+
+	py::class_<Stats, std::shared_ptr<Stats>>(m, "Stats")
+		.def_property_readonly("fps", &Stats::fps);
+
+	py::class_<Checkbox, std::shared_ptr<Checkbox>>(m, "Checkbox")
+		.def("draw", &Checkbox::draw)
+		.def_property("value", &Checkbox::value, &Checkbox::set_value);
+
+	py::class_<SliderFloat, std::shared_ptr<SliderFloat>>(m, "SliderFloat")
+		.def("draw", &SliderFloat::draw)
+		.def_property("value", &SliderFloat::value, &SliderFloat::set_value);
+
+	py::class_<SliderInt, std::shared_ptr<SliderInt>>(m, "SliderInt")
+		.def("draw", &SliderInt::draw)
+		.def_property("value", &SliderInt::value, &SliderInt::set_value);
+
+	py::class_<Combobox, std::shared_ptr<Combobox>>(m, "Combobox")
+		.def("draw", &Combobox::draw)
+		.def_property("selected_index", &Combobox::selected_index, &Combobox::set_selected_index)
+		.def_property_readonly("selected_item", &Combobox::selected_item)
+		.def_property_readonly("items", &Combobox::items);
+
+	py::class_<Window, std::shared_ptr<Window>>(m, "Window")
+		.def("check_alive", &Window::check_alive)
+		.def("set_title", &Window::set_title, py::arg("title"))
+		.def("set_size", &Window::set_size, py::arg("width"), py::arg("height"))
+		.def_property_readonly("width", &Window::width)
+		.def_property_readonly("height", &Window::height)
+		.def_property_readonly("stats", &Window::stats)
+		.def("begin_frame", &Window::begin_frame, py::return_value_policy::move)
+		.def(
+			"label",
+			static_cast<void (Window::*)(const std::string&)>(&Window::label),
+			py::arg("text")
+		)
+		.def(
+			"label",
+			static_cast<void (Window::*)(const std::string&, double)>(&Window::label),
+			py::arg("text"), py::arg("value")
+		)
+		.def(
+			"label",
+			static_cast<void (Window::*)(const std::string&, const std::string&)>(&Window::label),
+			py::arg("text"), py::arg("value")
+		)
+		.def("button", &Window::button, py::arg("text"))
+		.def("checkbox", &Window::checkbox, py::arg("label"), py::arg("value") = false)
+		.def("slider_float", &Window::slider_float, py::arg("label"), py::arg("min"), py::arg("max"), py::arg("value"))
+		.def("slider_int", &Window::slider_int, py::arg("label"), py::arg("min"), py::arg("max"), py::arg("value"))
+		.def("combobox", &Window::combobox, py::arg("label"), py::arg("items"), py::arg("selected_index") = 0);
+
+	// Opaque handles: not constructible from Python (no .def(py::init<...>())),
+	// only obtainable from Pipeline::layout()/attach() and handed back to
+	// DescriptorSet::bind()/Pipeline::create_framebuffer().
+	py::class_<LayoutHandle>(m, "LayoutHandle");
+	py::class_<AttachHandle>(m, "AttachHandle");
+
 	py::class_<DescriptorSet, std::shared_ptr<DescriptorSet>>(m, "DescriptorSet")
 		.def(
 			"bind",
-			py::overload_cast<int, const std::shared_ptr<Buffer>&>(&DescriptorSet::bind),
+			py::overload_cast<LayoutHandle, const std::shared_ptr<Buffer>&>(&DescriptorSet::bind),
 			py::arg("layout_id"),
 			py::arg("buffer")
 		)
 		.def(
 			"bind",
-			py::overload_cast<int, const std::shared_ptr<Image>&>(&DescriptorSet::bind),
+			py::overload_cast<LayoutHandle, const std::shared_ptr<Image>&>(&DescriptorSet::bind),
 			py::arg("layout_id"),
 			py::arg("image")
 		);
@@ -292,8 +546,8 @@ PYBIND11_MODULE(vk, m) {
 	py::class_<Device, std::shared_ptr<Device>>(m, "Device")
 		.def("dispose", &Device::dispose)
 		.def(
-			"allocate_tensor_dlpack",
-			&Device::create_tensor_dlpack,
+			"create_tensor",
+			&Device::create_tensor,
 			py::arg("shape"),
 			py::arg("scalar_type"),
 			py::arg("location"),
@@ -301,25 +555,48 @@ PYBIND11_MODULE(vk, m) {
 		)
 		.def(
 			"create_buffer",
-			&Device::create_buffer,
-			py::arg("size"),
-			py::arg("location"),
-			py::return_value_policy::move
-		)
-		.def(
-			"create_array",
-			&Device::create_array,
+			py::overload_cast<std::uint64_t, ScalarType, MemoryLocation>(&Device::create_buffer),
 			py::arg("elements"),
 			py::arg("scalar_type"),
 			py::arg("location"),
 			py::return_value_policy::move
 		)
 		.def(
-			"create_structured_buffer",
-			&Device::create_structured_buffer,
+			"create_buffer",
+			py::overload_cast<std::uint64_t, Format, MemoryLocation>(&Device::create_buffer),
+			py::arg("elements"),
+			py::arg("format"),
+			py::arg("location"),
+			py::return_value_policy::move
+		)
+		.def(
+			"create_buffer",
+			py::overload_cast<std::uint64_t, const std::shared_ptr<Layout>&, MemoryLocation>(&Device::create_buffer),
+			py::arg("elements"),
 			py::arg("layout"),
 			py::arg("location"),
-			py::arg("count") = 1,
+			py::return_value_policy::move
+		)
+		.def(
+			"create_image",
+			&Device::create_image,
+			py::arg("width"),
+			py::arg("height"),
+			py::arg("depth"),
+			py::arg("mip_levels"),
+			py::arg("array_layers"),
+			py::arg("format"),
+			py::arg("location"),
+			py::return_value_policy::move
+		)
+		.def(
+			"create_window",
+			&Device::create_window,
+			py::arg("width"),
+			py::arg("height"),
+			py::arg("title"),
+			py::arg("format"),
+			py::arg("frames_on_the_fly") = 3,
 			py::return_value_policy::move
 		)
 		.def(
@@ -347,6 +624,14 @@ PYBIND11_MODULE(vk, m) {
 			py::overload_cast<const std::shared_ptr<Image>&, MemoryLocation>(&Device::create_staging),
 			py::arg("image"),
 			py::arg("location") = MemoryLocation::HOST,
+			py::return_value_policy::move
+		)
+		.def(
+			"wrap",
+			&Device::wrap,
+			py::arg("obj"),
+			py::arg("mode"),
+			py::arg("location") = MemoryLocation::DEVICE,
 			py::return_value_policy::move
 		)
 		.def_static(

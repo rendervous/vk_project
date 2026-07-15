@@ -25,6 +25,12 @@ namespace py = pybind11;
 #include <dlfcn.h>
 #endif
 
+#include <GLFW/glfw3.h>
+
+#include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_vulkan.h>
+
 namespace {
 
 std::vector<VkLayerProperties> enumerate_instance_layers() {
@@ -338,6 +344,111 @@ DLDataType dlpack_dtype (ScalarType scalar) {
     }
 }
 
+// Reverse of dlpack_dtype(): the ScalarType matching an incoming DLPack
+// tensor's dtype, for Device::wrap().
+ScalarType scalar_type_from_dlpack_dtype(const DLDataType& dtype) {
+    switch (dtype.code) {
+        case 0: // signed int
+            switch (dtype.bits) {
+                case 8: return ScalarType::INT8;
+                case 16: return ScalarType::INT16;
+                case 32: return ScalarType::INT32;
+                case 64: return ScalarType::INT64;
+                default: break;
+            }
+            break;
+        case 1: // unsigned int
+            switch (dtype.bits) {
+                case 8: return ScalarType::UINT8;
+                case 16: return ScalarType::UINT16;
+                case 32: return ScalarType::UINT32;
+                case 64: return ScalarType::UINT64;
+                default: break;
+            }
+            break;
+        case 2: // float
+            switch (dtype.bits) {
+                case 16: return ScalarType::FLOAT16;
+                case 32: return ScalarType::FLOAT32;
+                case 64: return ScalarType::FLOAT64;
+                default: break;
+            }
+            break;
+        case 6: // bool
+            return ScalarType::BOOL;
+        default:
+            break;
+    }
+    throw std::runtime_error("Device::wrap: unsupported DLPack dtype");
+}
+
+// Best-effort ScalarType from a Python buffer-protocol format string
+// (struct module conventions), for Device::wrap().
+ScalarType scalar_type_from_buffer_format(const std::string& format, std::uint64_t itemsize) {
+    if (format == "f") return ScalarType::FLOAT32;
+    if (format == "d") return ScalarType::FLOAT64;
+    if (format == "e") return ScalarType::FLOAT16;
+    if (format == "b" || format == "c") return ScalarType::INT8;
+    if (format == "B") return ScalarType::UINT8;
+    if (format == "?") return ScalarType::BOOL;
+    if (format == "h") return ScalarType::INT16;
+    if (format == "H") return ScalarType::UINT16;
+    if (format == "i" || format == "l") return itemsize == 8 ? ScalarType::INT64 : ScalarType::INT32;
+    if (format == "I" || format == "L") return itemsize == 8 ? ScalarType::UINT64 : ScalarType::UINT32;
+    if (format == "q") return ScalarType::INT64;
+    if (format == "Q") return ScalarType::UINT64;
+    throw std::runtime_error("Device::wrap: unsupported buffer format '" + format + "'");
+}
+
+// True if `shape`/`strides` (DLPack convention: strides in units of
+// elements) describe a C-contiguous (row-major, tightly packed) tensor.
+// `strides == nullptr` is the DLPack convention for "contiguous, compute it
+// yourself".
+bool dltensor_is_contiguous(const std::int64_t* shape, const std::int64_t* strides, int ndim) {
+    if (!strides) return true;
+    std::int64_t expected = 1;
+    for (int d = ndim - 1; d >= 0; --d) {
+        if (shape[d] > 1 && strides[d] != expected) return false;
+        expected *= shape[d];
+    }
+    return true;
+}
+
+// Host-only analogue of vk_cuda_interop.cpp's copy_strided: copies between
+// a flat contiguous buffer and a strided view, for the case where both
+// sides are guaranteed CPU-dereferenceable (no CUDA device memory
+// involved). See Device::vk_copy_in/vk_copy_out.
+void copy_strided_host(
+    void* contiguous, void* strided, const std::int64_t* shape, const std::int64_t* strides,
+    int ndim, std::uint64_t itemsize, bool contiguous_is_dst) {
+    if (ndim == 0) {
+        std::memcpy(contiguous_is_dst ? contiguous : strided, contiguous_is_dst ? strided : contiguous, itemsize);
+        return;
+    }
+    std::uint64_t row_elements = 1;
+    for (int d = 1; d < ndim; ++d) row_elements *= static_cast<std::uint64_t>(shape[d]);
+    bool inner_packed = true;
+    std::int64_t expected = 1;
+    for (int d = ndim - 1; d >= 1; --d) {
+        if (strides[d] != expected) { inner_packed = false; break; }
+        expected *= shape[d];
+    }
+    if (ndim == 1 || inner_packed) {
+        const std::uint64_t row_bytes = row_elements * itemsize;
+        for (std::int64_t i = 0; i < shape[0]; ++i) {
+            char* s = reinterpret_cast<char*>(strided) + static_cast<std::uint64_t>(i) * static_cast<std::uint64_t>(strides[0]) * itemsize;
+            char* c = reinterpret_cast<char*>(contiguous) + static_cast<std::uint64_t>(i) * row_bytes;
+            std::memcpy(contiguous_is_dst ? c : s, contiguous_is_dst ? s : c, row_bytes);
+        }
+        return;
+    }
+    for (std::int64_t i = 0; i < shape[0]; ++i) {
+        char* next_strided = reinterpret_cast<char*>(strided) + static_cast<std::uint64_t>(i) * static_cast<std::uint64_t>(strides[0]) * itemsize;
+        char* next_contiguous = reinterpret_cast<char*>(contiguous) + static_cast<std::uint64_t>(i) * row_elements * itemsize;
+        copy_strided_host(next_contiguous, next_strided, shape + 1, strides + 1, ndim - 1, itemsize, contiguous_is_dst);
+    }
+}
+
 void dlmanaged_tensor_deleter(DLManagedTensor* self) {
     if (!self) {
         return;
@@ -363,6 +474,23 @@ py::object export_dltensor_py(DLManagedTensor* managed) {
 }
 
 using ExternalImportMemoryFn = ExternalImportFn;
+// Mirrors vk_cuda_interop.cpp's try_import_semaphore: imports a Vulkan
+// timeline semaphore (Device::vk_interop_semaphore()) into CUDA, returning
+// an opaque cudaExternalSemaphore_t handle (0 on failure/unsupported).
+using ExternalImportSemaphoreFn = std::uint64_t (*)(vk::Device device, int device_index, vk::Semaphore semaphore);
+// Mirrors vk_cuda_interop.cpp's copy_from_dlpack_to_ptr/copy_ptr_to_dlpack
+// signatures exactly (shape/strides: `ndim` entries, in units of `itemsize`
+// elements, per the DLPack convention). `wait_semaphore`/`wait_value`: see
+// try_import_semaphore's comment -- a GPU-side wait for a specific Vulkan
+// submission, enqueued before the copy itself. Both return 0 on success.
+using ExternalCopyFromDlpackFn = int (*)(
+    void* tensor_data, const std::int64_t* shape, const std::int64_t* strides, int ndim,
+    std::uint64_t itemsize, std::uint64_t dst_ptr, std::uint64_t total_bytes,
+    std::uint64_t wait_semaphore, std::uint64_t wait_value);
+using ExternalCopyToDlpackFn = int (*)(
+    std::uint64_t src_ptr, std::uint64_t total_bytes,
+    void* tensor_data, const std::int64_t* shape, const std::int64_t* strides, int ndim,
+    std::uint64_t itemsize, std::uint64_t wait_semaphore, std::uint64_t wait_value);
 
 std::string interop_library_base_name(uint32_t vendor_id) {
     switch (vendor_id) {
@@ -430,6 +558,100 @@ vk::BufferUsageFlags full_buffer_usage_flags() {
            vk::BufferUsageFlagBits::eShaderDeviceAddress;
 }
 
+vk::ImageUsageFlags full_image_usage_flags() {
+    return vk::ImageUsageFlagBits::eTransferSrc |
+           vk::ImageUsageFlagBits::eTransferDst |
+           vk::ImageUsageFlagBits::eSampled |
+           vk::ImageUsageFlagBits::eStorage |
+           vk::ImageUsageFlagBits::eColorAttachment;
+}
+
+// Defined further below, alongside the rest of the Layout-inspection
+// helpers; forward-declared here so CommandBuffer::bind_indices (which
+// comes first in the file) can use it.
+ScalarType resolve_component_type(const Layout& layout);
+
+// Copies `total_bytes` from a DLPack-compatible or Python buffer-protocol
+// object `source` into `dst_external_ptr` (`dst_location`). Same
+// DLPack/buffer-protocol handling and vk_copy_in dispatch as
+// Device::wrap()'s copy-in path; used by Buffer::load()/Tensor::load().
+void copy_pyobject_into(Device& device, std::uint64_t dst_external_ptr, MemoryLocation dst_location,
+    std::uint64_t total_bytes, const pybind11::object& source) {
+    if (pybind11::hasattr(source, "__dlpack__")) {
+        pybind11::object capsule = source.attr("__dlpack__")();
+        auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
+        if (!managed) {
+            throw std::runtime_error("load(): invalid DLPack capsule (expected a \"dltensor\" capsule)");
+        }
+        const DLTensor& t = managed->dl_tensor;
+        char* data_ptr = reinterpret_cast<char*>(t.data) + t.byte_offset;
+        const bool is_cuda_device = (t.device.device_type == 2);
+        const std::uint64_t itemsize = (static_cast<std::uint64_t>(t.dtype.bits) / 8) * static_cast<std::uint64_t>(t.dtype.lanes);
+        std::uint64_t src_bytes = itemsize;
+        for (int i = 0; i < t.ndim; ++i) src_bytes *= static_cast<std::uint64_t>(t.shape[i]);
+        if (src_bytes != total_bytes) {
+            throw std::runtime_error("load(): source size does not match the destination's size");
+        }
+        device.vk_copy_in(dst_external_ptr, dst_location, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
+        return;
+    }
+    if (PyObject_CheckBuffer(source.ptr())) {
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(source);
+        pybind11::buffer_info info = buf.request();
+        const std::uint64_t src_bytes = static_cast<std::uint64_t>(info.size) * static_cast<std::uint64_t>(info.itemsize);
+        if (src_bytes != total_bytes) {
+            throw std::runtime_error("load(): source size does not match the destination's size");
+        }
+        const std::int64_t total = static_cast<std::int64_t>(info.size);
+        const std::int64_t stride1 = 1;
+        device.vk_copy_in(dst_external_ptr, dst_location, info.ptr, &total, &stride1, 1, static_cast<std::uint64_t>(info.itemsize), false);
+        return;
+    }
+    throw std::runtime_error("load(): source must be a DLPack-compatible object or a Python buffer object");
+}
+
+// Symmetric to copy_pyobject_into: copies `total_bytes` from
+// `src_external_ptr` (`src_location`) into `target` (a DLPack-compatible
+// or Python buffer-protocol object, already sized to receive them). Used
+// by Buffer::save()/Tensor::save().
+void copy_pyobject_from(Device& device, std::uint64_t src_external_ptr, MemoryLocation src_location,
+    std::uint64_t total_bytes, const pybind11::object& target) {
+    if (pybind11::hasattr(target, "__dlpack__")) {
+        pybind11::object capsule = target.attr("__dlpack__")();
+        auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
+        if (!managed) {
+            throw std::runtime_error("save(): invalid DLPack capsule (expected a \"dltensor\" capsule)");
+        }
+        const DLTensor& t = managed->dl_tensor;
+        char* data_ptr = reinterpret_cast<char*>(t.data) + t.byte_offset;
+        const bool is_cuda_device = (t.device.device_type == 2);
+        const std::uint64_t itemsize = (static_cast<std::uint64_t>(t.dtype.bits) / 8) * static_cast<std::uint64_t>(t.dtype.lanes);
+        std::uint64_t dst_bytes = itemsize;
+        for (int i = 0; i < t.ndim; ++i) dst_bytes *= static_cast<std::uint64_t>(t.shape[i]);
+        if (dst_bytes != total_bytes) {
+            throw std::runtime_error("save(): target size does not match the source's size");
+        }
+        device.vk_copy_out(src_external_ptr, src_location, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
+        return;
+    }
+    if (PyObject_CheckBuffer(target.ptr())) {
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(target);
+        pybind11::buffer_info info = buf.request();
+        if (info.readonly) {
+            throw std::runtime_error("save(): target buffer is read-only");
+        }
+        const std::uint64_t dst_bytes = static_cast<std::uint64_t>(info.size) * static_cast<std::uint64_t>(info.itemsize);
+        if (dst_bytes != total_bytes) {
+            throw std::runtime_error("save(): target size does not match the source's size");
+        }
+        const std::int64_t total = static_cast<std::int64_t>(info.size);
+        const std::int64_t stride1 = 1;
+        device.vk_copy_out(src_external_ptr, src_location, info.ptr, &total, &stride1, 1, static_cast<std::uint64_t>(info.itemsize), false);
+        return;
+    }
+    throw std::runtime_error("save(): target must be a DLPack-compatible object or a writable Python buffer object");
+}
+
 } // namespace
 
 class ExternalInteropLibraryImpl {
@@ -453,6 +675,22 @@ public:
 
     [[nodiscard]] ExternalImportMemoryFn try_import_memory_fn() const noexcept {
         return try_import_memory_;
+    }
+
+    // Optional: only present in interop plugins that implement strided
+    // DLPack<->contiguous-pointer copies (see Device::wrap). Null (not an
+    // error) if the loaded plugin predates these, or has neither.
+    [[nodiscard]] ExternalCopyFromDlpackFn copy_from_dlpack_fn() const noexcept {
+        return copy_from_dlpack_;
+    }
+    [[nodiscard]] ExternalCopyToDlpackFn copy_to_dlpack_fn() const noexcept {
+        return copy_to_dlpack_;
+    }
+    // Optional: only present in interop plugins that implement cross-API
+    // semaphore import (see Device::vk_interop_semaphore). Null (not an
+    // error) if the loaded plugin predates it.
+    [[nodiscard]] ExternalImportSemaphoreFn try_import_semaphore_fn() const noexcept {
+        return try_import_semaphore_;
     }
 
 private:
@@ -534,6 +772,17 @@ private:
         }
 
         try_import_memory_ = reinterpret_cast<ExternalImportMemoryFn>(symbol);
+
+        // Optional symbols: absent in older/other plugins, not an error.
+        if (auto copy_from = load_symbol(handle_, "copy_from_dlpack_to_ptr")) {
+            copy_from_dlpack_ = reinterpret_cast<ExternalCopyFromDlpackFn>(copy_from);
+        }
+        if (auto copy_to = load_symbol(handle_, "copy_ptr_to_dlpack")) {
+            copy_to_dlpack_ = reinterpret_cast<ExternalCopyToDlpackFn>(copy_to);
+        }
+        if (auto import_semaphore = load_symbol(handle_, "try_import_semaphore")) {
+            try_import_semaphore_ = reinterpret_cast<ExternalImportSemaphoreFn>(import_semaphore);
+        }
     }
 
     void unload() noexcept {
@@ -542,10 +791,16 @@ private:
             handle_ = nullptr;
         }
         try_import_memory_ = nullptr;
+        copy_from_dlpack_ = nullptr;
+        copy_to_dlpack_ = nullptr;
+        try_import_semaphore_ = nullptr;
     }
 
     LibraryHandle handle_ = nullptr;
     ExternalImportMemoryFn try_import_memory_ = nullptr;
+    ExternalCopyFromDlpackFn copy_from_dlpack_ = nullptr;
+    ExternalCopyToDlpackFn copy_to_dlpack_ = nullptr;
+    ExternalImportSemaphoreFn try_import_semaphore_ = nullptr;
 };
 
 std::shared_ptr<Device> Device::create_device(uint32_t device_index, bool enable_validation_layers) {
@@ -827,7 +1082,11 @@ ScalarType format_scalar_type(Format format)
 
 vk_ResourceData::vk_ResourceData(
     std::shared_ptr<Device> device, const std::shared_ptr<MemorySlice>& memory,
-    vk::Image image, vk::ImageCreateInfo image_info): device_(std::move(device)), memory_(memory), image_(image), image_info_(image_info), resource_type_(image ? ResourceType::IMAGE : ResourceType::BUFFER) {
+    vk::Image image, vk::ImageCreateInfo image_info, vk::DeviceMemory dedicated_image_memory,
+    bool owns_image)
+    : device_(std::move(device)), memory_(memory), image_(image), image_info_(image_info),
+      resource_type_(image ? ResourceType::IMAGE : ResourceType::BUFFER),
+      dedicated_image_memory_(dedicated_image_memory), owns_image_(owns_image) {
     buffer_ = memory->page_buffer();
 }
 
@@ -838,15 +1097,19 @@ vk_ResourceData::~vk_ResourceData() noexcept {
 void vk_ResourceData::dispose() {
     if (!this->device_)
         return;
-    if (this->image_) {
-        auto device = this->device_->logical_device();
+    auto device = this->device_->logical_device();
+    if (this->image_ && this->owns_image_) {
         device.destroyImage(this->image_);
+    }
+    if (this->dedicated_image_memory_) {
+        device.freeMemory(this->dedicated_image_memory_);
     }
     auto dev = this->device_;
     this->device_ = nullptr;
     this->memory_ = nullptr;
     this->buffer_ = nullptr;
     this->image_ = nullptr;
+    this->dedicated_image_memory_ = nullptr;
 }
 
 std::uint64_t vk_ResourceData::device_ptr() const {
@@ -878,7 +1141,7 @@ vk::BufferView Buffer::get_view() {
     if (!buffer_view_) {
         vk::BufferViewCreateInfo info{};
         info.buffer = data_->get_buffer();
-        info.format = (vk::Format)slice_.buffer.format;
+        info.format = (vk::Format)format_;
         info.offset = data_->get_memory()->offset() + slice_.buffer.offset;
         info.range = slice_.buffer.size;
         auto device = this->data_->device()->logical_device();
@@ -890,8 +1153,16 @@ vk::BufferView Buffer::get_view() {
 vk::ImageView Image::get_view() {
     if (!image_view_) {
         auto image_info = data_->get_image_info();
+        const bool arrayed = slice_.image.array_count > 1;
+        vk::ImageViewType view_type;
+        switch (image_info.imageType) {
+            case vk::ImageType::e1D: view_type = arrayed ? vk::ImageViewType::e1DArray : vk::ImageViewType::e1D; break;
+            case vk::ImageType::e3D: view_type = vk::ImageViewType::e3D; break;
+            default: view_type = arrayed ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D; break;
+        }
         vk::ImageViewCreateInfo info{};
         info.image = data_->get_image();
+        info.viewType = view_type;
         info.format = (vk::Format)slice_.image.format;
         info.components = vk::ComponentMapping{
             vk::ComponentSwizzle::eIdentity,
@@ -965,6 +1236,10 @@ void vk_CommandBuffer::notify_executed() {
 }
 
 void CommandBuffer::close() {
+    if (render_pass_active_) {
+        command_buffer_->command_buffer.endRenderPass();
+        render_pass_active_ = false;
+    }
     command_buffer_->end();
 }
 
@@ -985,6 +1260,9 @@ void CommandBuffer::set_pipeline(const std::shared_ptr<Pipeline>& pipeline) {
     auto vk_pipeline = pipeline->vk_pipeline();
     if (!vk_pipeline->is_closed()) {
         throw std::runtime_error("CommandBuffer::set_pipeline: pipeline must be closed first");
+    }
+    if (vk_pipeline->type() == PipelineType::RASTERIZATION && !render_pass_active_) {
+        throw std::runtime_error("CommandBuffer::set_pipeline: a RASTERIZATION pipeline requires an active render pass (call set_framebuffer first)");
     }
     const vk::PipelineBindPoint bind_point = vk_pipeline->type() == PipelineType::COMPUTE
         ? vk::PipelineBindPoint::eCompute
@@ -1041,6 +1319,150 @@ void CommandBuffer::dispatch_threads(std::uint32_t x, std::uint32_t y, std::uint
         group_count(z, vk_pipeline->vk_local_size_z()));
 }
 
+void CommandBuffer::set_framebuffer(const std::shared_ptr<Framebuffer>& framebuffer) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot set a framebuffer on a closed command buffer");
+    }
+    if (render_pass_active_) {
+        command_buffer_->command_buffer.endRenderPass();
+        render_pass_active_ = false;
+    }
+
+    // Every attachment's render pass loadOp is eClear (see vk_Pipeline::vk_close),
+    // so a clear value must be provided for each; a plain opaque black is
+    // as reasonable a default as any, since there's no per-attachment
+    // clear-color API yet.
+    std::vector<vk::ClearValue> clear_values(framebuffer->vk_attachment_count());
+    for (auto& cv : clear_values) {
+        cv.color.float32[0] = 0.0f;
+        cv.color.float32[1] = 0.0f;
+        cv.color.float32[2] = 0.0f;
+        cv.color.float32[3] = 1.0f;
+    }
+
+    vk::RenderPassBeginInfo info{};
+    info.renderPass = framebuffer->vk_render_pass();
+    info.framebuffer = framebuffer->vk_framebuffer();
+    info.renderArea.offset = vk::Offset2D{ 0, 0 };
+    info.renderArea.extent = vk::Extent2D{ framebuffer->width(), framebuffer->height() };
+    info.clearValueCount = static_cast<std::uint32_t>(clear_values.size());
+    info.pClearValues = clear_values.data();
+
+    command_buffer_->command_buffer.beginRenderPass(info, vk::SubpassContents::eInline);
+    render_pass_active_ = true;
+    // Appended, not overwritten: see bound_pipelines_ above -- the same
+    // applies to every framebuffer ever set during this recording.
+    bound_framebuffers_.push_back(framebuffer);
+}
+
+void CommandBuffer::set_viewport(float x, float y, float width, float height) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot set a viewport on a closed command buffer");
+    }
+    vk::Viewport viewport{ x, y, width, height, 0.0f, 1.0f };
+    vk::Rect2D scissor{
+        vk::Offset2D{ static_cast<std::int32_t>(x), static_cast<std::int32_t>(y) },
+        vk::Extent2D{ static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height) }
+    };
+    command_buffer_->command_buffer.setViewport(0, viewport);
+    command_buffer_->command_buffer.setScissor(0, scissor);
+}
+
+void CommandBuffer::blit_image(const std::shared_ptr<Image>& src, const std::shared_ptr<Image>& dst, Filter filter) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot blit on a closed command buffer");
+    }
+    if (render_pass_active_) {
+        throw std::runtime_error("CommandBuffer::blit_image: cannot blit while a render pass is active (set_framebuffer with a different framebuffer, or close(), ends it)");
+    }
+    const vk::Extent3D src_extent = src->vk_image_info().extent;
+    const vk::Extent3D dst_extent = dst->vk_image_info().extent;
+
+    vk::ImageBlit region{};
+    region.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+    region.srcSubresource.mipLevel = static_cast<std::uint32_t>(src->vk_mip_start());
+    region.srcSubresource.baseArrayLayer = static_cast<std::uint32_t>(src->vk_array_start());
+    region.srcSubresource.layerCount = static_cast<std::uint32_t>(src->array_count());
+    region.srcOffsets[0] = vk::Offset3D{ 0, 0, 0 };
+    region.srcOffsets[1] = vk::Offset3D{
+        static_cast<std::int32_t>(src_extent.width), static_cast<std::int32_t>(src_extent.height), static_cast<std::int32_t>(src_extent.depth) };
+
+    region.dstSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+    region.dstSubresource.mipLevel = static_cast<std::uint32_t>(dst->vk_mip_start());
+    region.dstSubresource.baseArrayLayer = static_cast<std::uint32_t>(dst->vk_array_start());
+    region.dstSubresource.layerCount = static_cast<std::uint32_t>(dst->array_count());
+    region.dstOffsets[0] = vk::Offset3D{ 0, 0, 0 };
+    region.dstOffsets[1] = vk::Offset3D{
+        static_cast<std::int32_t>(dst_extent.width), static_cast<std::int32_t>(dst_extent.height), static_cast<std::int32_t>(dst_extent.depth) };
+
+    command_buffer_->command_buffer.blitImage(
+        src->vk_image(), vk::ImageLayout::eGeneral,
+        dst->vk_image(), vk::ImageLayout::eGeneral,
+        region, static_cast<vk::Filter>(filter));
+
+    bound_images_.push_back(src);
+    bound_images_.push_back(dst);
+}
+
+void CommandBuffer::bind_vertices(int binding, const std::shared_ptr<Buffer>& vertex_buffer) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot bind vertices on a closed command buffer");
+    }
+    vk::Buffer buf = vertex_buffer->vk_buffer();
+    vk::DeviceSize offset = vertex_buffer->vk_buffer_offset();
+    command_buffer_->command_buffer.bindVertexBuffers(static_cast<std::uint32_t>(binding), 1, &buf, &offset);
+    bound_vertex_index_buffers_.push_back(vertex_buffer);
+}
+
+void CommandBuffer::bind_indices(const std::shared_ptr<Buffer>& index_buffer) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot bind indices on a closed command buffer");
+    }
+    const Layout& layout = *index_buffer->element_layout();
+    vk::IndexType index_type;
+    if (layout.kind != TypeKind::STRUCT && resolve_component_type(layout) == ScalarType::UINT16) {
+        index_type = vk::IndexType::eUint16;
+    } else if (layout.kind != TypeKind::STRUCT && resolve_component_type(layout) == ScalarType::UINT32) {
+        index_type = vk::IndexType::eUint32;
+    } else {
+        throw std::runtime_error("CommandBuffer::bind_indices: index buffer's element_layout must be a scalar UINT16 or UINT32");
+    }
+    command_buffer_->command_buffer.bindIndexBuffer(index_buffer->vk_buffer(), index_buffer->vk_buffer_offset(), index_type);
+    bound_vertex_index_buffers_.push_back(index_buffer);
+}
+
+void CommandBuffer::dispatch_primitives(std::uint32_t vertices, std::uint32_t vertex_start) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot dispatch on a closed command buffer");
+    }
+    if (bound_pipelines_.empty()) {
+        throw std::runtime_error("CommandBuffer::dispatch_primitives: no pipeline is currently bound (call set_pipeline first)");
+    }
+    if (bound_pipelines_.back()->vk_pipeline()->type() != PipelineType::RASTERIZATION) {
+        throw std::runtime_error("CommandBuffer::dispatch_primitives: bound pipeline is not a RASTERIZATION pipeline");
+    }
+    if (!render_pass_active_) {
+        throw std::runtime_error("CommandBuffer::dispatch_primitives: no active render pass (call set_framebuffer first)");
+    }
+    command_buffer_->command_buffer.draw(vertices, 1, vertex_start, 0);
+}
+
+void CommandBuffer::dispatch_indexed_primitives(std::uint32_t indices, std::uint32_t index_start, std::int32_t vertex_offset) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot dispatch on a closed command buffer");
+    }
+    if (bound_pipelines_.empty()) {
+        throw std::runtime_error("CommandBuffer::dispatch_indexed_primitives: no pipeline is currently bound (call set_pipeline first)");
+    }
+    if (bound_pipelines_.back()->vk_pipeline()->type() != PipelineType::RASTERIZATION) {
+        throw std::runtime_error("CommandBuffer::dispatch_indexed_primitives: bound pipeline is not a RASTERIZATION pipeline");
+    }
+    if (!render_pass_active_) {
+        throw std::runtime_error("CommandBuffer::dispatch_indexed_primitives: no active render pass (call set_framebuffer first)");
+    }
+    command_buffer_->command_buffer.drawIndexed(indices, 1, index_start, vertex_offset, 0);
+}
+
 void CommandBuffer::release() {
     if (device_ == nullptr)
         return;
@@ -1053,13 +1475,23 @@ void CommandBuffer::release() {
     engine_.reset();
     bound_pipelines_.clear();
     bound_descriptor_sets_.clear();
+    bound_framebuffers_.clear();
+    bound_vertex_index_buffers_.clear();
+    bound_images_.clear();
+    render_pass_active_ = false;
 }
 
 void vk_Engine::dispose() noexcept {
+    auto d = device_.lock();
+    vk::Device dev = (d && !d->is_disposed()) ? d->logical_device() : vk::Device{};
+    vk_dispose_with(dev);
+}
+
+void vk_Engine::vk_dispose_with(vk::Device dev) noexcept {
     if (!queue_) return; // already disposed.
     wait();
-    if (auto d = device_.lock()) {
-        d->logical_device().destroySemaphore(timeline_semaphore_);
+    if (dev) {
+        dev.destroySemaphore(timeline_semaphore_);
     }
     reusable_command_buffers_.clear();
     queue_ = nullptr;
@@ -1108,11 +1540,29 @@ std::shared_ptr<SubmittedTask> vk_Engine::submit(std::uint32_t count, vk::Comman
     }
     current_submission_id_ ++; // if there is something to send to the GPU, there is something to wait for
     auto task = std::make_shared<SubmittedTask>(shared_from_this(), current_submission_id_);
+
+    // In addition to this engine's own private timeline semaphore, also
+    // signal the device-wide, exported interop_semaphore_ (if available):
+    // this is what lets a later CUDA-side memcpy (see
+    // MemoryManager::vk_copy_to_dlpack/vk_copy_from_dlpack) issue a real
+    // GPU-side wait for this exact submission, rather than relying solely
+    // on a host-side wait for cross-API memory visibility.
+    std::array<vk::Semaphore, 2> signal_semaphores{ timeline_semaphore_, nullptr };
+    std::array<std::uint64_t, 2> signal_values{ current_submission_id_, 0 };
+    std::uint32_t signal_count = 1;
+    if (auto device = device_.lock()) {
+        if (vk::Semaphore interop_semaphore = device->vk_interop_semaphore()) {
+            signal_semaphores[1] = interop_semaphore;
+            signal_values[1] = device->vk_bump_interop_semaphore_value();
+            signal_count = 2;
+        }
+    }
+
     vk::TimelineSemaphoreSubmitInfo timeline_submit_info{
         0,
         nullptr,
-        1,
-        &current_submission_id_,
+        signal_count,
+        signal_values.data(),
     };
     vk::SubmitInfo submit_info{
         0,
@@ -1120,8 +1570,8 @@ std::shared_ptr<SubmittedTask> vk_Engine::submit(std::uint32_t count, vk::Comman
         nullptr,
         count,
         command_buffers,
-        1,
-        &timeline_semaphore_,
+        signal_count,
+        signal_semaphores.data(),
     };
     submit_info.setPNext(&timeline_submit_info);
     queue_.submit(submit_info);
@@ -1184,7 +1634,8 @@ void Resource::dispose() {
     slice_ = {};
 }
 
-Buffer::Buffer(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice): Resource(resource_data, view_slice) {
+Buffer::Buffer(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice, std::shared_ptr<Layout> layout, Format format)
+    : Resource(resource_data, view_slice), layout_(std::move(layout)), format_(format) {
     assert (view_slice.type == ResourceType::BUFFER);
 }
 
@@ -1194,6 +1645,14 @@ std::uint64_t Buffer::device_ptr() const {
 
 std::uint64_t Buffer::external_ptr() const {
     return data_->external_ptr() + slice_.buffer.offset;
+}
+
+void Buffer::load(const pybind11::object& source) const {
+    copy_pyobject_into(*data_->device(), external_ptr(), data_->is_cpu() ? MemoryLocation::HOST : MemoryLocation::DEVICE, size(), source);
+}
+
+void Buffer::save(const pybind11::object& target) const {
+    copy_pyobject_from(*data_->device(), external_ptr(), data_->is_cpu() ? MemoryLocation::HOST : MemoryLocation::DEVICE, size(), target);
 }
 
 std::uint64_t Buffer::vk_buffer_offset() const noexcept {
@@ -1206,8 +1665,10 @@ std::uint64_t Buffer::vk_buffer_size() const noexcept {
 
 Buffer::~Buffer() noexcept{
     if (buffer_view_) {
-        auto device = this->data_->device()->logical_device();
-        device.destroyBufferView(buffer_view_);
+        auto device = this->data_->device();
+        if (device && !device->is_disposed()) {
+            device->logical_device().destroyBufferView(buffer_view_);
+        }
         buffer_view_ = nullptr;
     }
 }
@@ -1217,90 +1678,71 @@ Image::Image(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_
 
 Image::~Image() noexcept {
     if (image_view_) {
-        auto device = this->data_->device()->logical_device();
-        device.destroyImageView(image_view_);
+        auto device = this->data_->device();
+        if (device && !device->is_disposed()) {
+            device->logical_device().destroyImageView(image_view_);
+        }
         image_view_ = nullptr;
     }
 }
 
-std::shared_ptr<Buffer> Buffer::cast_format(Format new_format) const {
+std::shared_ptr<Buffer> Buffer::cast(ScalarType scalar) const {
     if (data_->resource_type() != ResourceType::BUFFER) {
-        throw std::runtime_error("buffer_cast can only be called on buffer resources");
+        throw std::runtime_error("Buffer::cast can only be called on buffer resources");
+    }
+    auto layout = compute_layout(TypeDescriptor::scalar(scalar), LayoutRule::Scalar);
+    ResourceSlice view_slice{};
+    view_slice.type = ResourceType::BUFFER;
+    view_slice.buffer.offset = slice_.buffer.offset;
+    view_slice.buffer.size = slice_.buffer.size;
+    return std::make_shared<Buffer>(data_, view_slice, std::move(layout));
+}
+
+std::shared_ptr<Buffer> Buffer::cast(Format format) const {
+    if (data_->resource_type() != ResourceType::BUFFER) {
+        throw std::runtime_error("Buffer::cast can only be called on buffer resources");
+    }
+    const ScalarType component_type = format_scalar_type(format);
+    const int components = static_cast<int>(formatSize(format)) / scalar_type_size(component_type);
+    auto element_type = std::make_shared<TypeDescriptor>(TypeDescriptor::scalar(component_type));
+    auto layout = compute_layout(TypeDescriptor::array_of(std::move(element_type), components), LayoutRule::Scalar);
+    ResourceSlice view_slice{};
+    view_slice.type = ResourceType::BUFFER;
+    view_slice.buffer.offset = slice_.buffer.offset;
+    view_slice.buffer.size = slice_.buffer.size;
+    return std::make_shared<Buffer>(data_, view_slice, std::move(layout), format);
+}
+
+std::shared_ptr<Buffer> Buffer::cast(const std::shared_ptr<Layout>& layout) const {
+    if (data_->resource_type() != ResourceType::BUFFER) {
+        throw std::runtime_error("Buffer::cast can only be called on buffer resources");
     }
     ResourceSlice view_slice{};
     view_slice.type = ResourceType::BUFFER;
     view_slice.buffer.offset = slice_.buffer.offset;
     view_slice.buffer.size = slice_.buffer.size;
-    view_slice.buffer.format = new_format;
-    view_slice.buffer.scalar = slice_.buffer.scalar;
-    return std::make_shared<Buffer>(data_, view_slice);
+    return std::make_shared<Buffer>(data_, view_slice, layout);
 }
 
-std::shared_ptr<Buffer> Buffer::cast_scalar(ScalarType new_scalar) const {
+std::shared_ptr<Buffer> Buffer::slice(std::uint64_t start_element, std::uint64_t count) const {
     if (data_->resource_type() != ResourceType::BUFFER) {
-        throw std::runtime_error("buffer_cast can only be called on buffer resources");
+        throw std::runtime_error("Buffer::slice can only be called on buffer resources");
     }
-    ResourceSlice view_slice{};
-    view_slice.type = ResourceType::BUFFER;
-    view_slice.buffer.offset = slice_.buffer.offset;
-    view_slice.buffer.size = slice_.buffer.size;
-    view_slice.buffer.format = slice_.buffer.format;
-    view_slice.buffer.scalar = new_scalar;
-    return std::make_shared<Buffer>(data_, view_slice);
-}
-
-std::shared_ptr<Buffer> Buffer::slice(std::uint64_t offset, std::uint64_t size) const {
-    if (data_->resource_type() != ResourceType::BUFFER) {
-        throw std::runtime_error("buffer_slice can only be called on buffer resources");
-    }
-    if (offset < 0 || size <= 0 || offset + size > slice_.buffer.size) {
+    const std::uint64_t element_size = layout_->aligned_size;
+    const std::uint64_t byte_offset = start_element * element_size;
+    const std::uint64_t byte_size = count * element_size;
+    if (count == 0 || byte_offset + byte_size > slice_.buffer.size) {
         throw std::runtime_error("Invalid buffer slice range");
     }
     ResourceSlice view_slice{};
     view_slice.type = ResourceType::BUFFER;
-    view_slice.buffer.offset = slice_.buffer.offset + offset;
-    view_slice.buffer.size = size;
-    view_slice.buffer.format = slice_.buffer.format;
-    view_slice.buffer.scalar = slice_.buffer.scalar;
-    return std::make_shared<Buffer>(data_, view_slice);
+    view_slice.buffer.offset = slice_.buffer.offset + byte_offset;
+    view_slice.buffer.size = byte_size;
+    return std::make_shared<Buffer>(data_, view_slice, layout_, format_);
 }
 
-std::shared_ptr<Buffer> Buffer::slice_array(std::uint64_t start, std::uint64_t count) const {
-    int scalar_size = scalar_type_size(slice_.buffer.scalar);
-    return slice(start * scalar_size, count * scalar_size);
-}
-
-pybind11::object Buffer::vk_dlpack() const {
-    void* ptr = nullptr;
-    auto memory = data_->get_memory();
-    DLDevice device = memory->dl_device();
-    if (external_ptr() == 0) {
-        throw std::runtime_error("A DEVICE tensor was requested but the external pointer is unavailable");
-    }
-    ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(external_ptr()));
-
-    int element_size = scalar_type_size(slice_.buffer.scalar);
-    int elements = size() / element_size;
-
-    auto* owner = new TensorOwner();
-    owner->memory = memory;
-    owner->shape = std::make_unique<std::int64_t[]>(1);
-    owner->strides = std::make_unique<std::int64_t[]>(1);
-    owner->shape[0] = elements;
-    owner->strides[0] = 1;
-
-    auto* managed = new DLManagedTensor{};
-    managed->dl_tensor.data = ptr;
-    managed->dl_tensor.device = device;
-    managed->dl_tensor.ndim = 1;
-    managed->dl_tensor.dtype = dlpack_dtype(slice_.buffer.scalar);
-    managed->dl_tensor.shape = owner->shape.get();
-    managed->dl_tensor.strides = owner->strides.get();
-    managed->dl_tensor.byte_offset = 0;
-    managed->manager_ctx = owner;
-    managed->deleter = dlmanaged_tensor_deleter;
-
-    return export_dltensor_py(managed);
+std::shared_ptr<Buffer> Buffer::element(std::uint64_t index) const {
+    return slice(index, 1);
 }
 
 DLDevice Buffer::vk_dlpack_device() const noexcept {
@@ -1351,9 +1793,170 @@ namespace {
                     "select a scalar/vector/matrix/array field instead");
         }
     }
+
+    // Copies every element described by `shape`/`strides` (as produced by
+    // append_tensor_dims: at most 2 dims for the vector/matrix/array-of-
+    // scalars fields Buffer::read()/write() support) between `strided`
+    // (this field's own, possibly padded, location inside the buffer) and
+    // `tight` (a contiguous scratch/user buffer of exactly
+    // element_count * scalar_size bytes). `shape`/`strides` are in units of
+    // `scalar_size`-byte elements, matching append_tensor_dims's convention.
+    // Recursive step for copy_field_elements(): walks dimension `dim` of
+    // `shape`/`strides`. The innermost dimension is copied as a single
+    // contiguous run whenever it actually is contiguous (strides[dim] == 1,
+    // true for a VECTOR's own dimension and a MATRIX's row dimension, and
+    // hence for anything nested under one of those, e.g. an array of
+    // vectors/matrices); the one case where even the innermost dimension
+    // isn't contiguous is a padded ARRAY-of-SCALAR (e.g. std140), copied one
+    // scalar at a time instead.
+    void copy_field_elements_dim(
+        char* strided, char* tight, std::uint64_t scalar_size,
+        const std::vector<std::int64_t>& shape, const std::vector<std::int64_t>& strides,
+        std::size_t dim, bool strided_to_tight) {
+        const bool last_dim = (dim + 1 == shape.size());
+        if (last_dim && strides[dim] == 1) {
+            const std::uint64_t row_bytes = static_cast<std::uint64_t>(shape[dim]) * scalar_size;
+            if (strided_to_tight) std::memcpy(tight, strided, row_bytes);
+            else std::memcpy(strided, tight, row_bytes);
+            return;
+        }
+        std::uint64_t tight_row_bytes = scalar_size;
+        for (std::size_t d = dim + 1; d < shape.size(); ++d) {
+            tight_row_bytes *= static_cast<std::uint64_t>(shape[d]);
+        }
+        for (std::int64_t i = 0; i < shape[dim]; ++i) {
+            char* s = strided + static_cast<std::uint64_t>(i) * static_cast<std::uint64_t>(strides[dim]) * scalar_size;
+            char* t = tight + static_cast<std::uint64_t>(i) * tight_row_bytes;
+            if (last_dim) {
+                if (strided_to_tight) std::memcpy(t, s, scalar_size);
+                else std::memcpy(s, t, scalar_size);
+            } else {
+                copy_field_elements_dim(s, t, scalar_size, shape, strides, dim + 1, strided_to_tight);
+            }
+        }
+    }
+
+    // Copies every element described by `shape`/`strides` (as produced by
+    // append_tensor_dims, at any nesting depth: vectors, matrices, and
+    // arrays of either) between `strided` (this field's own, possibly
+    // padded, location inside the buffer) and `tight` (a contiguous
+    // scratch/user buffer of exactly element_count * scalar_size bytes).
+    // `shape`/`strides` are in units of `scalar_size`-byte elements,
+    // matching append_tensor_dims's convention.
+    void copy_field_elements(
+        char* strided, char* tight, std::uint64_t scalar_size,
+        const std::vector<std::int64_t>& shape, const std::vector<std::int64_t>& strides,
+        bool strided_to_tight) {
+        if (shape.empty()) {
+            if (strided_to_tight) std::memcpy(tight, strided, scalar_size);
+            else std::memcpy(strided, tight, scalar_size);
+            return;
+        }
+        copy_field_elements_dim(strided, tight, scalar_size, shape, strides, 0, strided_to_tight);
+    }
+
+    // Reads one scalar of `type` from `ptr`, returned as a plain Python number.
+    pybind11::object read_scalar(const void* ptr, ScalarType type) {
+        switch (type) {
+            case ScalarType::BOOL: { std::uint8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v != 0); }
+            case ScalarType::INT8: { std::int8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v); }
+            case ScalarType::UINT8: { std::uint8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v); }
+            case ScalarType::INT16: { std::int16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); }
+            case ScalarType::UINT16: { std::uint16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); }
+            case ScalarType::FLOAT16: { std::uint16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); } // raw bit pattern
+            case ScalarType::INT32: { std::int32_t v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
+            case ScalarType::UINT32: { std::uint32_t v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
+            case ScalarType::FLOAT32: { float v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
+            case ScalarType::INT64: { std::int64_t v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
+            case ScalarType::UINT64: { std::uint64_t v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
+            case ScalarType::FLOAT64: { double v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
+            default: throw std::runtime_error("Unsupported scalar type");
+        }
+    }
+
+    // Writes one scalar of `type`, given as a plain Python number, to `ptr`.
+    void write_scalar(void* ptr, ScalarType type, const pybind11::object& value) {
+        switch (type) {
+            case ScalarType::BOOL: { std::uint8_t v = value.cast<bool>() ? 1 : 0; std::memcpy(ptr, &v, 1); return; }
+            case ScalarType::INT8: { auto v = value.cast<std::int8_t>(); std::memcpy(ptr, &v, 1); return; }
+            case ScalarType::UINT8: { auto v = value.cast<std::uint8_t>(); std::memcpy(ptr, &v, 1); return; }
+            case ScalarType::INT16: { auto v = value.cast<std::int16_t>(); std::memcpy(ptr, &v, 2); return; }
+            case ScalarType::UINT16: { auto v = value.cast<std::uint16_t>(); std::memcpy(ptr, &v, 2); return; }
+            case ScalarType::FLOAT16: { auto v = value.cast<std::uint16_t>(); std::memcpy(ptr, &v, 2); return; } // raw bit pattern
+            case ScalarType::INT32: { auto v = value.cast<std::int32_t>(); std::memcpy(ptr, &v, 4); return; }
+            case ScalarType::UINT32: { auto v = value.cast<std::uint32_t>(); std::memcpy(ptr, &v, 4); return; }
+            case ScalarType::FLOAT32: { auto v = value.cast<float>(); std::memcpy(ptr, &v, 4); return; }
+            case ScalarType::INT64: { auto v = value.cast<std::int64_t>(); std::memcpy(ptr, &v, 8); return; }
+            case ScalarType::UINT64: { auto v = value.cast<std::uint64_t>(); std::memcpy(ptr, &v, 8); return; }
+            case ScalarType::FLOAT64: { auto v = value.cast<double>(); std::memcpy(ptr, &v, 8); return; }
+            default: throw std::runtime_error("Unsupported scalar type");
+        }
+    }
+}
+
+pybind11::object Buffer::vk_dlpack() const {
+    void* ptr = nullptr;
+    auto memory = data_->get_memory();
+    DLDevice device = memory->dl_device();
+    if (external_ptr() == 0) {
+        throw std::runtime_error("A DEVICE tensor was requested but the external pointer is unavailable");
+    }
+    ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(external_ptr()));
+
+    // Shape/dtype are derived from element_layout(): a struct has no single
+    // numeric type, so it falls back to raw bytes; everything else (scalar,
+    // vector, matrix, array) uses the same shape/stride machinery as
+    // field(), just for the buffer's own top-level layout instead of one of
+    // its fields (with instance_count = size() / element_layout()->aligned_size
+    // as the outer dimension).
+    ScalarType dtype_scalar;
+    std::vector<std::int64_t> shape;
+    std::vector<std::int64_t> strides;
+    if (layout_->kind == TypeKind::STRUCT) {
+        dtype_scalar = ScalarType::UINT8;
+        shape = { static_cast<std::int64_t>(size()) };
+        strides = { 1 };
+    } else {
+        dtype_scalar = resolve_component_type(*layout_);
+        const std::uint64_t scalar_size = static_cast<std::uint64_t>(scalar_type_size(dtype_scalar));
+        const std::uint64_t instance_count = layout_->aligned_size > 0 ? size() / layout_->aligned_size : 1;
+        shape.push_back(static_cast<std::int64_t>(instance_count));
+        strides.push_back(static_cast<std::int64_t>(layout_->aligned_size / scalar_size));
+        append_tensor_dims(*layout_, scalar_size, shape, strides);
+    }
+    const int dimension = static_cast<int>(shape.size());
+
+    auto* owner = new TensorOwner();
+    owner->memory = memory;
+    owner->shape = std::make_unique<std::int64_t[]>(dimension);
+    owner->strides = std::make_unique<std::int64_t[]>(dimension);
+    for (int i = 0; i < dimension; ++i) {
+        owner->shape[i] = shape[i];
+        owner->strides[i] = strides[i];
+    }
+
+    auto* managed = new DLManagedTensor{};
+    managed->dl_tensor.data = ptr;
+    managed->dl_tensor.device = device;
+    managed->dl_tensor.ndim = dimension;
+    managed->dl_tensor.dtype = dlpack_dtype(dtype_scalar);
+    managed->dl_tensor.shape = owner->shape.get();
+    managed->dl_tensor.strides = owner->strides.get();
+    managed->dl_tensor.byte_offset = 0;
+    managed->manager_ctx = owner;
+    managed->deleter = dlmanaged_tensor_deleter;
+
+    return export_dltensor_py(managed);
+}
+
+void Buffer::vk_require_struct_layout(const char* method_name) const {
+    if (layout_->kind != TypeKind::STRUCT) {
+        throw std::runtime_error(std::string("Buffer::") + method_name + ": only valid on a buffer whose element_layout() is a struct");
+    }
 }
 
 pybind11::object Buffer::field(const LayoutField& field) const {
+    vk_require_struct_layout("field");
     auto root = field.root.lock();
     if (!root) {
         throw std::runtime_error("LayoutField has no root layout (was it obtained from compute_layout()?)");
@@ -1400,6 +2003,107 @@ pybind11::object Buffer::field(const LayoutField& field) const {
     managed->deleter = dlmanaged_tensor_deleter;
 
     return export_dltensor_py(managed);
+}
+
+char* Buffer::vk_resolve_field_ptr(const LayoutField& field) const {
+    vk_require_struct_layout("read/write");
+    auto root = field.root.lock();
+    if (!root) {
+        throw std::runtime_error("LayoutField has no root layout (was it obtained from compute_layout()?)");
+    }
+    if (!data_->get_memory()->host_visible()) {
+        throw std::runtime_error("Buffer::read/write: only supported on host-visible buffers");
+    }
+    if (size() != root->aligned_size) {
+        throw std::runtime_error("Buffer::read/write: buffer must hold exactly one instance of the field's root layout");
+    }
+    if (external_ptr() == 0) {
+        throw std::runtime_error("Buffer::read/write: no host-accessible pointer available for this buffer");
+    }
+    return reinterpret_cast<char*>(static_cast<std::uintptr_t>(external_ptr())) + field.offset;
+}
+
+pybind11::object Buffer::read(const LayoutField& field) const {
+    char* ptr = vk_resolve_field_ptr(field);
+    const Layout& layout = *field.layout;
+
+    if (layout.kind == TypeKind::SCALAR) {
+        return read_scalar(ptr, layout.component_type);
+    }
+
+    const ScalarType component_type = resolve_component_type(layout);
+    const std::uint64_t scalar_size = static_cast<std::uint64_t>(scalar_type_size(component_type));
+    std::vector<std::int64_t> shape, strides;
+    append_tensor_dims(layout, scalar_size, shape, strides);
+    std::uint64_t total_elements = 1;
+    for (auto d : shape) total_elements *= static_cast<std::uint64_t>(d);
+
+    std::string packed(static_cast<std::size_t>(total_elements * scalar_size), '\0');
+    copy_field_elements(ptr, packed.data(), scalar_size, shape, strides, /*strided_to_tight=*/true);
+    return pybind11::bytes(packed);
+}
+
+void Buffer::write(const LayoutField& field, const pybind11::object& value) const {
+    char* ptr = vk_resolve_field_ptr(field);
+    const Layout& layout = *field.layout;
+
+    if (layout.kind == TypeKind::SCALAR) {
+        write_scalar(ptr, layout.component_type, value);
+        return;
+    }
+
+    const ScalarType component_type = resolve_component_type(layout);
+    const std::uint64_t scalar_size = static_cast<std::uint64_t>(scalar_type_size(component_type));
+    std::vector<std::int64_t> shape, strides;
+    append_tensor_dims(layout, scalar_size, shape, strides);
+    std::uint64_t total_elements = 1;
+    for (auto d : shape) total_elements *= static_cast<std::uint64_t>(d);
+    const std::uint64_t total_bytes = total_elements * scalar_size;
+
+    // A plain Python buffer object (e.g. a numpy array), assumed C-contiguous.
+    if (PyObject_CheckBuffer(value.ptr())) {
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(value);
+        pybind11::buffer_info info = buf.request();
+        const std::uint64_t src_bytes = static_cast<std::uint64_t>(info.size) * static_cast<std::uint64_t>(info.itemsize);
+        if (src_bytes != total_bytes) {
+            throw std::runtime_error("Buffer::write: source buffer size does not match the field's size");
+        }
+        copy_field_elements(ptr, reinterpret_cast<char*>(info.ptr), scalar_size, shape, strides, /*strided_to_tight=*/false);
+        return;
+    }
+
+    // A DLPack-compatible object (e.g. a CPU torch tensor): pull its
+    // "dltensor" capsule directly rather than going through from_dlpack(),
+    // which is the expensive path this method exists to avoid.
+    if (pybind11::hasattr(value, "__dlpack__")) {
+        pybind11::object capsule = value.attr("__dlpack__")();
+        auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
+        if (!managed) {
+            throw std::runtime_error("Buffer::write: invalid DLPack capsule (expected a \"dltensor\" capsule)");
+        }
+        const DLTensor& src = managed->dl_tensor;
+        // device_type 1 == CPU, 3 == CUDA host/pinned memory: both are
+        // directly dereferenceable from the CPU. Anything else (e.g. a
+        // plain CUDA device tensor) can't be safely memcpy'd from here.
+        if (src.device.device_type != 1 && src.device.device_type != 3) {
+            throw std::runtime_error("Buffer::write: DLPack source tensor must be CPU-accessible");
+        }
+        const std::uint64_t src_itemsize = (static_cast<std::uint64_t>(src.dtype.bits) / 8) * static_cast<std::uint64_t>(src.dtype.lanes);
+        std::uint64_t src_bytes = src_itemsize;
+        for (std::int32_t i = 0; i < src.ndim; ++i) {
+            src_bytes *= static_cast<std::uint64_t>(src.shape[i]);
+        }
+        if (src_bytes != total_bytes) {
+            throw std::runtime_error("Buffer::write: DLPack source tensor size does not match the field's size");
+        }
+        char* src_ptr = reinterpret_cast<char*>(src.data) + src.byte_offset;
+        copy_field_elements(ptr, src_ptr, scalar_size, shape, strides, /*strided_to_tight=*/false);
+        return;
+    }
+
+    throw std::runtime_error(
+        "Buffer::write: value must be a plain number for a scalar field, or a Python buffer "
+        "object / DLPack-compatible object for a vector, matrix or array-of-scalars field");
 }
 
 std::shared_ptr<Image> Image::cast_format(Format new_format) const {
@@ -1460,10 +2164,34 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
         enabled_layers.push_back(layer_it->layerName);
     }
 
+    // Surface extensions, needed for Window/swapchain support. Enabled
+    // defensively (whichever the platform actually supports) rather than
+    // deferred until the first Window is created, since VkInstance
+    // extensions can only be chosen once, up front, and glfwGetRequiredInstanceExtensions
+    // needs glfwInit() to already have been called (a chicken-and-egg
+    // problem avoided by just enabling every surface extension this
+    // platform supports up front instead).
+    const std::vector<vk::ExtensionProperties> instance_extensions = vk::enumerateInstanceExtensionProperties();
+    std::vector<const char*> enabled_instance_extensions;
+    const auto add_instance_extension_if_supported = [&](const char* name) {
+        if (supports_extension(instance_extensions, name)) {
+            enabled_instance_extensions.push_back(name);
+        }
+    };
+    add_instance_extension_if_supported(VK_KHR_SURFACE_EXTENSION_NAME);
+#if defined(_WIN32)
+    add_instance_extension_if_supported(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+#else
+    add_instance_extension_if_supported(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+    add_instance_extension_if_supported(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+#endif
+
     vk::InstanceCreateInfo ci{};
     ci.pApplicationInfo = &app;
     ci.enabledLayerCount = static_cast<uint32_t>(enabled_layers.size());
     ci.ppEnabledLayerNames = enabled_layers.empty() ? nullptr : enabled_layers.data();
+    ci.enabledExtensionCount = static_cast<uint32_t>(enabled_instance_extensions.size());
+    ci.ppEnabledExtensionNames = enabled_instance_extensions.empty() ? nullptr : enabled_instance_extensions.data();
 
     instance_ = vk::createInstance(ci);
 
@@ -1493,11 +2221,26 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     add_extension_if_supported(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     add_extension_if_supported(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     add_extension_if_supported(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+    add_extension_if_supported(VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+    add_extension_if_supported(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 #if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
     add_extension_if_supported("VK_KHR_external_memory_win32");
+    const char* external_semaphore_platform_extension = "VK_KHR_external_semaphore_win32";
 #else
     add_extension_if_supported("VK_KHR_external_memory_fd");
+    const char* external_semaphore_platform_extension = "VK_KHR_external_semaphore_fd";
 #endif
+    add_extension_if_supported(external_semaphore_platform_extension);
+    // Only meaningful if every extension needed to export/import a
+    // cross-API semaphore (see vk_init()'s interop_semaphore_ setup) is
+    // actually present -- interop-semaphore-based synchronization is
+    // skipped entirely otherwise, falling back to a plain host-side wait.
+    external_semaphore_supported_ =
+        supports_extension(supported_extensions, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME) &&
+        supports_extension(supported_extensions, external_semaphore_platform_extension);
+    // Gates Device::create_window: without VK_KHR_swapchain there is no
+    // way to present anything.
+    swapchain_supported_ = supports_extension(supported_extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 
     vk::PhysicalDeviceProperties2 properties2{};
     vk::PhysicalDeviceVulkan12Properties vulkan12_properties{};
@@ -1574,6 +2317,20 @@ uint32_t Device::device_index() const noexcept {
 
 void Device::vk_init() {
     engines_.resize(8); // one slot per EngineType bitmask combination (1..7)
+
+    if (external_semaphore_supported_) {
+        vk::SemaphoreTypeCreateInfo semaphore_type_create_info(vk::SemaphoreType::eTimeline, 0);
+#if defined(_WIN32) && defined(VK_USE_PLATFORM_WIN32_KHR)
+        vk::ExportSemaphoreCreateInfo export_info(vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32);
+#else
+        vk::ExportSemaphoreCreateInfo export_info(vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd);
+#endif
+        semaphore_type_create_info.pNext = &export_info;
+        interop_semaphore_ = device_.createSemaphore(vk::SemaphoreCreateInfo{
+            vk::SemaphoreCreateFlags{},
+            &semaphore_type_create_info
+        });
+    }
 
     const auto memory_properties = physical_.getMemoryProperties();
     bool found_cpu = false;
@@ -1942,7 +2699,14 @@ void vk_Pipeline::vk_close() {
             desc.stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
             desc.stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
             desc.initialLayout = vk::ImageLayout::eUndefined;
-            desc.finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+            // The subpass itself still writes through eColorAttachmentOptimal
+            // (attachment_refs, below), but the render pass's automatic
+            // final transition targets eGeneral -- the one layout every
+            // other use site of an Image assumes uniformly (descriptor
+            // binds, blit_image; see Image's docstring), so a rendered-to
+            // image stays consistently usable afterwards without any
+            // per-image layout tracking.
+            desc.finalLayout = vk::ImageLayout::eGeneral;
             attachment_descs.push_back(desc);
             attachment_refs.push_back({ static_cast<std::uint32_t>(i), vk::ImageLayout::eColorAttachmentOptimal });
         }
@@ -2060,7 +2824,7 @@ const vk_DescriptorBinding& vk_Pipeline::vk_binding(int layout_id) const {
     return bindings_[static_cast<std::size_t>(layout_id)];
 }
 
-std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<int, std::shared_ptr<Image>>> attachments) {
+std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<AttachHandle, std::shared_ptr<Image>>> attachments) {
     if (!pipeline_->is_closed()) throw std::runtime_error("Pipeline::create_framebuffer: pipeline must be closed first");
     if (pipeline_->type() != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::create_framebuffer: only valid for RASTERIZATION pipelines");
 
@@ -2072,7 +2836,7 @@ std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<
     for (auto& [slot, image] : attachments) {
         int index = -1;
         for (std::size_t i = 0; i < attachment_descs.size(); ++i) {
-            if (attachment_descs[i].slot == slot) { index = static_cast<int>(i); break; }
+            if (attachment_descs[i].slot == slot.vk_slot()) { index = static_cast<int>(i); break; }
         }
         if (index < 0) throw std::runtime_error("Pipeline::create_framebuffer: no attachment declared for this slot");
         if (image->format() != attachment_descs[static_cast<std::size_t>(index)].format) {
@@ -2101,7 +2865,9 @@ std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<
     info.layers = 1;
 
     vk::Framebuffer framebuffer = device_->logical_device().createFramebuffer(info);
-    auto vk_fb = std::make_shared<vk_Framebuffer>(device_, framebuffer, width, height);
+    auto vk_fb = std::make_shared<vk_Framebuffer>(
+        device_, framebuffer, pipeline_->vk_render_pass(), static_cast<std::uint32_t>(views.size()), width, height);
+    device_->vk_register_framebuffer(vk_fb);
     return std::make_shared<Framebuffer>(std::move(vk_fb));
 }
 
@@ -2111,20 +2877,907 @@ std::shared_ptr<DescriptorSet> Pipeline::create_descriptor_set(int set) {
     return std::make_shared<DescriptorSet>(std::move(vk_ds));
 }
 
-vk_Framebuffer::vk_Framebuffer(std::weak_ptr<Device> device, vk::Framebuffer framebuffer, std::uint32_t width, std::uint32_t height) noexcept
-    : device_(std::move(device)), framebuffer_(framebuffer), width_(width), height_(height) {}
+vk_Framebuffer::vk_Framebuffer(std::weak_ptr<Device> device, vk::Framebuffer framebuffer, vk::RenderPass render_pass,
+    std::uint32_t attachment_count, std::uint32_t width, std::uint32_t height) noexcept
+    : device_(std::move(device)), framebuffer_(framebuffer), render_pass_(render_pass),
+      attachment_count_(attachment_count), width_(width), height_(height) {}
 
-vk_Framebuffer::~vk_Framebuffer() noexcept {
+void vk_Framebuffer::dispose() noexcept {
+    if (!framebuffer_) return;
     auto device = device_.lock();
-    if (!device || device->is_disposed()) return;
-    if (framebuffer_) device->logical_device().destroyFramebuffer(framebuffer_);
+    if (device && !device->is_disposed()) {
+        device->logical_device().destroyFramebuffer(framebuffer_);
+    }
+    framebuffer_ = nullptr;
+}
+
+namespace {
+
+// Finds a queue family supporting both graphics (needed for the blit/copy/
+// barrier commands recorded below) and presentation to `surface`. Throws
+// if none exists (exceedingly rare in practice: every desktop driver
+// exposes at least one such family).
+std::uint32_t find_present_queue_family(vk::PhysicalDevice physical, vk::SurfaceKHR surface) {
+    const auto families = physical.getQueueFamilyProperties();
+    for (std::uint32_t i = 0; i < families.size(); ++i) {
+        const bool graphics = (families[i].queueFlags & vk::QueueFlagBits::eGraphics) == vk::QueueFlagBits::eGraphics;
+        if (!graphics) continue;
+        if (physical.getSurfaceSupportKHR(i, surface)) {
+            return i;
+        }
+    }
+    throw std::runtime_error("Window: no queue family supports both graphics and presentation to this surface");
+}
+
+// Records a full image layout transition (both access masks and pipeline
+// stages broad enough to be correct, if not maximally tight, for the
+// handful of operations Window's pre-recorded command buffers perform).
+void record_image_barrier(vk::CommandBuffer cmd, vk::Image image, vk::ImageLayout old_layout, vk::ImageLayout new_layout) {
+    vk::ImageMemoryBarrier barrier{};
+    barrier.oldLayout = old_layout;
+    barrier.newLayout = new_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+    cmd.pipelineBarrier(
+        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
+        vk::DependencyFlags{}, {}, {}, barrier);
+}
+
+// Reference-counts glfwInit()/glfwTerminate() across however many Windows
+// are alive at once, since each successful glfwInit() must be matched by
+// exactly one glfwTerminate() (not one per Window).
+int g_glfw_ref_count = 0;
+
+void glfw_acquire() {
+    if (g_glfw_ref_count == 0) {
+        glfwInit();
+    }
+    ++g_glfw_ref_count;
+}
+
+void glfw_release() {
+    if (--g_glfw_ref_count == 0) {
+        glfwTerminate();
+    }
+}
+
+} // namespace
+
+vk_Window::vk_Window(std::shared_ptr<Device> device, std::uint32_t width, std::uint32_t height,
+    const std::string& title, Format format, std::uint32_t frames_on_the_fly)
+    : device_(device), format_(format), frames_on_the_fly_(std::max<std::uint32_t>(frames_on_the_fly, 1)) {
+    if (!device->vk_swapchain_supported()) {
+        throw std::runtime_error("Window: VK_KHR_swapchain is not supported/enabled on this device");
+    }
+
+    glfw_acquire();
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    GLFWwindow* glfw_window = glfwCreateWindow(static_cast<int>(width), static_cast<int>(height), title.c_str(), nullptr, nullptr);
+    if (!glfw_window) {
+        glfw_release();
+        throw std::runtime_error("Window: glfwCreateWindow failed");
+    }
+    glfw_window_ = glfw_window;
+
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (glfwCreateWindowSurface(static_cast<VkInstance>(device->vk_instance()), glfw_window, nullptr, &surface) != VK_SUCCESS) {
+        glfwDestroyWindow(glfw_window);
+        glfw_release();
+        throw std::runtime_error("Window: glfwCreateWindowSurface failed");
+    }
+    surface_ = surface;
+
+    present_queue_family_ = find_present_queue_family(device->physical_device(), surface_);
+    present_queue_ = device->logical_device().getQueue(present_queue_family_, 0);
+
+    // Must happen before create_swapchain(): it creates imgui_render_pass_,
+    // which the first create_swapchain() call needs to build imgui_framebuffers_.
+    vk_imgui_init(device);
+
+    create_swapchain();
+}
+
+void vk_Window::vk_imgui_init(const std::shared_ptr<Device>& device) {
+    vk::Device dev = device->logical_device();
+
+    IMGUI_CHECKVERSION();
+    ImGuiContext* ctx = ImGui::CreateContext();
+    imgui_context_ = ctx;
+    ImGui::SetCurrentContext(ctx);
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // a library shouldn't write files behind the caller's back
+
+    ImGui_ImplGlfw_InitForVulkan(static_cast<GLFWwindow*>(glfw_window_), true);
+
+    // Sized generously for ImGui's own internal descriptor sets (font
+    // texture, plus any user textures added later).
+    vk::DescriptorPoolSize pool_size{ vk::DescriptorType::eCombinedImageSampler, 64 };
+    vk::DescriptorPoolCreateInfo pool_info{};
+    pool_info.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
+    pool_info.maxSets = 64;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    imgui_descriptor_pool_ = dev.createDescriptorPool(pool_info);
+
+    // Drawn as a final overlay pass onto the swapchain image: eLoad (not
+    // eClear) to preserve whatever the caller already rendered/blitted
+    // there; initial/final layout ePresentSrcKHR to match the layout the
+    // pre-recorded target-to-render_target command buffers always leave
+    // render_target in by the time this pass runs (see vk_present_frame).
+    vk::AttachmentDescription attachment{};
+    attachment.format = vk::Format::eB8G8R8A8Unorm;
+    attachment.samples = vk::SampleCountFlagBits::e1;
+    attachment.loadOp = vk::AttachmentLoadOp::eLoad;
+    attachment.storeOp = vk::AttachmentStoreOp::eStore;
+    attachment.stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+    attachment.stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+    attachment.initialLayout = vk::ImageLayout::ePresentSrcKHR;
+    attachment.finalLayout = vk::ImageLayout::ePresentSrcKHR;
+
+    vk::AttachmentReference color_ref{ 0, vk::ImageLayout::eColorAttachmentOptimal };
+    vk::SubpassDescription subpass{};
+    subpass.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+
+    vk::SubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    dependency.dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    dependency.srcAccessMask = vk::AccessFlags{};
+    dependency.dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+
+    vk::RenderPassCreateInfo render_pass_info{};
+    render_pass_info.attachmentCount = 1;
+    render_pass_info.pAttachments = &attachment;
+    render_pass_info.subpassCount = 1;
+    render_pass_info.pSubpasses = &subpass;
+    render_pass_info.dependencyCount = 1;
+    render_pass_info.pDependencies = &dependency;
+    imgui_render_pass_ = dev.createRenderPass(render_pass_info);
+
+    ImGui_ImplVulkan_InitInfo init_info{};
+    init_info.Instance = static_cast<VkInstance>(device->vk_instance());
+    init_info.PhysicalDevice = static_cast<VkPhysicalDevice>(device->physical_device());
+    init_info.Device = static_cast<VkDevice>(dev);
+    init_info.QueueFamily = present_queue_family_;
+    init_info.Queue = static_cast<VkQueue>(present_queue_);
+    init_info.PipelineCache = VK_NULL_HANDLE;
+    init_info.DescriptorPool = static_cast<VkDescriptorPool>(imgui_descriptor_pool_);
+    init_info.RenderPass = static_cast<VkRenderPass>(imgui_render_pass_);
+    init_info.Subpass = 0;
+    init_info.MinImageCount = std::max<std::uint32_t>(frames_on_the_fly_, 2);
+    init_info.ImageCount = init_info.MinImageCount;
+    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    ImGui_ImplVulkan_Init(&init_info);
+
+    last_frame_time_point_ = std::chrono::steady_clock::now();
+}
+
+void vk_Window::vk_imgui_shutdown(vk::Device dev) noexcept {
+    if (!imgui_context_) return;
+    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(imgui_context_));
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext(static_cast<ImGuiContext*>(imgui_context_));
+    imgui_context_ = nullptr;
+    if (dev) {
+        if (imgui_render_pass_) dev.destroyRenderPass(imgui_render_pass_);
+        if (imgui_descriptor_pool_) dev.destroyDescriptorPool(imgui_descriptor_pool_);
+    }
+    imgui_render_pass_ = nullptr;
+    imgui_descriptor_pool_ = nullptr;
+}
+
+void vk_Window::vk_imgui_ensure_current() const noexcept {
+    if (imgui_context_) ImGui::SetCurrentContext(static_cast<ImGuiContext*>(imgui_context_));
+}
+
+void vk_Window::vk_imgui_text(const std::string& text) {
+    vk_imgui_ensure_current();
+    ImGui::Text("%s", text.c_str());
+}
+
+bool vk_Window::vk_imgui_button(const std::string& text) {
+    vk_imgui_ensure_current();
+    return ImGui::Button(text.c_str());
+}
+
+bool vk_Window::vk_imgui_checkbox(const std::string& label, bool& value) {
+    vk_imgui_ensure_current();
+    return ImGui::Checkbox(label.c_str(), &value);
+}
+
+bool vk_Window::vk_imgui_slider_float(const std::string& label, float& value, float min, float max) {
+    vk_imgui_ensure_current();
+    return ImGui::SliderFloat(label.c_str(), &value, min, max);
+}
+
+bool vk_Window::vk_imgui_slider_int(const std::string& label, int& value, int min, int max) {
+    vk_imgui_ensure_current();
+    return ImGui::SliderInt(label.c_str(), &value, min, max);
+}
+
+bool vk_Window::vk_imgui_combobox(const std::string& label, const std::vector<std::string>& items, int& selected_index) {
+    vk_imgui_ensure_current();
+    bool changed = false;
+    const std::string preview = (selected_index >= 0 && static_cast<std::size_t>(selected_index) < items.size())
+        ? items[static_cast<std::size_t>(selected_index)] : std::string{};
+    if (ImGui::BeginCombo(label.c_str(), preview.c_str())) {
+        for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+            const bool is_selected = (i == selected_index);
+            if (ImGui::Selectable(items[static_cast<std::size_t>(i)].c_str(), is_selected)) {
+                selected_index = i;
+                changed = true;
+            }
+            if (is_selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+std::uint64_t vk_next_widget_id(const std::weak_ptr<vk_Window>& window) {
+    auto w = window.lock();
+    return w ? w->vk_next_widget_id() : 0;
+}
+
+double Stats::fps() const {
+    auto w = window_.lock();
+    return w ? w->vk_fps() : 0.0;
+}
+
+bool Checkbox::draw() {
+    auto w = window_.lock();
+    if (!w) return false;
+    const std::string id_label = label_ + "##cb" + std::to_string(id_);
+    return w->vk_imgui_checkbox(id_label, value_);
+}
+
+bool SliderFloat::draw() {
+    auto w = window_.lock();
+    if (!w) return false;
+    const std::string id_label = label_ + "##sf" + std::to_string(id_);
+    return w->vk_imgui_slider_float(id_label, value_, min_, max_);
+}
+
+bool SliderInt::draw() {
+    auto w = window_.lock();
+    if (!w) return false;
+    const std::string id_label = label_ + "##si" + std::to_string(id_);
+    return w->vk_imgui_slider_int(id_label, value_, min_, max_);
+}
+
+bool Combobox::draw() {
+    auto w = window_.lock();
+    if (!w) return false;
+    const std::string id_label = label_ + "##cx" + std::to_string(id_);
+    return w->vk_imgui_combobox(id_label, items_, selected_index_);
+}
+
+vk_Window::~vk_Window() noexcept {
+    dispose();
+}
+
+void vk_Window::dispose() noexcept {
+    auto device = device_.lock();
+    vk::Device dev = (device && !device->is_disposed()) ? device->logical_device() : vk::Device{};
+    vk::Instance instance = (device && !device->is_disposed()) ? device->vk_instance() : vk::Instance{};
+    vk_dispose_with(dev, instance);
+}
+
+void vk_Window::vk_dispose_with(vk::Device dev, vk::Instance instance) noexcept {
+    if (dev) {
+        try {
+            dev.waitIdle();
+        } catch (...) {
+            // dispose must not throw.
+        }
+    }
+    destroy_swapchain_resources_with(dev);
+    vk_imgui_shutdown(dev);
+    if (dev && instance && surface_) {
+        instance.destroySurfaceKHR(surface_);
+    }
+    surface_ = nullptr;
+    if (glfw_window_) {
+        glfwDestroyWindow(static_cast<GLFWwindow*>(glfw_window_));
+        glfw_window_ = nullptr;
+        glfw_release();
+    }
+}
+
+void vk_Window::destroy_swapchain_resources_with(vk::Device dev) noexcept {
+    // Must go before slots_.clear() below: each framebuffer wraps a
+    // slot's render_target image view, which slots_.clear() may destroy
+    // (if that was the view's last reference).
+    if (dev) {
+        for (auto& fb : imgui_framebuffers_) {
+            if (fb) dev.destroyFramebuffer(fb);
+        }
+    }
+    imgui_framebuffers_.clear();
+    imgui_command_buffers_.clear(); // freed below, along with every other command buffer in command_pool_
+
+    if (dev) {
+        for (auto& sync : sync_groups_) {
+            if (sync.image_available_semaphore) dev.destroySemaphore(sync.image_available_semaphore);
+            if (sync.content_ready_semaphore) dev.destroySemaphore(sync.content_ready_semaphore);
+            if (sync.render_finished_semaphore) dev.destroySemaphore(sync.render_finished_semaphore);
+            if (sync.fence) dev.destroyFence(sync.fence);
+        }
+        if (command_pool_) {
+            dev.destroyCommandPool(command_pool_); // also frees every command buffer allocated from it
+        }
+        if (swapchain_) {
+            dev.destroySwapchainKHR(swapchain_);
+        }
+    }
+    sync_groups_.clear();
+    slots_.clear();
+    swapchain_images_.clear();
+    frame_to_image_index_.clear();
+    images_in_flight_.clear();
+    command_pool_ = nullptr;
+    swapchain_ = nullptr;
+}
+
+namespace {
+// Physical, byte-exact per-channel scalar type and channel count for a
+// Format -- unlike format_scalar_type(), which reports the shader-
+// conceptual read type (collapsing every 8-bit normalized format to a
+// single "float" component). buffer_target/tensor_target need the
+// former: their raw bytes are copied directly into image_target via
+// vkCmdCopyBufferToImage, and tensor_target's dtype/shape are exposed
+// as-is to the caller (e.g. via DLPack).
+std::pair<ScalarType, std::uint64_t> physical_pixel_layout(Format format) {
+    switch (static_cast<vk::Format>(format)) {
+        case vk::Format::eR8Unorm:
+        case vk::Format::eR8G8Unorm:
+        case vk::Format::eR8G8B8Unorm:
+        case vk::Format::eR8G8B8A8Unorm:
+        case vk::Format::eB8G8R8A8Unorm:
+            return { ScalarType::UINT8, formatSize(format) };
+        case vk::Format::eR8Snorm:
+        case vk::Format::eR8G8Snorm:
+        case vk::Format::eR8G8B8Snorm:
+        case vk::Format::eR8G8B8A8Snorm:
+            return { ScalarType::INT8, formatSize(format) };
+        default: {
+            const ScalarType scalar = format_scalar_type(format);
+            return { scalar, formatSize(format) / scalar_type_size(scalar) };
+        }
+    }
+}
+} // namespace
+
+void vk_Window::create_swapchain() {
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Window: device has been disposed");
+    vk::PhysicalDevice physical = device->physical_device();
+    vk::Device dev = device->logical_device();
+
+    dev.waitIdle();
+    vk::SwapchainKHR old_swapchain = swapchain_;
+    // Destroy everything except the swapchain itself (needed as
+    // oldSwapchain below, for a resize to hand over ownership cleanly).
+    // Framebuffers must go before slots_.clear(), same reasoning as
+    // destroy_swapchain_resources_with.
+    for (auto& fb : imgui_framebuffers_) {
+        if (fb) dev.destroyFramebuffer(fb);
+    }
+    imgui_framebuffers_.clear();
+    imgui_command_buffers_.clear(); // freed below, along with every other command buffer in command_pool_
+    for (auto& sync : sync_groups_) {
+        if (sync.image_available_semaphore) dev.destroySemaphore(sync.image_available_semaphore);
+        if (sync.content_ready_semaphore) dev.destroySemaphore(sync.content_ready_semaphore);
+        if (sync.render_finished_semaphore) dev.destroySemaphore(sync.render_finished_semaphore);
+        if (sync.fence) dev.destroyFence(sync.fence);
+    }
+    sync_groups_.clear();
+    slots_.clear();
+    swapchain_images_.clear();
+    images_in_flight_.clear();
+    if (command_pool_) {
+        dev.destroyCommandPool(command_pool_);
+        command_pool_ = nullptr;
+    }
+
+    const vk::SurfaceCapabilitiesKHR capabilities = physical.getSurfaceCapabilitiesKHR(surface_);
+    const auto surface_formats = physical.getSurfaceFormatsKHR(surface_);
+    const auto present_modes = physical.getSurfacePresentModesKHR(surface_);
+
+    // The swapchain itself is always BGRA8_UNorm (the native format on
+    // most Windows/Linux drivers); `format_` is only for image_target/
+    // buffer_target/tensor_target, which may be any format the caller
+    // finds convenient -- blit_image (used to composite them into
+    // render_target at present time) converts between formats natively.
+    const vk::Format swapchain_format = vk::Format::eB8G8R8A8Unorm;
+    bool format_supported = false;
+    for (const auto& f : surface_formats) {
+        if (f.format == swapchain_format && f.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear) {
+            format_supported = true;
+            break;
+        }
+    }
+    if (!format_supported) {
+        throw std::runtime_error("Window: this surface does not support VK_FORMAT_B8G8R8A8_UNORM (the format every swapchain is created with)");
+    }
+    vk_format_ = swapchain_format;
+
+    vk::PresentModeKHR present_mode = vk::PresentModeKHR::eFifo; // always supported, vsync'd
+    for (const auto& mode : present_modes) {
+        if (mode == vk::PresentModeKHR::eFifo) { present_mode = mode; break; }
+    }
+
+    vk::Extent2D extent;
+    if (capabilities.currentExtent.width != std::numeric_limits<std::uint32_t>::max()) {
+        extent = capabilities.currentExtent;
+    } else {
+        int actual_width = 0, actual_height = 0;
+        glfwGetFramebufferSize(static_cast<GLFWwindow*>(glfw_window_), &actual_width, &actual_height);
+        extent.width = std::clamp(static_cast<std::uint32_t>(actual_width), capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
+        extent.height = std::clamp(static_cast<std::uint32_t>(actual_height), capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+    }
+    extent_ = extent;
+
+    std::uint32_t image_count = std::max(frames_on_the_fly_, capabilities.minImageCount);
+    if (capabilities.maxImageCount > 0) {
+        image_count = std::min(image_count, capabilities.maxImageCount);
+    }
+
+    // eTransferSrc is not strictly needed to render+present, but it's
+    // virtually universally supported and lets render_target be read back
+    // (e.g. vkCmdCopyImageToBuffer, for a screenshot) or used as a blit
+    // source -- cheap to request defensively.
+    vk::ImageUsageFlags image_usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst;
+    if (capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eTransferSrc) {
+        image_usage |= vk::ImageUsageFlagBits::eTransferSrc;
+    }
+
+    vk::SwapchainCreateInfoKHR swapchain_info{};
+    swapchain_info.surface = surface_;
+    swapchain_info.minImageCount = image_count;
+    swapchain_info.imageFormat = vk_format_;
+    swapchain_info.imageColorSpace = vk::ColorSpaceKHR::eSrgbNonlinear;
+    swapchain_info.imageExtent = extent_;
+    swapchain_info.imageArrayLayers = 1;
+    swapchain_info.imageUsage = image_usage;
+    swapchain_info.imageSharingMode = vk::SharingMode::eExclusive;
+    swapchain_info.preTransform = capabilities.currentTransform;
+    swapchain_info.compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque;
+    swapchain_info.presentMode = present_mode;
+    swapchain_info.clipped = VK_TRUE;
+    swapchain_info.oldSwapchain = old_swapchain;
+
+    swapchain_ = dev.createSwapchainKHR(swapchain_info);
+    if (old_swapchain) {
+        dev.destroySwapchainKHR(old_swapchain);
+    }
+
+    swapchain_images_ = dev.getSwapchainImagesKHR(swapchain_);
+    const std::uint32_t actual_image_count = static_cast<std::uint32_t>(swapchain_images_.size());
+    frames_on_the_fly_ = actual_image_count;
+
+    vk::CommandPoolCreateInfo pool_info{};
+    pool_info.queueFamilyIndex = present_queue_family_;
+    pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+    command_pool_ = dev.createCommandPool(pool_info);
+
+    vk::ImageCreateInfo swapchain_image_info{};
+    swapchain_image_info.imageType = vk::ImageType::e2D;
+    swapchain_image_info.format = vk_format_;
+    swapchain_image_info.extent = vk::Extent3D{ extent_.width, extent_.height, 1 };
+    swapchain_image_info.mipLevels = 1;
+    swapchain_image_info.arrayLayers = 1;
+    swapchain_image_info.samples = vk::SampleCountFlagBits::e1;
+    swapchain_image_info.tiling = vk::ImageTiling::eOptimal;
+    swapchain_image_info.usage = swapchain_info.imageUsage;
+    swapchain_image_info.sharingMode = vk::SharingMode::eExclusive;
+    swapchain_image_info.initialLayout = vk::ImageLayout::eUndefined;
+
+    slots_.resize(actual_image_count);
+    images_in_flight_.assign(actual_image_count, vk::Fence{});
+    for (std::uint32_t i = 0; i < actual_image_count; ++i) {
+        auto memory_slice = std::make_shared<MemorySlice>(device, nullptr, 0, 0, 0, 0);
+        auto data = std::make_shared<vk_ResourceData>(device, memory_slice, swapchain_images_[i], swapchain_image_info,
+            /*dedicated_image_memory=*/nullptr, /*owns_image=*/false);
+        ResourceSlice slice{};
+        slice.type = ResourceType::IMAGE;
+        slice.image.format = Format::BGRA8_UNorm; // the swapchain's real, fixed format
+        slice.image.mip_start = 0;
+        slice.image.mip_count = 1;
+        slice.image.array_start = 0;
+        slice.image.array_count = 1;
+        slots_[i].render_target = std::make_shared<Image>(data, slice);
+        slots_[i].image_target = device->create_image(
+            static_cast<int>(extent_.width), static_cast<int>(extent_.height), 1, 1, 1, format_, MemoryLocation::DEVICE);
+        const std::uint64_t pixel_count = static_cast<std::uint64_t>(extent_.width) * extent_.height;
+        slots_[i].buffer_target = device->create_buffer(pixel_count, format_, MemoryLocation::DEVICE);
+        const auto [target_scalar_type, target_channels] = physical_pixel_layout(format_);
+        slots_[i].tensor_target = device->create_tensor(
+            { extent_.height, extent_.width, target_channels }, target_scalar_type, MemoryLocation::DEVICE);
+
+        vk::CommandBufferAllocateInfo alloc_info{};
+        alloc_info.commandPool = command_pool_;
+        alloc_info.level = vk::CommandBufferLevel::ePrimary;
+        alloc_info.commandBufferCount = 4;
+        auto cmds = dev.allocateCommandBuffers(alloc_info);
+        slots_[i].cmd_from_render_target = cmds[0];
+        slots_[i].cmd_from_image_target = cmds[1];
+        slots_[i].cmd_from_buffer_target = cmds[2];
+        slots_[i].cmd_from_tensor_target = cmds[3];
+
+        record_command_buffers(i);
+    }
+
+    // ImGui overlay framebuffer: one per slot, wrapping the same
+    // render_target view every other command buffer targets, so the
+    // overlay pass draws on top of whatever content is already there.
+    imgui_framebuffers_.resize(actual_image_count);
+    for (std::uint32_t i = 0; i < actual_image_count; ++i) {
+        vk::ImageView view = slots_[i].render_target->get_view();
+        vk::FramebufferCreateInfo fb_info{};
+        fb_info.renderPass = imgui_render_pass_;
+        fb_info.attachmentCount = 1;
+        fb_info.pAttachments = &view;
+        fb_info.width = extent_.width;
+        fb_info.height = extent_.height;
+        fb_info.layers = 1;
+        imgui_framebuffers_[i] = dev.createFramebuffer(fb_info);
+    }
+    ImGui_ImplVulkan_SetMinImageCount(std::max<std::uint32_t>(frames_on_the_fly_, 2));
+
+    sync_groups_.resize(frames_on_the_fly_);
+    for (auto& sync : sync_groups_) {
+        sync.image_available_semaphore = dev.createSemaphore(vk::SemaphoreCreateInfo{});
+        sync.content_ready_semaphore = dev.createSemaphore(vk::SemaphoreCreateInfo{});
+        sync.render_finished_semaphore = dev.createSemaphore(vk::SemaphoreCreateInfo{});
+        sync.fence = dev.createFence(vk::FenceCreateInfo{});
+        sync.fence_submitted = false;
+    }
+    imgui_command_buffers_.resize(frames_on_the_fly_);
+    {
+        vk::CommandBufferAllocateInfo alloc_info{};
+        alloc_info.commandPool = command_pool_;
+        alloc_info.level = vk::CommandBufferLevel::ePrimary;
+        alloc_info.commandBufferCount = frames_on_the_fly_;
+        auto cmds = dev.allocateCommandBuffers(alloc_info);
+        for (std::uint32_t i = 0; i < frames_on_the_fly_; ++i) {
+            imgui_command_buffers_[i] = cmds[i];
+        }
+    }
+    frame_to_image_index_.assign(frames_on_the_fly_, 0);
+}
+
+void vk_Window::record_command_buffers(std::size_t slot_index) {
+    auto& slot = slots_[slot_index];
+    const vk::Image render_target_image = slot.render_target->vk_image();
+    const vk::Image image_target_image = slot.image_target->vk_image();
+
+    // render_target used directly: the caller's own render pass already
+    // left it in eGeneral (initialLayout=eUndefined, finalLayout=eGeneral --
+    // see vk_Pipeline::vk_close), regardless of the image's true state
+    // beforehand, so only the final present transition is needed here.
+    slot.cmd_from_render_target.begin(vk::CommandBufferBeginInfo{});
+    record_image_barrier(slot.cmd_from_render_target, render_target_image, vk::ImageLayout::eGeneral, vk::ImageLayout::ePresentSrcKHR);
+    slot.cmd_from_render_target.end();
+
+    // image_target: blit it into render_target, then present. render_target
+    // is transitioned from eUndefined (a discard -- valid regardless of its
+    // true prior layout, e.g. ePresentSrcKHR from the last time this slot
+    // was presented) since the caller never wrote to it directly.
+    slot.cmd_from_image_target.begin(vk::CommandBufferBeginInfo{});
+    record_image_barrier(slot.cmd_from_image_target, render_target_image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral);
+    {
+        vk::ImageBlit region{};
+        region.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        region.srcSubresource.layerCount = 1;
+        region.srcOffsets[1] = vk::Offset3D{ static_cast<std::int32_t>(extent_.width), static_cast<std::int32_t>(extent_.height), 1 };
+        region.dstSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        region.dstSubresource.layerCount = 1;
+        region.dstOffsets[1] = vk::Offset3D{ static_cast<std::int32_t>(extent_.width), static_cast<std::int32_t>(extent_.height), 1 };
+        slot.cmd_from_image_target.blitImage(
+            image_target_image, vk::ImageLayout::eGeneral,
+            render_target_image, vk::ImageLayout::eGeneral,
+            region, vk::Filter::eNearest);
+    }
+    record_image_barrier(slot.cmd_from_image_target, render_target_image, vk::ImageLayout::eGeneral, vk::ImageLayout::ePresentSrcKHR);
+    slot.cmd_from_image_target.end();
+
+    // buffer_target/tensor_target: upload into image_target (already
+    // eGeneral since Device::create_image leaves every image there), then
+    // exactly the image_target sequence above.
+    auto record_from_linear_source = [&](vk::CommandBuffer cmd, vk::Buffer src_buffer, std::uint64_t src_offset) {
+        cmd.begin(vk::CommandBufferBeginInfo{});
+        record_image_barrier(cmd, render_target_image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral);
+        vk::BufferImageCopy copy{};
+        copy.bufferOffset = src_offset;
+        copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = vk::Extent3D{ extent_.width, extent_.height, 1 };
+        cmd.copyBufferToImage(src_buffer, image_target_image, vk::ImageLayout::eGeneral, copy);
+        vk::ImageBlit region{};
+        region.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        region.srcSubresource.layerCount = 1;
+        region.srcOffsets[1] = vk::Offset3D{ static_cast<std::int32_t>(extent_.width), static_cast<std::int32_t>(extent_.height), 1 };
+        region.dstSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        region.dstSubresource.layerCount = 1;
+        region.dstOffsets[1] = vk::Offset3D{ static_cast<std::int32_t>(extent_.width), static_cast<std::int32_t>(extent_.height), 1 };
+        cmd.blitImage(
+            image_target_image, vk::ImageLayout::eGeneral,
+            render_target_image, vk::ImageLayout::eGeneral,
+            region, vk::Filter::eNearest);
+        record_image_barrier(cmd, render_target_image, vk::ImageLayout::eGeneral, vk::ImageLayout::ePresentSrcKHR);
+        cmd.end();
+    };
+    record_from_linear_source(slot.cmd_from_buffer_target, slot.buffer_target->vk_buffer(), slot.buffer_target->vk_buffer_offset());
+    record_from_linear_source(slot.cmd_from_tensor_target, slot.tensor_target->vk_buffer(), slot.tensor_target->vk_buffer_offset());
+}
+
+bool vk_Window::check_alive() {
+    glfwPollEvents();
+    if (glfwWindowShouldClose(static_cast<GLFWwindow*>(glfw_window_))) {
+        alive_ = false;
+    }
+    return alive_;
+}
+
+void vk_Window::set_title(const std::string& title) {
+    glfwSetWindowTitle(static_cast<GLFWwindow*>(glfw_window_), title.c_str());
+}
+
+void vk_Window::set_size(std::uint32_t width, std::uint32_t height) {
+    glfwSetWindowSize(static_cast<GLFWwindow*>(glfw_window_), static_cast<int>(width), static_cast<int>(height));
+    create_swapchain();
+}
+
+vk_Window::FrameResources vk_Window::vk_begin_frame() {
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Window::begin_frame: device has been disposed");
+    vk::Device dev = device->logical_device();
+
+    const std::uint32_t sync_index = static_cast<std::uint32_t>(current_frame_index_ % frames_on_the_fly_);
+    auto& sync = sync_groups_[sync_index];
+    if (sync.fence_submitted) {
+        auto wait_result = dev.waitForFences(sync.fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+        (void)wait_result;
+        dev.resetFences(sync.fence);
+    }
+
+    std::uint32_t image_index = 0;
+    VkResult result = vkAcquireNextImageKHR(
+        static_cast<VkDevice>(dev), static_cast<VkSwapchainKHR>(swapchain_),
+        std::numeric_limits<std::uint64_t>::max(),
+        static_cast<VkSemaphore>(sync.image_available_semaphore), VK_NULL_HANDLE, &image_index);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        create_swapchain();
+        auto& sync2 = sync_groups_[sync_index];
+        result = vkAcquireNextImageKHR(
+            static_cast<VkDevice>(dev), static_cast<VkSwapchainKHR>(swapchain_),
+            std::numeric_limits<std::uint64_t>::max(),
+            static_cast<VkSemaphore>(sync2.image_available_semaphore), VK_NULL_HANDLE, &image_index);
+    }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        throw std::runtime_error("Window::begin_frame: failed to acquire a swapchain image");
+    }
+
+    frame_to_image_index_[sync_index] = image_index;
+
+    // vkAcquireNextImageKHR does not guarantee round-robin order, so this
+    // image may have last been used under a *different* sync group --
+    // whose fence (not this one) is what actually guards its command
+    // buffers/ImGui framebuffer. Wait for that specific fence (unless
+    // it's already this sync group's, e.g. on a stable round-robin
+    // driver, in which case it was already waited on above) before
+    // reusing anything belonging to this image. See images_in_flight_'s
+    // docstring.
+    if (images_in_flight_[image_index] && images_in_flight_[image_index] != sync.fence) {
+        auto wait_result = dev.waitForFences(images_in_flight_[image_index], VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+        (void)wait_result;
+    }
+    images_in_flight_[image_index] = sync.fence;
+
+    const auto& slot = slots_[image_index];
+
+    // Starts this frame's ImGui immediate-mode block: label()/button()/
+    // checkbox()/slider_*()/combobox() calls made between now and the
+    // matching present() land in this frame's draw data (see
+    // vk_present_frame, which calls ImGui::Render() and submits it).
+    vk_imgui_ensure_current();
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - last_frame_time_point_).count();
+    last_frame_time_point_ = now;
+    if (dt > 0.0) {
+        const double instantaneous_fps = 1.0 / dt;
+        // Exponential moving average: a single frame's instantaneous fps
+        // is too noisy to display directly.
+        fps_ = (fps_ == 0.0) ? instantaneous_fps : (fps_ * 0.9 + instantaneous_fps * 0.1);
+    }
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    FrameResources resources{};
+    resources.render_target = slot.render_target;
+    resources.image_target = slot.image_target;
+    resources.buffer_target = slot.buffer_target;
+    resources.tensor_target = slot.tensor_target;
+    resources.index = current_frame_index_;
+    ++current_frame_index_;
+    return resources;
+}
+
+void vk_Window::vk_present_frame(std::int64_t index,
+    const std::shared_ptr<Image>& render_target, const std::shared_ptr<Image>& image_target,
+    const std::shared_ptr<Buffer>& buffer_target, const std::shared_ptr<Tensor>& tensor_target) {
+    if (index != last_enqueue_frame_index_ + 1) {
+        throw std::runtime_error("Window::present: frames must be presented in order");
+    }
+    last_enqueue_frame_index_ = index;
+
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Window::present: device has been disposed");
+    vk::Device dev = device->logical_device();
+
+    const std::uint32_t sync_index = static_cast<std::uint32_t>(index % frames_on_the_fly_);
+    const std::uint32_t image_index = frame_to_image_index_[sync_index];
+    auto& sync = sync_groups_[sync_index];
+    const auto& slot = slots_[image_index];
+
+    vk::CommandBuffer cmd;
+    if (buffer_target) {
+        cmd = slot.cmd_from_buffer_target;
+    } else if (tensor_target) {
+        cmd = slot.cmd_from_tensor_target;
+    } else if (image_target) {
+        cmd = slot.cmd_from_image_target;
+    } else {
+        cmd = slot.cmd_from_render_target;
+    }
+
+    // Wait, GPU-side, for any Vulkan work submitted since begin_frame()
+    // (the caller's own rendering into whichever target they picked) --
+    // see Device::vk_interop_semaphore's docstring: this is a real
+    // cross-submission wait, not just "the host thinks it's done".
+    const bool has_interop_wait = device->vk_interop_semaphore() != nullptr;
+    const std::uint64_t interop_wait_value = device->vk_interop_semaphore_value();
+
+    std::array<vk::Semaphore, 2> wait_semaphores{ sync.image_available_semaphore, nullptr };
+    std::array<std::uint64_t, 2> wait_values{ 0, 0 };
+    std::array<vk::PipelineStageFlags, 2> wait_stages{ vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eAllCommands };
+    std::uint32_t wait_count = 1;
+    if (has_interop_wait) {
+        wait_semaphores[1] = device->vk_interop_semaphore();
+        wait_values[1] = interop_wait_value;
+        wait_count = 2;
+    }
+
+    vk::TimelineSemaphoreSubmitInfo timeline_info{};
+    timeline_info.waitSemaphoreValueCount = wait_count;
+    timeline_info.pWaitSemaphoreValues = wait_values.data();
+
+    // Signals content_ready_semaphore (not render_finished_semaphore
+    // directly): the ImGui overlay submission below runs after this one,
+    // drawing on top of whatever this command buffer just produced, and
+    // is what actually signals render_finished_semaphore/the fence --
+    // see this function's docstring.
+    vk::SubmitInfo submit_info{};
+    submit_info.waitSemaphoreCount = wait_count;
+    submit_info.pWaitSemaphores = wait_semaphores.data();
+    submit_info.pWaitDstStageMask = wait_stages.data();
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &sync.content_ready_semaphore;
+    submit_info.setPNext(&timeline_info);
+
+    present_queue_.submit(submit_info, nullptr);
+
+    // ImGui's draw data is inherently per-frame, so unlike `cmd` above
+    // (pre-recorded once at swapchain-creation time), this command buffer
+    // is recorded fresh every present() call.
+    ImGui::Render();
+    ImDrawData* draw_data = ImGui::GetDrawData();
+
+    vk::CommandBuffer imgui_cmd = imgui_command_buffers_[sync_index];
+    imgui_cmd.reset();
+    imgui_cmd.begin(vk::CommandBufferBeginInfo{});
+    vk::RenderPassBeginInfo rp_begin{};
+    rp_begin.renderPass = imgui_render_pass_;
+    rp_begin.framebuffer = imgui_framebuffers_[image_index];
+    rp_begin.renderArea = vk::Rect2D{ { 0, 0 }, extent_ };
+    imgui_cmd.beginRenderPass(rp_begin, vk::SubpassContents::eInline);
+    ImGui_ImplVulkan_RenderDrawData(draw_data, static_cast<VkCommandBuffer>(imgui_cmd));
+    imgui_cmd.endRenderPass();
+    imgui_cmd.end();
+
+    vk::PipelineStageFlags imgui_wait_stage = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    vk::SubmitInfo imgui_submit_info{};
+    imgui_submit_info.waitSemaphoreCount = 1;
+    imgui_submit_info.pWaitSemaphores = &sync.content_ready_semaphore;
+    imgui_submit_info.pWaitDstStageMask = &imgui_wait_stage;
+    imgui_submit_info.commandBufferCount = 1;
+    imgui_submit_info.pCommandBuffers = &imgui_cmd;
+    imgui_submit_info.signalSemaphoreCount = 1;
+    imgui_submit_info.pSignalSemaphores = &sync.render_finished_semaphore;
+
+    present_queue_.submit(imgui_submit_info, sync.fence);
+    sync.fence_submitted = true;
+
+    vk::PresentInfoKHR present_info{};
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = &sync.render_finished_semaphore;
+    present_info.swapchainCount = 1;
+    present_info.pSwapchains = &swapchain_;
+    present_info.pImageIndices = &image_index;
+
+    const VkResult present_result = vkQueuePresentKHR(static_cast<VkQueue>(present_queue_), reinterpret_cast<const VkPresentInfoKHR*>(&present_info));
+    if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR) {
+        create_swapchain();
+    } else if (present_result != VK_SUCCESS) {
+        throw std::runtime_error("Window::present: vkQueuePresentKHR failed");
+    }
+}
+
+Frame::Frame(std::shared_ptr<Window> window, std::shared_ptr<Image> render_target, std::shared_ptr<Image> image_target,
+    std::shared_ptr<Buffer> buffer_target, std::shared_ptr<Tensor> tensor_target, std::int64_t index) noexcept :
+window_(std::move(window)),
+render_target_(std::move(render_target)),
+image_target_(std::move(image_target)),
+buffer_target_(std::move(buffer_target)),
+tensor_target_(std::move(tensor_target)),
+index_(index)
+{
+}
+
+void Frame::present() {
+    if (presented())
+        return;
+    if (!is_target_acquired()) {
+        throw std::runtime_error("Frame::present: cannot present a frame that has not acquired any resource.");
+    }
+    window_->vk_present_frame(index_, render_target_, image_target_, buffer_target_, tensor_target_);
+    window_.reset();
+    render_target_.reset();
+    image_target_.reset();
+    buffer_target_.reset();
+    tensor_target_.reset();
+}
+
+Window::Window(std::shared_ptr<Device> device, std::uint32_t width, std::uint32_t height, const std::string& title,
+    Format format, std::uint32_t frames_on_the_fly)
+    : window_(std::make_shared<vk_Window>(std::move(device), width, height, title, format, frames_on_the_fly)) {
+}
+
+std::shared_ptr<Frame> Window::begin_frame() {
+    auto resources = window_->vk_begin_frame();
+    return std::make_shared<Frame>(shared_from_this(), resources.render_target, resources.image_target,
+        resources.buffer_target, resources.tensor_target, resources.index);
+}
+
+std::shared_ptr<Window> Device::create_window(std::uint32_t width, std::uint32_t height, const std::string& title,
+    Format format, std::uint32_t frames_on_the_fly) {
+    auto window = std::make_shared<Window>(shared_from_this(), width, height, title, format, frames_on_the_fly);
+    vk_register_window(window->vk_window());
+    return window;
 }
 
 vk_DescriptorSet::vk_DescriptorSet(std::weak_ptr<Device> device, std::shared_ptr<vk_Pipeline> pipeline, int set, vk::DescriptorSet descriptor_set) noexcept
     : device_(std::move(device)), pipeline_(std::move(pipeline)), set_(set), descriptor_set_(descriptor_set) {}
 
-void vk_DescriptorSet::vk_bind_buffer(int layout_id, const std::shared_ptr<Buffer>& buffer) {
-    const auto& binding = pipeline_->vk_binding(layout_id);
+void vk_DescriptorSet::vk_bind_buffer(LayoutHandle layout_id, const std::shared_ptr<Buffer>& buffer) {
+    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
     if (binding.type != DescriptorType::STORAGE_BUFFER && binding.type != DescriptorType::UNIFORM_BUFFER) {
         throw std::runtime_error("DescriptorSet::bind: this binding does not expect a buffer");
@@ -2147,8 +3800,8 @@ void vk_DescriptorSet::vk_bind_buffer(int layout_id, const std::shared_ptr<Buffe
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_image(int layout_id, const std::shared_ptr<Image>& image) {
-    const auto& binding = pipeline_->vk_binding(layout_id);
+void vk_DescriptorSet::vk_bind_image(LayoutHandle layout_id, const std::shared_ptr<Image>& image) {
+    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
     if (binding.type != DescriptorType::STORAGE_IMAGE && binding.type != DescriptorType::SAMPLED_IMAGE) {
         throw std::runtime_error("DescriptorSet::bind: this binding type requires a sampler, not yet supported");
@@ -2174,90 +3827,219 @@ void vk_DescriptorSet::vk_bind_image(int layout_id, const std::shared_ptr<Image>
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t size, MemoryLocation location) {
+std::shared_ptr<vk_ResourceData> Device::vk_allocate_buffer_data(std::uint64_t size, MemoryLocation location) {
     auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
     auto memory = manager->allocate(size, 256);
     auto data = std::make_shared<vk_ResourceData>(shared_from_this(), memory, vk::Image{}, vk::ImageCreateInfo{});
     resources_.push_back(data); // save a weak reference to force destroy of hanging resources.
+    return data;
+}
+
+std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, ScalarType type, MemoryLocation location) {
+    auto layout = compute_layout(TypeDescriptor::scalar(type), LayoutRule::Scalar);
+    const std::uint64_t bytes = elements * layout->aligned_size;
+    auto data = vk_allocate_buffer_data(bytes, location);
     ResourceSlice full_slice {};
     // Relative to this resource's own memory slice (see Buffer::device_ptr/external_ptr
     // and Buffer::offset()), not the absolute offset within the underlying page.
     full_slice.type = ResourceType::BUFFER;
     full_slice.buffer.offset = 0;
-    full_slice.buffer.size = size;
-    full_slice.buffer.format = Format::Undefined;
-    full_slice.buffer.scalar = ScalarType::UINT8;
-    auto result = std::make_shared<Buffer>(data, full_slice);
-    return result;
+    full_slice.buffer.size = bytes;
+    return std::make_shared<Buffer>(data, full_slice, std::move(layout));
 }
 
-std::shared_ptr<Buffer> Device::create_array(std::uint64_t elements, ScalarType type, MemoryLocation location) {
-    const int itemsize = scalar_type_size(type);
-    const std::uint64_t bytes = elements * itemsize;
-    return create_buffer(bytes, location)->cast_scalar(type);
+std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, Format format, MemoryLocation location) {
+    const ScalarType component_type = format_scalar_type(format);
+    const int components = static_cast<int>(formatSize(format)) / scalar_type_size(component_type);
+    auto element_type = std::make_shared<TypeDescriptor>(TypeDescriptor::scalar(component_type));
+    auto layout = compute_layout(TypeDescriptor::array_of(std::move(element_type), components), LayoutRule::Scalar);
+    const std::uint64_t bytes = elements * layout->aligned_size;
+    auto data = vk_allocate_buffer_data(bytes, location);
+    ResourceSlice full_slice {};
+    full_slice.type = ResourceType::BUFFER;
+    full_slice.buffer.offset = 0;
+    full_slice.buffer.size = bytes;
+    return std::make_shared<Buffer>(data, full_slice, std::move(layout), format);
 }
 
-std::shared_ptr<Buffer> Device::create_texels(std::uint64_t elements, Format format, MemoryLocation location) {
-    const std::uint64_t bytes = elements * formatSize(format);
-    return create_buffer(bytes, location)->cast_format(format)->cast_scalar(format_scalar_type(format));
-}
-
-std::shared_ptr<Buffer> Device::create_structured_buffer(const Layout& layout, MemoryLocation location, int count) {
-    if (count <= 0)
-        throw std::runtime_error("create_structured_buffer: count must be positive");
-    // Always uses aligned_size (not the possibly-tighter size), even for count == 1,
-    // so that buffer_size / layout.aligned_size reliably recovers `count` later
+std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, const std::shared_ptr<Layout>& layout, MemoryLocation location) {
+    if (elements == 0)
+        throw std::runtime_error("create_buffer: elements must be positive");
+    // Always uses aligned_size (not the possibly-tighter size), even for elements == 1,
+    // so that buffer_size / layout.aligned_size reliably recovers `elements` later
     // (e.g. in Buffer::field(field)).
-    const std::uint64_t size = layout.aligned_size * static_cast<std::uint64_t>(count);
+    const std::uint64_t size = layout->aligned_size * elements;
     if (size == 0)
-        throw std::runtime_error("create_structured_buffer: computed size is 0");
-    return create_buffer(size, location);
+        throw std::runtime_error("create_buffer: computed size is 0");
+    auto data = vk_allocate_buffer_data(size, location);
+    ResourceSlice full_slice {};
+    full_slice.type = ResourceType::BUFFER;
+    full_slice.buffer.offset = 0;
+    full_slice.buffer.size = size;
+    return std::make_shared<Buffer>(data, full_slice, layout);
+}
+
+void Device::vk_transition_image_layout(vk::Image image, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
+    std::uint32_t mip_levels, std::uint32_t array_layers) {
+    std::shared_ptr<Engine> engine;
+    for (EngineType type : { EngineType::COMPUTE, EngineType::GRAPHICS, EngineType::TRANSFER }) {
+        try {
+            engine = create_engine(type, 0);
+            break;
+        } catch (const std::runtime_error&) {
+            continue;
+        }
+    }
+    if (!engine) {
+        throw std::runtime_error("Device::create_image: no queue available to perform the initial image layout transition");
+    }
+
+    auto cmd = engine->create_command_buffer(); // already begin()-ed
+    auto vk_cmd = cmd->vk_command_buffer();
+
+    vk::ImageMemoryBarrier barrier{};
+    barrier.oldLayout = old_layout;
+    barrier.newLayout = new_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = mip_levels;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = array_layers;
+    barrier.srcAccessMask = vk::AccessFlags{};
+    barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+        | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite
+        | vk::AccessFlagBits::eColorAttachmentWrite;
+
+    vk_cmd->command_buffer.pipelineBarrier(
+        vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eAllCommands,
+        vk::DependencyFlags{}, {}, {}, barrier);
+
+    cmd->close();
+    engine->submit({ cmd })->wait();
 }
 
 std::shared_ptr<Image> Device::create_image(int width, int height, int depth, int mip_levels,
     int array_layers, Format format, MemoryLocation location) {
-    return nullptr;
+    if (width <= 0 || height <= 0 || depth <= 0 || mip_levels <= 0 || array_layers <= 0) {
+        throw std::runtime_error("Device::create_image: width, height, depth, mip_levels and array_layers must all be positive");
+    }
+    if (depth > 1 && array_layers > 1) {
+        throw std::runtime_error("Device::create_image: a 3D image (depth > 1) cannot have more than one array layer");
+    }
+
+    const vk::ImageType image_type = depth > 1 ? vk::ImageType::e3D
+        : (height > 1 ? vk::ImageType::e2D : vk::ImageType::e1D);
+
+    vk::ImageCreateInfo image_info{};
+    image_info.imageType = image_type;
+    image_info.format = static_cast<vk::Format>(format);
+    image_info.extent = vk::Extent3D{
+        static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), static_cast<std::uint32_t>(depth) };
+    image_info.mipLevels = static_cast<std::uint32_t>(mip_levels);
+    image_info.arrayLayers = static_cast<std::uint32_t>(array_layers);
+    image_info.samples = vk::SampleCountFlagBits::e1;
+    image_info.tiling = vk::ImageTiling::eOptimal;
+    image_info.usage = full_image_usage_flags();
+    image_info.sharingMode = vk::SharingMode::eExclusive;
+    image_info.initialLayout = vk::ImageLayout::eUndefined;
+
+    vk::Device dev = logical_device();
+    vk::Image image = dev.createImage(image_info);
+
+    const vk::MemoryRequirements requirements = dev.getImageMemoryRequirements(image);
+    auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
+    vk::MemoryAllocateInfo alloc_info(requirements.size, manager->vk_memory_type_index());
+    vk::DeviceMemory memory;
+    try {
+        memory = dev.allocateMemory(alloc_info);
+        dev.bindImageMemory(image, memory, 0);
+    } catch (...) {
+        dev.destroyImage(image);
+        throw;
+    }
+
+    // Freshly created images start in eUndefined, which isn't valid for
+    // sampling/storage/blit access -- transition once here so every other
+    // use site can keep assuming eGeneral uniformly (see
+    // vk_transition_image_layout's comment).
+    try {
+        vk_transition_image_layout(image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+            static_cast<std::uint32_t>(mip_levels), static_cast<std::uint32_t>(array_layers));
+    } catch (...) {
+        dev.destroyImage(image);
+        dev.freeMemory(memory);
+        throw;
+    }
+
+    // Images don't sub-allocate from a shared MemoryPage the way buffers do
+    // (see vk_ResourceData's dedicated_image_memory_ comment), so this
+    // MemorySlice is just an inert placeholder to satisfy vk_ResourceData's
+    // constructor -- its null `page` makes every one of its accessors
+    // (page_buffer/device_ptr/external_ptr/host_visible/release) a no-op.
+    auto memory_slice = std::make_shared<MemorySlice>(shared_from_this(), nullptr, 0, 0, 0, 0);
+    auto data = std::make_shared<vk_ResourceData>(shared_from_this(), memory_slice, image, image_info, memory);
+    resources_.push_back(data); // save a weak reference to force destroy of hanging resources.
+
+    ResourceSlice slice{};
+    slice.type = ResourceType::IMAGE;
+    slice.image.format = format;
+    slice.image.mip_start = 0;
+    slice.image.mip_count = mip_levels;
+    slice.image.array_start = 0;
+    slice.image.array_count = array_layers;
+
+    return std::make_shared<Image>(data, slice);
 }
 
 std::shared_ptr<Buffer> Device::create_staging(const std::shared_ptr<Buffer>& buffer, MemoryLocation location) {
-    return create_buffer(buffer->size(), location);
+    return create_buffer(buffer->size(), ScalarType::UINT8, location);
 }
 
 std::shared_ptr<Buffer> Device::create_staging(const std::shared_ptr<Image>& image, MemoryLocation location) {
     throw std::runtime_error("create_staging: image staging is not yet supported (Image does not expose its byte size)");
 }
 
-pybind11::object Device::create_tensor_dlpack(const std::vector<std::uint64_t>& shape, ScalarType type, MemoryLocation location) {
-    int dimension = shape.size();
-    if (dimension <= 0) {
-        throw std::runtime_error("Dimension must be positive");
+Tensor::Tensor(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice,
+    std::vector<std::uint64_t> shape, ScalarType scalar_type)
+    : Resource(std::move(resource_data), view_slice), shape_(std::move(shape)), scalar_type_(scalar_type) {
+    assert(view_slice.type == ResourceType::BUFFER);
+}
+
+DLDevice Tensor::vk_dlpack_device() const noexcept {
+    return data_->get_memory()->dl_device();
+}
+
+std::uint64_t Tensor::vk_buffer_offset() const noexcept {
+    return data_->get_memory()->offset() + slice_.buffer.offset;
+}
+
+pybind11::object Tensor::vk_dlpack() const {
+    if (external_ptr() == 0) {
+        throw std::runtime_error("A DEVICE tensor was requested but the external pointer is unavailable");
     }
-    std::int64_t elements = 1;
-    for (int i = 0; i < dimension; ++i) {
-        elements *= shape[i];
-    }
-    int element_size = scalar_type_size(type);
-    auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
-    auto memory = manager->allocate(elements * element_size, 256);
-    auto ptr = memory->external_ptr();
-    if (ptr == 0) {
-        throw std::runtime_error("DEVICE tensor requested but external pointer is unavailable");
-    }
-    DLDevice device = memory->dl_device();
+    void* ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(external_ptr()));
+    DLDevice device = data_->get_memory()->dl_device();
+
+    const int dimension = static_cast<int>(shape_.size());
     auto* owner = new TensorOwner();
-    owner->memory = memory;
+    owner->memory = data_->get_memory();
     owner->shape = std::make_unique<std::int64_t[]>(dimension);
     owner->strides = std::make_unique<std::int64_t[]>(dimension);
-    for (int i=0; i<dimension; ++i) {
-        owner->shape[i] = shape[i];
-        elements /= shape[i];
-        owner->strides[i] = elements;
+    std::int64_t stride = 1;
+    for (int i = dimension - 1; i >= 0; --i) {
+        owner->shape[i] = static_cast<std::int64_t>(shape_[static_cast<std::size_t>(i)]);
+        owner->strides[i] = stride;
+        stride *= static_cast<std::int64_t>(shape_[static_cast<std::size_t>(i)]);
     }
+
     auto* managed = new DLManagedTensor{};
-    managed->dl_tensor.data = reinterpret_cast<void*>(static_cast<std::uintptr_t>(ptr));
+    managed->dl_tensor.data = ptr;
     managed->dl_tensor.device = device;
     managed->dl_tensor.ndim = dimension;
-    managed->dl_tensor.dtype = dlpack_dtype(type);
+    managed->dl_tensor.dtype = dlpack_dtype(scalar_type_);
     managed->dl_tensor.shape = owner->shape.get();
     managed->dl_tensor.strides = owner->strides.get();
     managed->dl_tensor.byte_offset = 0;
@@ -2265,6 +4047,211 @@ pybind11::object Device::create_tensor_dlpack(const std::vector<std::uint64_t>& 
     managed->deleter = dlmanaged_tensor_deleter;
 
     return export_dltensor_py(managed);
+}
+
+void Tensor::load(const pybind11::object& source) const {
+    copy_pyobject_into(*data_->device(), external_ptr(), data_->is_cpu() ? MemoryLocation::HOST : MemoryLocation::DEVICE, size(), source);
+}
+
+void Tensor::save(const pybind11::object& target) const {
+    copy_pyobject_from(*data_->device(), external_ptr(), data_->is_cpu() ? MemoryLocation::HOST : MemoryLocation::DEVICE, size(), target);
+}
+
+std::shared_ptr<Tensor> Device::create_tensor(const std::vector<std::uint64_t>& shape, ScalarType type, MemoryLocation location) {
+    if (shape.empty()) {
+        throw std::runtime_error("Device::create_tensor: shape must have at least one dimension");
+    }
+    std::uint64_t elements = 1;
+    for (auto d : shape) elements *= d;
+    const std::uint64_t size = elements * static_cast<std::uint64_t>(scalar_type_size(type));
+    if (size == 0) {
+        throw std::runtime_error("Device::create_tensor: computed size is 0");
+    }
+    auto data = vk_allocate_buffer_data(size, location);
+    ResourceSlice full_slice{};
+    full_slice.type = ResourceType::BUFFER;
+    full_slice.buffer.offset = 0;
+    full_slice.buffer.size = size;
+    return std::make_shared<Tensor>(data, full_slice, shape, type);
+}
+
+void Device::vk_copy_in(
+    std::uint64_t dst_external_ptr, MemoryLocation dst_location,
+    void* src_data, const std::int64_t* shape, const std::int64_t* strides, int ndim,
+    std::uint64_t itemsize, bool source_is_cuda) {
+    std::uint64_t total_bytes = itemsize;
+    for (int d = 0; d < ndim; ++d) total_bytes *= static_cast<std::uint64_t>(shape[d]);
+
+    if (dst_location == MemoryLocation::DEVICE || source_is_cuda) {
+        if (!device_memory_manager_->vk_copy_from_dlpack(src_data, shape, strides, ndim, itemsize, dst_external_ptr, total_bytes)) {
+            throw std::runtime_error("Device::wrap: no interop library available to copy CUDA-resident/DEVICE data");
+        }
+        return;
+    }
+    copy_strided_host(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst_external_ptr)), src_data, shape, strides, ndim, itemsize, /*contiguous_is_dst=*/true);
+}
+
+void Device::vk_copy_out(
+    std::uint64_t src_external_ptr, MemoryLocation src_location,
+    void* dst_data, const std::int64_t* shape, const std::int64_t* strides, int ndim,
+    std::uint64_t itemsize, bool dst_is_cuda) {
+    std::uint64_t total_bytes = itemsize;
+    for (int d = 0; d < ndim; ++d) total_bytes *= static_cast<std::uint64_t>(shape[d]);
+
+    if (src_location == MemoryLocation::DEVICE || dst_is_cuda) {
+        if (!device_memory_manager_->vk_copy_to_dlpack(src_external_ptr, total_bytes, dst_data, shape, strides, ndim, itemsize)) {
+            throw std::runtime_error("Device::wrap: no interop library available to copy back to CUDA-resident/DEVICE data");
+        }
+        return;
+    }
+    copy_strided_host(reinterpret_cast<void*>(static_cast<std::uintptr_t>(src_external_ptr)), dst_data, shape, strides, ndim, itemsize, /*contiguous_is_dst=*/false);
+}
+
+std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, WrapMode mode, MemoryLocation location) {
+    // Case 1: one of our own Buffers -- always a direct, contiguous mapping
+    // already in the right place; never needs a copy.
+    if (py::isinstance<Buffer>(obj)) {
+        auto buffer = obj.cast<std::shared_ptr<Buffer>>();
+        const Layout& layout = *buffer->element_layout();
+        const ScalarType scalar = layout.kind == TypeKind::STRUCT ? ScalarType::UINT8 : resolve_component_type(layout);
+        const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar));
+        std::vector<std::uint64_t> shape{ buffer->size() / itemsize };
+        return std::make_shared<WrappedMemory>(
+            weak_from_this(), buffer->device_ptr(), std::move(shape), scalar,
+            nullptr, location, mode, WrappedMemory::SourceKind::NONE, pybind11::object());
+    }
+
+    // Case 1b: one of our own Tensors -- same as a Buffer, always a direct
+    // mapping, never needs a copy (checked before the generic DLPack case
+    // below, since Tensor also implements __dlpack__).
+    if (py::isinstance<Tensor>(obj)) {
+        auto tensor = obj.cast<std::shared_ptr<Tensor>>();
+        return std::make_shared<WrappedMemory>(
+            weak_from_this(), tensor->device_ptr(), tensor->shape(), tensor->scalar_type(),
+            nullptr, location, mode, WrappedMemory::SourceKind::NONE, pybind11::object());
+    }
+
+    // Case 2: a DLPack-compatible object (e.g. a torch tensor).
+    if (pybind11::hasattr(obj, "__dlpack__")) {
+        pybind11::object capsule = obj.attr("__dlpack__")();
+        auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
+        if (!managed) {
+            throw std::runtime_error("Device::wrap: invalid DLPack capsule (expected a \"dltensor\" capsule)");
+        }
+        const DLTensor& t = managed->dl_tensor;
+        char* data_ptr = reinterpret_cast<char*>(t.data) + t.byte_offset;
+        const bool is_cuda_device = (t.device.device_type == 2);
+        const bool contiguous = dltensor_is_contiguous(t.shape, t.strides, t.ndim);
+
+        std::vector<std::uint64_t> shape(static_cast<std::size_t>(t.ndim));
+        for (int i = 0; i < t.ndim; ++i) shape[static_cast<std::size_t>(i)] = static_cast<std::uint64_t>(t.shape[i]);
+        const ScalarType scalar = scalar_type_from_dlpack_dtype(t.dtype);
+        const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar));
+        std::uint64_t elements = 1;
+        for (auto d : shape) elements *= d;
+
+        if (is_cuda_device && contiguous) {
+            const auto external_ptr = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data_ptr));
+            // Already one of our own allocations (e.g. it came from
+            // torch.from_dlpack() on one of our own Buffers)? Reuse its
+            // corresponding Vulkan device address directly -- no copy
+            // needed either way.
+            std::uint64_t own_device_ptr = host_memory_manager_->external_to_device(external_ptr);
+            if (own_device_ptr == 0) {
+                own_device_ptr = device_memory_manager_->external_to_device(external_ptr);
+            }
+            if (own_device_ptr != 0) {
+                return std::make_shared<WrappedMemory>(
+                    weak_from_this(), own_device_ptr, std::move(shape), scalar,
+                    nullptr, location, mode, WrappedMemory::SourceKind::NONE, pybind11::object());
+            }
+        }
+
+        auto temp = create_buffer(elements, scalar, location);
+        if (mode == WrapMode::CopyIn || mode == WrapMode::CopyInOut) {
+            vk_copy_in(temp->external_ptr(), location, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
+        }
+        return std::make_shared<WrappedMemory>(
+            weak_from_this(), temp->device_ptr(), std::move(shape), scalar,
+            temp, location, mode, WrappedMemory::SourceKind::DLPACK, std::move(obj));
+    }
+
+    // Case 3: a plain Python buffer-protocol object (e.g. a numpy array).
+    if (PyObject_CheckBuffer(obj.ptr())) {
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(obj);
+        pybind11::buffer_info info = buf.request();
+        const ScalarType scalar = scalar_type_from_buffer_format(info.format, static_cast<std::uint64_t>(info.itemsize));
+        const std::uint64_t elements = static_cast<std::uint64_t>(info.size);
+
+        auto temp = create_buffer(elements, scalar, location);
+        if (mode == WrapMode::CopyIn || mode == WrapMode::CopyInOut) {
+            const std::int64_t total = static_cast<std::int64_t>(elements);
+            const std::int64_t stride1 = 1;
+            vk_copy_in(temp->external_ptr(), location, info.ptr, &total, &stride1, 1, static_cast<std::uint64_t>(info.itemsize), /*source_is_cuda=*/false);
+        }
+        std::vector<std::uint64_t> shape{ elements };
+        return std::make_shared<WrappedMemory>(
+            weak_from_this(), temp->device_ptr(), std::move(shape), scalar,
+            temp, location, mode, WrappedMemory::SourceKind::BUFFER_PROTOCOL, std::move(obj));
+    }
+
+    throw std::runtime_error("Device::wrap: value must be a Buffer, a DLPack-compatible object, or a Python buffer object");
+}
+
+WrappedMemory::WrappedMemory(
+    std::weak_ptr<Device> device,
+    std::uint64_t device_ptr,
+    std::vector<std::uint64_t> shape,
+    ScalarType scalar_type,
+    std::shared_ptr<Buffer> owned_buffer,
+    MemoryLocation owned_location,
+    WrapMode mode,
+    SourceKind source_kind,
+    pybind11::object source) noexcept
+    : device_(std::move(device)), device_ptr_(device_ptr), shape_(std::move(shape)), scalar_type_(scalar_type),
+      owned_buffer_(std::move(owned_buffer)), owned_location_(owned_location), mode_(mode), source_kind_(source_kind),
+      source_(source.is_none() ? nullptr : std::make_unique<pybind11::object>(std::move(source))) {
+}
+
+void WrappedMemory::unwrap() {
+    if (unwrapped_) return;
+    unwrapped_ = true;
+
+    // Move out before any early return so a second call (or the destructor,
+    // which also calls unwrap()) never re-runs this, regardless of outcome.
+    auto owned_buffer = std::move(owned_buffer_);
+    auto source = std::move(source_);
+
+    if (mode_ != WrapMode::CopyOut && mode_ != WrapMode::CopyInOut) return;
+    if (source_kind_ == SourceKind::NONE || !owned_buffer || !source) return;
+    auto device = device_.lock();
+    if (!device || device->is_disposed()) return;
+
+    const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar_type_));
+    if (source_kind_ == SourceKind::DLPACK) {
+        pybind11::object capsule = source->attr("__dlpack__")();
+        auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
+        if (managed) {
+            const DLTensor& t = managed->dl_tensor;
+            char* data_ptr = reinterpret_cast<char*>(t.data) + t.byte_offset;
+            const bool is_cuda_device = (t.device.device_type == 2);
+            device->vk_copy_out(owned_buffer->external_ptr(), owned_location_, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
+        }
+    } else if (source_kind_ == SourceKind::BUFFER_PROTOCOL) {
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(*source);
+        pybind11::buffer_info info = buf.request();
+        const std::int64_t total = static_cast<std::int64_t>(info.size);
+        const std::int64_t stride1 = 1;
+        device->vk_copy_out(owned_buffer->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*dst_is_cuda=*/false);
+    }
+}
+
+WrappedMemory::~WrappedMemory() noexcept {
+    try {
+        unwrap();
+    } catch (...) {
+        // Destructors must not throw; best-effort copy-back.
+    }
 }
 
 void Device::dispose() noexcept {
@@ -2280,7 +4267,7 @@ void Device::dispose() noexcept {
     for (auto& engine_family : engines_) {
         for (auto& engine : engine_family) {
             if (engine) {
-                engine->dispose();
+                engine->vk_dispose_with(device_);
             }
         }
         engine_family.clear();
@@ -2296,6 +4283,35 @@ void Device::dispose() noexcept {
     }
     command_pools_.clear();
 
+    // Destroy any still-alive framebuffers first: each references a render
+    // pass and image views, so they must go before the images/pipelines
+    // those views/render passes point into -- and well before the device
+    // and instance themselves, since leaving one around across
+    // vkDestroyDevice/vkDestroyInstance has been observed to crash on at
+    // least one driver.
+    for (const auto& fb : framebuffers_) {
+        auto framebuffer = fb.lock();
+        if (framebuffer)
+            framebuffer->dispose();
+    }
+    framebuffers_.clear();
+
+    // Destroy any still-alive windows next: each owns a swapchain/surface,
+    // semaphores/fences and per-slot render/image/buffer/tensor targets.
+    // vk_Window only holds a weak_ptr<Device> (to avoid a reference cycle
+    // back to Device), so without this, whether its Vulkan objects get
+    // destroyed before or after vkDestroyDevice would depend entirely on
+    // the unspecified order in which Python drops its last references to
+    // the Device and the Window (e.g. plain module-level globals, never
+    // explicitly disposed) -- tripping vkDestroyDevice's child-object
+    // validation checks whenever the Window loses that race.
+    for (const auto& w : windows_) {
+        auto window = w.lock();
+        if (window)
+            window->vk_dispose_with(device_, instance_);
+    }
+    windows_.clear();
+
     // Destroy now any pending resource
     for (const auto& r: resources_) {
         auto res = r.lock();
@@ -2304,9 +4320,22 @@ void Device::dispose() noexcept {
     }
     resources_.clear();
 
+    // Destroy every memory page's underlying vk::Buffer/vk::DeviceMemory
+    // using device_ directly (see vk_dispose_with's docstring) before
+    // resetting the managers -- otherwise ~MemoryPage would try
+    // device_.lock() on its own weak_ptr<Device>, which is unconditionally
+    // expired by the time Device::dispose() runs via ~Device(), leaking
+    // every page's backing buffer/memory.
+    if (device_memory_manager_) device_memory_manager_->vk_dispose_with(device_);
+    if (host_memory_manager_) host_memory_manager_->vk_dispose_with(device_);
     device_memory_manager_.reset();
     host_memory_manager_.reset();
     device_index_ = 0;
+
+    if (interop_semaphore_ && device_) {
+        device_.destroySemaphore(interop_semaphore_);
+        interop_semaphore_ = nullptr;
+    }
 
     if (device_) {
         device_.destroy();
@@ -2403,7 +4432,7 @@ MemoryManager::MemoryManager(std::weak_ptr<Device> device, uint32_t memory_type_
       host_visible_(host_visible) {
     auto dev = device_.lock();
     const auto vendor_id = dev->physical_device().getProperties().vendorID;
-    std::cout << "[INFO] Loading interop library for vendor ID" << vendor_id << std::endl;
+    //std::cout << "[INFO] Loading interop library for vendor ID" << vendor_id << std::endl;
     // printf("[INFO] Loading interop library for vendor ID: 0x%04X\n", vendor_id);
     interop_library_ = std::make_shared<ExternalInteropLibraryImpl>(interop_library_base_name(vendor_id));
     if (!interop_library_) {
@@ -2420,6 +4449,13 @@ MemoryManager::MemoryManager(std::weak_ptr<Device> device, uint32_t memory_type_
 }
 
 MemoryManager::~MemoryManager() noexcept = default;
+
+void MemoryManager::vk_dispose_with(vk::Device dev) noexcept {
+    for (auto& page : pages_) {
+        if (page) page->vk_dispose_with(dev);
+    }
+    pages_.clear();
+}
 
 std::shared_ptr<MemorySlice> MemoryManager::allocate(std::uint64_t size, int alignment) {
     auto d = device_.lock();
@@ -2463,6 +4499,49 @@ std::uint64_t MemoryManager::device_to_external(std::uint64_t device_ptr) const 
         }
     }
     return 0;
+}
+
+std::uint64_t MemoryManager::vk_interop_semaphore_handle() const {
+    if (interop_semaphore_import_attempted_) return interop_semaphore_handle_;
+    interop_semaphore_import_attempted_ = true;
+    if (!interop_library_) return 0;
+    auto import_fn = interop_library_->try_import_semaphore_fn();
+    if (!import_fn) return 0;
+    auto device = device_.lock();
+    if (!device) return 0;
+    vk::Semaphore semaphore = device->vk_interop_semaphore();
+    if (!semaphore) return 0;
+    interop_semaphore_handle_ = import_fn(device->vk_device(), static_cast<int>(device->device_index()), semaphore);
+    return interop_semaphore_handle_;
+}
+
+bool MemoryManager::vk_copy_from_dlpack(
+    void* tensor_data, const std::int64_t* shape, const std::int64_t* strides, int ndim,
+    std::uint64_t itemsize, std::uint64_t dst_ptr, std::uint64_t total_bytes) const {
+    if (!interop_library_) return false;
+    auto fn = interop_library_->copy_from_dlpack_fn();
+    if (!fn) return false;
+    const std::uint64_t wait_semaphore = vk_interop_semaphore_handle();
+    std::uint64_t wait_value = 0;
+    if (wait_semaphore) {
+        if (auto device = device_.lock()) wait_value = device->vk_interop_semaphore_value();
+    }
+    return fn(tensor_data, shape, strides, ndim, itemsize, dst_ptr, total_bytes, wait_semaphore, wait_value) == 0;
+}
+
+bool MemoryManager::vk_copy_to_dlpack(
+    std::uint64_t src_ptr, std::uint64_t total_bytes,
+    void* tensor_data, const std::int64_t* shape, const std::int64_t* strides, int ndim,
+    std::uint64_t itemsize) const {
+    if (!interop_library_) return false;
+    auto fn = interop_library_->copy_to_dlpack_fn();
+    if (!fn) return false;
+    const std::uint64_t wait_semaphore = vk_interop_semaphore_handle();
+    std::uint64_t wait_value = 0;
+    if (wait_semaphore) {
+        if (auto device = device_.lock()) wait_value = device->vk_interop_semaphore_value();
+    }
+    return fn(src_ptr, total_bytes, tensor_data, shape, strides, ndim, itemsize, wait_semaphore, wait_value) == 0;
 }
 
 MemoryPage::MemoryPage(std::weak_ptr<Device> device, uint32_t memory_type_index, bool host_visible, std::uint64_t capacity, ExternalImportFn try_import_memory)
@@ -2540,8 +4619,13 @@ MemoryPage::MemoryPage(std::weak_ptr<Device> device, uint32_t memory_type_index,
 }
 
 MemoryPage::~MemoryPage() noexcept {
-    if (auto device_ptr = device_.lock(); device_ptr && !device_ptr->is_disposed()) {
-        auto dev = device_ptr->vk_device();
+    auto device_ptr = device_.lock();
+    vk::Device dev = (device_ptr && !device_ptr->is_disposed()) ? device_ptr->vk_device() : vk::Device{};
+    vk_dispose_with(dev);
+}
+
+void MemoryPage::vk_dispose_with(vk::Device dev) noexcept {
+    if (dev) {
         if (host_visible_ && memory_) {
             dev.unmapMemory(memory_);
         }

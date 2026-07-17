@@ -51,9 +51,10 @@ jobs:
 
           CIBW_ARCHS_WINDOWS: AMD64
 
-          # Linux Vulkan
+          # Linux Vulkan + GLFW/X11 dev headers
           CIBW_BEFORE_ALL_LINUX: >
-            yum install -y vulkan-loader-devel vulkan-headers || true
+            yum install -y vulkan-loader-devel vulkan-headers
+            libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel libXext-devel || true
 
         run: python -m cibuildwheel --output-dir wheelhouse
 

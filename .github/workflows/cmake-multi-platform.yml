@@ -23,24 +23,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Installed directly from LunarG (not the TWoolhouse/setup-vulkan-sdk
+      # action): that action's "latest"/version handling isn't reliable here
+      # -- pinning its `version:` input still produced a much newer SDK
+      # whose Vulkan-Hpp moved DispatchLoaderDynamic into vk::detail, which
+      # this codebase isn't compatible with. This installs the exact same
+      # 1.3.275.0 SDK used for local development/testing, deterministically.
       - name: Set up Vulkan SDK on Windows
-        if: runner.os == 'Windows'
-        id: vulkan
-        uses: TWoolhouse/setup-vulkan-sdk@v1.1.0
-        with:
-          # Pinned (not "latest"): newer Vulkan-Hpp releases moved
-          # DispatchLoaderDynamic and friends into a vk::detail namespace,
-          # which this codebase (written against vk::DispatchLoaderDynamic)
-          # isn't compatible with. 1.3.275.0 matches local development/testing.
-          version: 1.3.275.0
-
-      - name: Export Vulkan SDK paths on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          "VULKAN_SDK=${{ steps.vulkan.outputs.path }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "Vulkan_ROOT=${{ steps.vulkan.outputs.path }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CMAKE_PREFIX_PATH=${{ steps.vulkan.outputs.path }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $ver = "1.3.275.0"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile VulkanSDK-Installer.exe
+          Start-Process -FilePath .\VulkanSDK-Installer.exe -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait -NoNewWindow
+          $sdkPath = "C:\VulkanSDK\$ver"
+          "VULKAN_SDK=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "Vulkan_ROOT=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CMAKE_PREFIX_PATH=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install cibuildwheel
         run: python -m pip install --upgrade pip cibuildwheel

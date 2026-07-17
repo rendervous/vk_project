@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# vk is a shared module (pybind11 extension): every static library linked
+# into it (glfw3, tinyobjloader, ...) must itself be built with -fPIC on
+# Linux, or the final link fails with "recompile with -fPIC" relocation
+# errors. Set before any add_subdirectory/FetchContent so it applies to
+# fetched dependencies too.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # -----------------------------------------------------------------------------
 # Python
 # -----------------------------------------------------------------------------

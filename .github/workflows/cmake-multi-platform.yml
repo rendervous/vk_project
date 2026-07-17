@@ -28,7 +28,11 @@ jobs:
         id: vulkan
         uses: TWoolhouse/setup-vulkan-sdk@v1.1.0
         with:
-          version: latest
+          # Pinned (not "latest"): newer Vulkan-Hpp releases moved
+          # DispatchLoaderDynamic and friends into a vk::detail namespace,
+          # which this codebase (written against vk::DispatchLoaderDynamic)
+          # isn't compatible with. 1.3.275.0 matches local development/testing.
+          version: 1.3.275.0
 
       - name: Export Vulkan SDK paths on Windows
         if: runner.os == 'Windows'

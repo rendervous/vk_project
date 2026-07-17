@@ -25,29 +25,46 @@ class MemoryLocation(enum.Enum):
     """
 
 
-class WrapMode(enum.Enum):
-    """When :meth:`Device.wrap` must copy data because the wrapped
-    object isn't already directly usable in place, this controls at
-    which point(s) of the :class:`WrappedMemory`'s lifetime the copy
-    happens.
+class VertexAttribute(enum.Enum):
+    """A single interleaved-vertex-buffer attribute kind, as produced by
+    :meth:`Device.load_scene` and stored on :class:`Mesh`.
     """
 
-    IN = 0
-    """Copy the source data in when the wrap is created."""
-    OUT = 1
-    """Copy back to the source object when the :class:`WrappedMemory`
-    is destroyed."""
-    INOUT = 2
-    """Copy in when created and copy back when destroyed."""
+    POSITION = 0
+    NORMAL = 1
+    TEXCOORD = 2
+    TANGENT = 3
+    BITANGENT = 4
 
 
-class ScalarType(enum.Enum):
-    """Scalar element types supported by buffers and tensors allocated
-    through :class:`Device`.
+class VertexResolutionMode(enum.Enum):
+    """How :meth:`Device.load_scene` decides whether two face-corners
+    referring to the same source data resolve to the same output vertex.
+    """
+
+    BY_POSITION = 0
+    """Weld by position only: face-corners sharing a position keep
+    whichever corner's normal/texcoord was seen first; any differing
+    normal/texcoord on later corners is discarded."""
+    BY_ALL_ATTRIBUTES = 1
+    """Weld by the full (position, normal, texcoord) tuple: two
+    face-corners share a vertex only if every attribute matches. Default."""
+    DUPLICATE = 2
+    """No welding: every face-corner gets its own vertex."""
+
+
+class Type(enum.Enum):
+    """Scalar, vector or matrix element type supported by buffers/tensors
+    allocated through :class:`Device`, and by a type description passed to
+    :func:`compute_layout` (see also :class:`TypeDescriptor`).
+
+    Vector/matrix members match GLSL's own shapes (``matCxR``: `C` columns,
+    `R` rows). ``INT8``/``UINT8`` aren't valid GLSL shader types but are
+    kept for byte-level buffer/``Format``-channel use.
     """
 
     UNDEFINED = 0
-    """No scalar type specified."""
+    """No type specified."""
     BOOL = 1
     """Boolean value."""
     FLOAT16 = 2
@@ -72,6 +89,48 @@ class ScalarType(enum.Enum):
     """Unsigned 32-bit integer."""
     UINT64 = 12
     """Unsigned 64-bit integer."""
+    VEC2 = 13
+    """2-component FLOAT32 vector."""
+    VEC3 = 14
+    """3-component FLOAT32 vector."""
+    VEC4 = 15
+    """4-component FLOAT32 vector."""
+    IVEC2 = 16
+    """2-component INT32 vector."""
+    IVEC3 = 17
+    """3-component INT32 vector."""
+    IVEC4 = 18
+    """4-component INT32 vector."""
+    UVEC2 = 19
+    """2-component UINT32 vector."""
+    UVEC3 = 20
+    """3-component UINT32 vector."""
+    UVEC4 = 21
+    """4-component UINT32 vector."""
+    BVEC2 = 22
+    """2-component BOOL vector."""
+    BVEC3 = 23
+    """3-component BOOL vector."""
+    BVEC4 = 24
+    """4-component BOOL vector."""
+    MAT2 = 25
+    """2x2 FLOAT32 matrix."""
+    MAT2x3 = 26
+    """2-column, 3-row FLOAT32 matrix."""
+    MAT2x4 = 27
+    """2-column, 4-row FLOAT32 matrix."""
+    MAT3x2 = 28
+    """3-column, 2-row FLOAT32 matrix."""
+    MAT3 = 29
+    """3x3 FLOAT32 matrix."""
+    MAT3x4 = 30
+    """3-column, 4-row FLOAT32 matrix."""
+    MAT4x2 = 31
+    """4-column, 2-row FLOAT32 matrix."""
+    MAT4x3 = 32
+    """4-column, 3-row FLOAT32 matrix."""
+    MAT4 = 33
+    """4x4 FLOAT32 matrix."""
 
 
 class Format(enum.Enum):
@@ -227,8 +286,21 @@ class Format(enum.Enum):
     RGBA64_Float = 60
     """Four-channel 64-bit floating point value."""
 
+    Depth16_UNorm = 124
+    """16-bit unsigned normalized depth. Only valid with
+    :meth:`Device.create_depth_buffer_image`."""
+    Depth32_Float = 126
+    """32-bit floating point depth. Only valid with
+    :meth:`Device.create_depth_buffer_image`."""
+    Depth24_UNorm_Stencil8_UInt = 129
+    """24-bit unsigned normalized depth plus 8-bit stencil. Only valid
+    with :meth:`Device.create_depth_buffer_image`."""
+    Depth32_Float_Stencil8_UInt = 130
+    """32-bit floating point depth plus 8-bit stencil. Only valid with
+    :meth:`Device.create_depth_buffer_image`."""
 
-class EngineType(enum.Enum):
+
+class EngineType(enum.IntFlag):
     """Capability requested when creating an :class:`Engine` via
     ``Device.create_engine``.
     """
@@ -285,13 +357,13 @@ class DescriptorType(enum.Enum):
     STORAGE_IMAGE = 2
     """A read/write image, without a sampler."""
     SAMPLED_IMAGE = 3
-    """A read-only, filterable image, without a sampler."""
+    """A read-only image with no sampler of its own -- pair it with a
+    separate :attr:`SAMPLER` binding (GLSL ``texture2D``)."""
     SAMPLER = 4
-    """A standalone sampler. Not yet bindable via :meth:`DescriptorSet.bind`."""
+    """A standalone sampler (:class:`Sampler`), paired with a separate
+    :attr:`SAMPLED_IMAGE` binding."""
     COMBINED_IMAGE_SAMPLER = 5
-    """An image and sampler bound together. Not yet bindable via
-    :meth:`DescriptorSet.bind`.
-    """
+    """An image and sampler bound together in one binding (GLSL ``sampler2D``)."""
     ACCELERATION_STRUCTURE = 6
     """A ray tracing acceleration structure. Not yet bindable via
     :meth:`DescriptorSet.bind`.
@@ -299,14 +371,84 @@ class DescriptorType(enum.Enum):
 
 
 class Filter(enum.Enum):
-    """Texel filtering used by :meth:`CommandBuffer.blit_image` when the
-    source and destination extents differ.
+    """Texel filtering: used by :meth:`CommandBuffer.blit_image` when the
+    source and destination extents differ, and by
+    :meth:`Device.create_sampler` (``mag_filter``/``min_filter``).
     """
 
     NEAREST = 0
     """Nearest-texel sampling."""
     LINEAR = 1
     """Linearly interpolated sampling."""
+
+
+class MipmapMode(enum.Enum):
+    """How a :class:`Sampler` filters between mip levels, set via
+    :meth:`Device.create_sampler`'s ``mipmap_mode``.
+    """
+
+    NEAREST = 0
+    """Snaps to the nearest mip level."""
+    LINEAR = 1
+    """Linearly interpolates between the two nearest mip levels."""
+
+
+class WrapMode(enum.Enum):
+    """How a :class:`Sampler` handles texture coordinates outside
+    ``[0, 1]``, set (once per axis) via :meth:`Device.create_sampler`'s
+    ``wrap_u``/``wrap_v``/``wrap_w``.
+    """
+
+    REPEAT = 0
+    """Tiles the texture (wraps around)."""
+    MIRRORED_REPEAT = 1
+    """Tiles the texture, mirroring every other tile."""
+    CLAMP_TO_EDGE = 2
+    """Clamps to the texture's edge texels."""
+    CLAMP_TO_BORDER = 3
+    """Clamps to a fixed border color (always opaque black -- there is no
+    separate border-color parameter)."""
+
+
+class CullMode(enum.Enum):
+    """Dynamic rasterization cull mode, set via
+    :meth:`CommandBuffer.set_cull_mode`. Requires Vulkan 1.3 (core
+    "extended dynamic state").
+    """
+
+    NONE = 0
+    """No faces are culled."""
+    FRONT = 1
+    """Front-facing (per :class:`FrontFace`) triangles are culled."""
+    BACK = 2
+    """Back-facing triangles are culled."""
+    FRONT_AND_BACK = 3
+    """Every triangle is culled."""
+
+
+class FrontFace(enum.Enum):
+    """Winding order that identifies a triangle's front face, set via
+    :meth:`CommandBuffer.set_front_face`. Requires Vulkan 1.3.
+    """
+
+    COUNTER_CLOCKWISE = 0
+    CLOCKWISE = 1
+
+
+class CompareOp(enum.Enum):
+    """Depth comparison operator, set via
+    :meth:`CommandBuffer.set_depth_test`. A fragment passes the depth
+    test when ``fragment_depth <compare_op> stored_depth`` is true.
+    """
+
+    NEVER = 0
+    LESS = 1
+    EQUAL = 2
+    LESS_OR_EQUAL = 3
+    GREATER = 4
+    NOT_EQUAL = 5
+    GREATER_OR_EQUAL = 6
+    ALWAYS = 7
 
 
 class LayoutHandle:
@@ -333,15 +475,13 @@ class TypeKind(enum.Enum):
     payload is populated.
     """
 
-    SCALAR = 0
-    """A single scalar value."""
-    VECTOR = 1
-    """A vector of 2, 3 or 4 components of the same scalar type."""
-    MATRIX = 2
-    """A column-major matrix of scalar components."""
-    ARRAY = 3
+    SINGLE = 0
+    """A single scalar, vector or matrix value -- see :attr:`Layout.type`
+    (and :attr:`Layout.element_layout`, non-``None`` for a matrix) for
+    which."""
+    ARRAY = 1
     """A fixed-size, or unsized/runtime, array of a single element type."""
-    STRUCT = 4
+    STRUCT = 2
     """An ordered collection of named, independently-typed fields."""
 
 
@@ -365,45 +505,24 @@ class LayoutRule(enum.Enum):
 
 
 class TypeDescriptor:
-    """Describes the shape of a GPU-buffer-resident type: scalar, vector,
-    matrix, array or struct.
+    """Describes the shape of a GPU-buffer-resident type: a single
+    scalar/vector/matrix value, an array or a struct.
 
     Used together with :class:`LayoutRule` and :func:`compute_layout` to
     compute byte offsets, sizes and strides without touching the GPU, and
     with ``Device.create_buffer(elements, layout, ...)`` to allocate a buffer sized
-    to hold it.
+    to hold it. Not constructed directly in typical code -- pass a plain
+    type spec (a bare :class:`Type`, or a ``[count, spec]``/``{name: spec}``
+    literal) straight to :func:`compute_layout` instead.
     """
 
     @staticmethod
-    def scalar(type: ScalarType) -> "TypeDescriptor":
-        """Creates a scalar type descriptor.
+    def single(type: Type) -> "TypeDescriptor":
+        """Creates a scalar/vector/matrix type descriptor.
 
-        :param type: Scalar element type.
+        :param type: Scalar, vector or matrix element type.
         :return: A new :class:`TypeDescriptor` of kind
-            :attr:`TypeKind.SCALAR`.
-        """
-        ...
-
-    @staticmethod
-    def vector(component_type: ScalarType, components: int) -> "TypeDescriptor":
-        """Creates a vector type descriptor.
-
-        :param component_type: Scalar type of each component.
-        :param components: Number of components; must be 2, 3 or 4.
-        :return: A new :class:`TypeDescriptor` of kind
-            :attr:`TypeKind.VECTOR`.
-        """
-        ...
-
-    @staticmethod
-    def matrix(component_type: ScalarType, rows: int, columns: int) -> "TypeDescriptor":
-        """Creates a column-major matrix type descriptor.
-
-        :param component_type: Scalar type of each component.
-        :param rows: Number of rows; must be 2, 3 or 4.
-        :param columns: Number of columns; must be 2, 3 or 4.
-        :return: A new :class:`TypeDescriptor` of kind
-            :attr:`TypeKind.MATRIX`.
+            :attr:`TypeKind.SINGLE`.
         """
         ...
 
@@ -498,12 +617,21 @@ class Layout:
         ...
 
     @property
-    def component_type(self) -> ScalarType:
-        """Scalar component type of this layout.
+    def type(self) -> Type:
+        """The exact scalar/vector/matrix type this layout was computed
+        for (e.g. :attr:`Type.VEC3`, :attr:`Type.MAT4`).
 
-        Only meaningful when :attr:`kind` is :attr:`TypeKind.SCALAR`,
-        :attr:`TypeKind.VECTOR` or :attr:`TypeKind.MATRIX`;
-        :attr:`ScalarType.UNDEFINED` otherwise.
+        Only meaningful when :attr:`kind` is :attr:`TypeKind.SINGLE`;
+        :attr:`Type.UNDEFINED` otherwise.
+        """
+        ...
+
+    @property
+    def component_type(self) -> Type:
+        """`type`'s own base scalar component (itself, for a scalar).
+
+        Only meaningful when :attr:`kind` is :attr:`TypeKind.SINGLE`;
+        :attr:`Type.UNDEFINED` otherwise.
         """
         ...
 
@@ -519,10 +647,10 @@ class Layout:
     @property
     def element_layout(self) -> "Layout | None":
         """Layout of a single element (for an array) or column (for a
-        matrix).
+        matrix-shaped :attr:`TypeKind.SINGLE`).
 
-        Only meaningful when :attr:`kind` is :attr:`TypeKind.ARRAY` or
-        :attr:`TypeKind.MATRIX`; ``None`` otherwise.
+        ``None`` for a scalar/vector :attr:`TypeKind.SINGLE`, or for
+        :attr:`TypeKind.STRUCT`.
         """
         ...
 
@@ -530,8 +658,8 @@ class Layout:
     def stride(self) -> int:
         """Byte stride between consecutive elements or matrix columns.
 
-        Only meaningful when :attr:`kind` is :attr:`TypeKind.ARRAY` or
-        :attr:`TypeKind.MATRIX`; zero otherwise.
+        Only meaningful when :attr:`kind` is :attr:`TypeKind.ARRAY`, or a
+        matrix-shaped :attr:`TypeKind.SINGLE`; zero otherwise.
         """
         ...
 
@@ -539,9 +667,168 @@ class Layout:
     def count(self) -> int:
         """Number of elements (for an array) or columns (for a matrix).
 
-        Only meaningful when :attr:`kind` is :attr:`TypeKind.ARRAY` or
-        :attr:`TypeKind.MATRIX`; zero otherwise.
+        Only meaningful when :attr:`kind` is :attr:`TypeKind.ARRAY`, or a
+        matrix-shaped :attr:`TypeKind.SINGLE`; zero otherwise.
         """
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this was created from."""
+        ...
+
+    def field(self, name: str) -> LayoutField:
+        """Looks up a named field of this struct layout, for navigating a
+        Layout tree by name (e.g. ``Layouts.instance().field("transform")``).
+
+        Chain into a nested struct via the returned field's own
+        ``.layout`` (itself a :class:`Layout`), or into an array/matrix
+        field via ``.layout.element_layout``. Raises ``RuntimeError`` if
+        this layout isn't a struct, or no field named ``name`` exists.
+        """
+        ...
+
+
+class Layouts:
+    """Tool class with commonly-needed :class:`Layout`\\ s for ray tracing
+    acceleration structure buffers, precomputed once and cached. Every
+    layout here is computed under scalar (tightly packed, natural
+    alignment) rules, matching the corresponding Vulkan C struct's own
+    byte layout exactly -- navigable field-by-field via :meth:`Layout.field`.
+    """
+
+    @staticmethod
+    def index16() -> Layout:
+        """A single UINT16 triangle-mesh index (:attr:`ADSTriangles.indices`)."""
+        ...
+
+    @staticmethod
+    def index32() -> Layout:
+        """A single UINT32 triangle-mesh index (:attr:`ADSTriangles.indices`)."""
+        ...
+
+    @staticmethod
+    def position() -> Layout:
+        """A single tightly-packed FLOAT32 vec3 vertex position
+        (:attr:`ADSTriangles.vertices`).
+        """
+        ...
+
+    @staticmethod
+    def aabb() -> Layout:
+        """A single ``VkAabbPositionsKHR``-shaped procedural AABB entry
+        (:attr:`ADSAABB.aabbs`): fields ``min_x``/``min_y``/``min_z``/
+        ``max_x``/``max_y``/``max_z``.
+        """
+        ...
+
+    @staticmethod
+    def instance() -> Layout:
+        """A single ``VkAccelerationStructureInstanceKHR``-shaped TLAS
+        instance entry (:attr:`ADSInstances.instances`): fields
+        ``transform`` (the row-major 3x4 affine transform, as an array of
+        3 vec4 rows), ``instance_custom_index_and_mask`` and
+        ``instance_shader_binding_table_record_offset_and_flags`` (each
+        packing two bitfields into one uint32 -- low 24 bits/high 8 bits
+        respectively: pack via ``(mask << 24) | (custom_index & 0xFFFFFF)``),
+        and ``acceleration_structure_reference`` (the referenced BLAS's
+        device address, see ``AccelerationStructure.device_address``).
+        """
+        ...
+
+
+class ADSTriangles:
+    """Declares the geometry for a bottom-level acceleration structure
+    (BLAS) built from a triangle mesh.
+    """
+
+    def __init__(
+        self,
+        vertices: Buffer,
+        vertex_count: int,
+        indices: Buffer | None = None,
+        primitive_count: int = 0,
+        opaque: bool = True,
+    ) -> None:
+        """`vertices` must be a DEVICE-resident buffer of tightly-packed
+        FLOAT32 vec3 positions (e.g. ``Layouts.position()``) with at least
+        `vertex_count` elements. `indices`, if given, must be a DEVICE-
+        resident buffer whose element_layout is a scalar UINT16 or UINT32
+        (non-indexed triangles are used otherwise); `primitive_count` is
+        the triangle count either way.
+        """
+        ...
+
+    vertices: Buffer
+    vertex_count: int
+    indices: Buffer | None
+    primitive_count: int
+    opaque: bool
+
+
+class ADSAABB:
+    """Declares the geometry for a bottom-level acceleration structure
+    (BLAS) built from procedural AABBs.
+    """
+
+    def __init__(self, aabbs: Buffer, count: int, opaque: bool = True) -> None:
+        """`aabbs` must be a DEVICE-resident buffer of
+        ``Layouts.aabb()``-shaped entries, with at least `count` elements.
+        """
+        ...
+
+    aabbs: Buffer
+    count: int
+    opaque: bool
+
+
+class ADSInstances:
+    """Declares a top-level acceleration structure (TLAS) built from
+    instances of other, already-built bottom-level acceleration
+    structures.
+    """
+
+    def __init__(self, instances: Buffer, count: int) -> None:
+        """`instances` must be a DEVICE-resident buffer of
+        ``Layouts.instance()``-shaped entries, with at least `count`
+        elements.
+        """
+        ...
+
+    instances: Buffer
+    count: int
+
+
+ADSDeclaration = ADSTriangles | ADSAABB | ADSInstances
+"""Declares the geometry backing one acceleration structure build:
+:class:`ADSTriangles`/:class:`ADSAABB` build a BLAS, :class:`ADSInstances`
+builds a TLAS. Passed to ``Device.create_ads`` (to size and allocate the
+acceleration structure) and ``CommandBuffer.build_ads`` (to actually
+record the build).
+"""
+
+
+class AccelerationStructure:
+    """User-facing handle to a built (or build-pending) acceleration
+    structure, obtained from ``Device.create_ads``. Pass it to
+    ``CommandBuffer.build_ads`` to actually record its build, and to
+    ``DescriptorSet.bind`` (declared type ``DescriptorType.ACCELERATION_STRUCTURE``)
+    to use it from a shader, or reference it from a TLAS instance entry
+    via :attr:`device_address`.
+    """
+
+    @property
+    def device_address(self) -> int:
+        """This acceleration structure's Vulkan device address: for a
+        BLAS, the value to place in a TLAS instance entry's
+        ``acceleration_structure_reference`` field (see
+        ``Layouts.instance()``).
+        """
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this was created from."""
         ...
 
 
@@ -581,9 +868,14 @@ class Buffer:
         ...
 
     @property
+    def device_index(self) -> int:
+        """Index of the Device this buffer was created from."""
+        ...
+
+    @property
     def element_layout(self) -> Layout:
         """Layout of a single element of this buffer: a scalar
-        (``Device.create_buffer(elements, ScalarType, ...)``), an array of a
+        (``Device.create_buffer(elements, Type, ...)``), an array of a
         format's per-channel scalar (``Device.create_buffer(elements,
         Format, ...)``), or a struct (``Device.create_buffer(elements,
         layout, ...)``). Every :class:`Buffer` has one -- there is no "untyped"
@@ -596,7 +888,7 @@ class Buffer:
         ...
 
     @overload
-    def cast(self, scalar: ScalarType) -> "Buffer":
+    def cast(self, scalar: Type) -> "Buffer":
         """Reinterprets this buffer's bytes (same underlying offset/size)
         as a flat array of ``scalar`` elements.
 
@@ -647,7 +939,7 @@ class Buffer:
         """
         ...
 
-    def __dlpack__(self, stream: object = None) -> object:
+    def __dlpack__(self, stream: None = None) -> object:
         """Exports this buffer as a DLPack capsule (the Python DLPack
         protocol's tensor-export method).
 
@@ -672,6 +964,42 @@ class Buffer:
         """
         ...
 
+    def torch(self) -> object:
+        """Returns this buffer as a ``torch.Tensor``, via ``torch.from_dlpack``.
+        Lazily imports ``torch`` (not a hard dependency); raises
+        ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def numpy(self) -> object:
+        """Returns this buffer as a ``numpy.ndarray``, via
+        ``numpy.from_dlpack``. Lazily imports ``numpy`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def jax(self) -> object:
+        """Returns this buffer as a ``jax.Array``, via
+        ``jax.dlpack.from_dlpack``. Lazily imports ``jax`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def cupy(self) -> object:
+        """Returns this buffer as a ``cupy.ndarray``, via
+        ``cupy.from_dlpack``. Lazily imports ``cupy`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def tensorflow(self) -> object:
+        """Returns this buffer as a ``tf.Tensor``, via
+        ``tf.experimental.dlpack.from_dlpack``. Lazily imports
+        ``tensorflow`` (not a hard dependency); raises ``ImportError`` if
+        it isn't installed.
+        """
+        ...
+
     def field(self, field: LayoutField) -> object:
         """Exports ``field``, repeated across every instance of its root
         layout in this buffer, as a single strided DLPack tensor.
@@ -691,7 +1019,22 @@ class Buffer:
         """
         ...
 
-    def read(self, field: LayoutField) -> object:
+    @overload
+    def read(self, field: LayoutField) -> object: ...
+
+    @overload
+    def read(self, field: str) -> object:
+        """Same as the ``LayoutField`` overload, but ``field`` is a dotted
+        name path (e.g. ``"lights.0.P"``, field names and/or integer
+        array/matrix-column indices) resolved against :attr:`element_layout`.
+        A single plain name (no dot, not an integer) is exactly equivalent
+        to ``read(element_layout.field(name))``; a deeper path is read via
+        a byte-level ``cast``/``slice`` instead (lazily imports ``torch``),
+        returning a ``torch.Tensor`` rather than a ``vk.math3d`` object.
+        """
+        ...
+
+    def read(self, field) -> object:
         """Reads ``field`` directly via ``memcpy``, bypassing DLPack --
         much cheaper than :meth:`field` for small (e.g. scalar) fields.
 
@@ -701,14 +1044,26 @@ class Buffer:
         ``field``'s root layout (i.e. :attr:`size` equals
         ``field.root.aligned_size``).
 
-        :param field: Field to read. Must describe a scalar, vector,
-            matrix, or (possibly nested) array of any of those -- not a
-            struct, since a struct isn't a single numeric type.
-        :return: A plain Python number (``int``/``float``/``bool``) for a
-            scalar field; a tightly-packed buffer object (``bytes``) for a
-            vector, matrix, or array field -- e.g. wrap it with
-            ``numpy.frombuffer`` or ``torch.frombuffer`` for a properly
-            typed/shaped view.
+        :param field: A :class:`LayoutField` (from
+            ``element_layout.field(name)``), or a dotted name path string
+            (e.g. ``"lights.0.P"``, field names and/or integer
+            array/matrix-column indices) navigated against
+            :attr:`element_layout` -- a single plain name is equivalent to
+            the :class:`LayoutField` form, a deeper path is instead
+            resolved via a byte-level ``cast``/``slice`` (lazily imports
+            ``torch``) and returns a ``torch.Tensor``. Must describe a
+            scalar, vector, matrix, or (possibly nested) array of any of
+            those -- not a struct, since a struct isn't a single numeric
+            type.
+        :return: For the :class:`LayoutField`/plain-name forms: a plain
+            Python number (``int``/``float``/``bool``) for a scalar field;
+            the matching ``vk.math3d`` vec*/mat* object for a vector or
+            matrix field (e.g. a FLOAT32 vec3 field -> :class:`vk.math3d.vec3`,
+            an INT32 vec2 field -> :class:`vk.math3d.ivec2`; a matrix field
+            is always float, e.g. :class:`vk.math3d.mat4`); a
+            tightly-packed buffer object (``bytes``) for an array field,
+            or for a vector/matrix field with no ``vk.math3d`` equivalent.
+            For a deeper dotted path: a ``torch.Tensor`` instead.
         :raises RuntimeError: If :attr:`element_layout` isn't a struct,
             this buffer isn't host-visible, doesn't hold exactly one
             instance of ``field``'s root layout, or ``field`` describes a
@@ -716,29 +1071,58 @@ class Buffer:
         """
         ...
 
-    def write(self, field: LayoutField, value: object) -> None:
-        """Writes ``value`` into ``field`` directly via ``memcpy``,
-        bypassing DLPack -- much cheaper than going through :meth:`field`
-        for small (e.g. scalar) fields.
+    @overload
+    def write(self, field: LayoutField, value: object) -> None: ...
 
-        Same buffer requirements as :meth:`read`.
+    @overload
+    def write(self, field: str, value: object) -> None: ...
 
-        :param field: Field to write. Must describe a scalar, vector,
-            matrix, or (possibly nested) array of any of those -- not a
-            struct, since a struct isn't a single numeric type.
-        :param value: For a scalar field, a plain Python number. For a
-            vector or matrix field, also a plain (possibly nested, for a
-            matrix) Python list/tuple of numbers -- converted on the
-            Python side to a packed array before writing. For a vector,
-            matrix, or array field, otherwise, a Python object supporting
-            the buffer protocol (e.g. a C-contiguous numpy array) or a
-            DLPack-compatible object (e.g. a CPU torch tensor) -- both are
-            read directly via ``memcpy``, so a CUDA tensor is rejected
-            (there's no valid CPU pointer to copy from).
+    @overload
+    def write(self, **fields: object) -> None: ...
+
+    def write(self, field=None, value: object = None, **fields: object) -> None:
+        """Writes one or more fields of this struct-layout buffer directly
+        via ``memcpy``, bypassing DLPack -- much cheaper than going through
+        :meth:`field` for small (e.g. scalar) fields.
+
+        Three forms:
+
+        - ``write(field, value)``: ``field`` a :class:`LayoutField` (from
+          ``element_layout.field(name)``) -- must describe a scalar,
+          vector, matrix, or (possibly nested) array of any of those, not
+          a struct.
+        - ``write(path, value)``: ``path`` a dotted name string (e.g.
+          ``"lights.0.P"``, field names and/or integer array/matrix-column
+          indices), navigated against :attr:`element_layout`. A single
+          plain name (no dot, not an integer) is exactly equivalent to the
+          :class:`LayoutField` form; a deeper path is instead resolved via
+          a byte-level ``cast``/``slice`` (lazily imports ``torch``).
+        - ``write(name=value, ...)``: one or more top-level fields by
+          name, each written independently (equivalent to calling
+          ``write(name, value)`` once per keyword).
+
+        In every form, if ``value`` is a ``dict``, the target field is
+        assumed to be a struct and each ``{key: value}`` pair is written
+        recursively to ``path.key``. If ``value`` is a ``list``/``tuple``
+        and the target field is an array, each element is written to the
+        matching numeric index (``path.0``, ``path.1``, ...); for a
+        vector/matrix field (not an array), a plain (possibly nested, for
+        a matrix) list/tuple of numbers is instead written element-by-element
+        as that field's own components, converting to its scalar type.
+        Otherwise (a vector, matrix or array field, given a value that
+        isn't a dict/list/tuple matching the above), ``value`` may be a
+        ``vk.math3d`` vec*/mat* object, a Python object supporting the
+        buffer protocol (e.g. a C-contiguous numpy array), or a
+        DLPack-compatible object (e.g. a CPU torch tensor) -- read
+        directly via ``memcpy``, so a CUDA tensor is rejected (there's no
+        valid CPU pointer to copy from).
+
+        :raises TypeError: If both a positional ``field``/``path`` and
+            ``name=value`` keywords are given.
         :raises RuntimeError: If :attr:`element_layout` isn't a struct,
             this buffer isn't host-visible, doesn't hold exactly one
-            instance of ``field``'s root layout, ``value``'s size doesn't
-            match ``field``'s, or (for a DLPack source) it isn't
+            instance of the target field's root layout, ``value``'s size
+            doesn't match the field's, or (for a DLPack source) it isn't
             CPU-accessible.
         """
         ...
@@ -798,7 +1182,7 @@ class Tensor:
         ...
 
     @property
-    def scalar_type(self) -> ScalarType:
+    def scalar_type(self) -> Type:
         """Scalar element type of this tensor."""
         ...
 
@@ -811,6 +1195,47 @@ class Tensor:
     def device_ptr(self) -> int:
         """Vulkan buffer device address of this tensor -- a raw pointer
         usable from within a shader, not a CUDA/host pointer.
+        """
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this tensor was created from."""
+        ...
+
+    def torch(self) -> object:
+        """Returns this tensor as a ``torch.Tensor``, via ``torch.from_dlpack``.
+        Lazily imports ``torch`` (not a hard dependency); raises
+        ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def numpy(self) -> object:
+        """Returns this tensor as a ``numpy.ndarray``, via
+        ``numpy.from_dlpack``. Lazily imports ``numpy`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def jax(self) -> object:
+        """Returns this tensor as a ``jax.Array``, via
+        ``jax.dlpack.from_dlpack``. Lazily imports ``jax`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def cupy(self) -> object:
+        """Returns this tensor as a ``cupy.ndarray``, via
+        ``cupy.from_dlpack``. Lazily imports ``cupy`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def tensorflow(self) -> object:
+        """Returns this tensor as a ``tf.Tensor``, via
+        ``tf.experimental.dlpack.from_dlpack``. Lazily imports
+        ``tensorflow`` (not a hard dependency); raises ``ImportError`` if
+        it isn't installed.
         """
         ...
 
@@ -851,21 +1276,49 @@ class WrappedMemory:
 
     Exposes a Vulkan buffer device address (``device_ptr``) usable from
     within a shader, alongside the wrapped object's ``shape`` and
-    ``scalar_type``. If wrapping required an intermediate copy, this
-    object copies data back to the source when :meth:`unwrap` is called
-    (or, failing that, when it's garbage collected), depending on the
-    :class:`WrapMode` it was created with.
+    ``scalar_type``.
+
+    If the wrapped object is directly accessible from both the CPU and
+    GPU sides (a :class:`Buffer`, a :class:`Tensor`, or memory that
+    already belongs to this device), ``device_ptr`` aliases it directly:
+    there is only one copy of the data, so every dirty/update method
+    below is a no-op.
+
+    Otherwise a temporary buffer stands in for the GPU side, and this
+    object tracks which side -- the wrapped Python object ("cpu") or the
+    temporary buffer ("gpu") -- was modified more recently via a pair of
+    version counters. Call :meth:`make_cpu_dirty`/:meth:`make_gpu_dirty`
+    after modifying one side, then :meth:`update_cpu`/:meth:`update_gpu`
+    to lazily copy the other side's changes across -- a copy only
+    actually happens when the destination is stale.
     """
 
-    def unwrap(self) -> None:
-        """Performs, immediately, whatever copy-back this wrap's
-        :class:`WrapMode` calls for (``OUT``/``INOUT``), instead of
-        leaving it to whenever the garbage collector gets around to
-        destroying this object.
+    def make_cpu_dirty(self) -> None:
+        """Marks the CPU side (the wrapped Python object) as holding the
+        freshest data, so the next :meth:`update_gpu` call will copy it
+        across. No-op for a direct mapping.
+        """
+        ...
 
-        Safe to call more than once -- only the first call has any
-        effect. Unlike garbage collection, exceptions raised while
-        copying back propagate to the caller.
+    def make_gpu_dirty(self) -> None:
+        """Marks the GPU side (this wrap's own ``device_ptr``, e.g.
+        after a shader wrote through it) as holding the freshest data,
+        so the next :meth:`update_cpu` call will copy it back. No-op
+        for a direct mapping.
+        """
+        ...
+
+    def update_cpu(self) -> None:
+        """Copies GPU -> CPU only if :meth:`make_gpu_dirty` was called
+        more recently than the last :meth:`update_cpu`/creation. A
+        no-op otherwise, and always a no-op for a direct mapping.
+        """
+        ...
+
+    def update_gpu(self) -> None:
+        """Copies CPU -> GPU only if :meth:`make_cpu_dirty` was called
+        more recently than the last :meth:`update_gpu`/creation. A
+        no-op otherwise, and always a no-op for a direct mapping.
         """
         ...
 
@@ -883,7 +1336,7 @@ class WrappedMemory:
         ...
 
     @property
-    def scalar_type(self) -> ScalarType:
+    def scalar_type(self) -> Type:
         """Scalar element type of the wrapped object."""
         ...
 
@@ -915,6 +1368,11 @@ class Image:
         """Number of array layers this image (view) covers."""
         ...
 
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this image was created from."""
+        ...
+
     def cast_format(self, format: Format) -> "Image":
         """Reinterprets this image's texel data as `format` (same
         underlying image and subresource range), for a format of the
@@ -927,6 +1385,104 @@ class Image:
         layers, sharing the same underlying image.
         """
         ...
+
+
+class Sampler:
+    """A texture sampler (filtering + per-axis wrap modes), obtained from
+    :meth:`Device.create_sampler`.
+
+    Used together with an :class:`Image` via :meth:`DescriptorSet.bind`,
+    either as a standalone :attr:`DescriptorType.SAMPLER` binding (paired
+    with a separate :attr:`DescriptorType.SAMPLED_IMAGE` binding), or
+    combined with an image in one
+    :attr:`DescriptorType.COMBINED_IMAGE_SAMPLER` binding.
+    """
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this sampler was created from."""
+        ...
+
+
+class Mesh:
+    """A single interleaved vertex buffer plus index buffer, as produced
+    by :meth:`Device.load_scene`.
+    """
+
+    @property
+    def vertices(self) -> Buffer:
+        """Interleaved vertex data, laid out per :attr:`attributes`."""
+        ...
+
+    @property
+    def indices(self) -> Buffer:
+        """Triangle indices (``uint32``) into :attr:`vertices`."""
+        ...
+
+    @property
+    def attributes(self) -> list[VertexAttribute]:
+        """Order of attributes interleaved in each :attr:`vertices` entry."""
+        ...
+
+
+MaterialValue = float | list[float] | str
+"""A single material property's value: a scalar, an RGB triplet (as a
+3-element list), or a string (e.g. a texture map path)."""
+
+
+class Material:
+    """A dynamic, open-ended set of named properties (e.g. ``"diffuse"``
+    -> an RGB triplet, ``"diffuse_map"`` -> a texture path) -- not a fixed
+    schema, so any loader can store whatever it finds.
+    """
+
+    def __init__(self) -> None: ...
+
+    def set(self, name: str, value: MaterialValue) -> None:
+        """Sets (or overwrites) a named property."""
+        ...
+
+    def get(self, name: str) -> MaterialValue | None:
+        """Returns a named property's value, or ``None`` if unset."""
+        ...
+
+    @property
+    def properties(self) -> dict[str, MaterialValue]:
+        """All properties currently set on this material."""
+        ...
+
+
+class SceneNode:
+    """A single named mesh instance within a :class:`Scene`, obtained
+    from :meth:`Device.load_scene`.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def material(self) -> Material | None:
+        """``None`` if this node has no associated material."""
+        ...
+
+    @property
+    def mesh(self) -> Mesh: ...
+
+    @property
+    def transform(self) -> list[list[float]] | None:
+        """A 3x4 row-major affine transform, or ``None`` when the source
+        format has no per-node transform concept (e.g. OBJ).
+        """
+        ...
+
+
+class Scene:
+    """A flat list of :class:`SceneNode`, obtained from
+    :meth:`Device.load_scene`.
+    """
+
+    @property
+    def nodes(self) -> list[SceneNode]: ...
 
 
 class CommandBuffer:
@@ -1032,6 +1588,47 @@ class CommandBuffer:
         """
         ...
 
+    def set_cull_mode(self, mode: CullMode) -> None:
+        """Sets the dynamic cull mode used by subsequent draw calls.
+
+        Must be called while the command buffer is still recording.
+        Graphics pipelines only.
+
+        :raises RuntimeError: If the device doesn't support Vulkan 1.3
+            (extended dynamic state).
+        """
+        ...
+
+    def set_front_face(self, front_face: FrontFace) -> None:
+        """Sets the dynamic front-face winding order used by subsequent
+        draw calls.
+
+        Must be called while the command buffer is still recording.
+        Graphics pipelines only.
+
+        :raises RuntimeError: If the device doesn't support Vulkan 1.3
+            (extended dynamic state).
+        """
+        ...
+
+    def set_depth_test(
+        self, enable: bool, write_enable: bool = True, compare_op: CompareOp = CompareOp.LESS
+    ) -> None:
+        """Sets dynamic depth testing state used by subsequent draw calls.
+
+        :param enable: Whether the depth test itself is performed.
+        :param write_enable: Whether a fragment that passes the depth
+            test writes its depth into the depth buffer.
+        :param compare_op: How a fragment's depth compares against the
+            depth buffer to pass the test.
+        :raises RuntimeError: If the device doesn't support Vulkan 1.3
+            (extended dynamic state), if no render pass is active (call
+            :meth:`set_framebuffer` first), or if ``enable`` is true but
+            the active framebuffer has no depth attachment (see
+            :meth:`Pipeline.attach_depth`).
+        """
+        ...
+
     def blit_image(self, src: "Image", dst: "Image", filter: Filter = Filter.LINEAR) -> None:
         """Records a device-side blit (resizing/format-converting as
         needed) from ``src`` into ``dst``, covering each image's full
@@ -1074,7 +1671,7 @@ class CommandBuffer:
         :meth:`dispatch_indexed_primitives` calls.
 
         ``index_buffer.element_layout`` must be a scalar
-        :attr:`ScalarType.UINT16` or :attr:`ScalarType.UINT32`. Must be
+        :attr:`Type.UINT16` or :attr:`Type.UINT32`. Must be
         called while the command buffer is still recording, i.e. before
         :meth:`close`. Keeps a reference to ``index_buffer`` alive for as
         long as this command buffer is, including while submitted and
@@ -1117,6 +1714,20 @@ class CommandBuffer:
         """
         ...
 
+    def build_ads(self, ads: AccelerationStructure, declaration: ADSDeclaration) -> None:
+        """Records a build of `ads` (previously sized/allocated by
+        :meth:`Device.create_ads`) from the geometry described by
+        `declaration`, which must be the same kind
+        (:class:`ADSTriangles`/:class:`ADSAABB` vs :class:`ADSInstances`)
+        it was created with.
+
+        Allocates a temporary scratch buffer for the build, kept alive
+        (like every buffer/acceleration structure referenced here) for as
+        long as this command buffer is, including while submitted and
+        pending on the GPU. Requires a COMPUTE-capable engine.
+        """
+        ...
+
     def close(self) -> None:
         """Ends recording (and any still-active render pass) and makes
         it ready to submit for execution on its engine.
@@ -1147,6 +1758,27 @@ class CommandBuffer:
     def is_released(self) -> bool:
         """Whether this command buffer has been released back to its
         engine and can no longer be used.
+        """
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this command buffer was created from.
+        Raises ``RuntimeError`` if already released.
+        """
+        ...
+
+    @property
+    def engine_type(self) -> "EngineType":
+        """Capability of the engine this command buffer was created from.
+        Raises ``RuntimeError`` if already released.
+        """
+        ...
+
+    @property
+    def engine_index(self) -> int:
+        """Index of the engine this command buffer was created from.
+        Raises ``RuntimeError`` if already released.
         """
         ...
 
@@ -1201,6 +1833,21 @@ class Engine:
         """Blocks the calling thread until every command previously
         submitted through this engine has finished executing on the GPU.
         """
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this engine was created from."""
+        ...
+
+    @property
+    def engine_type(self) -> "EngineType":
+        """Capability this engine was created with."""
+        ...
+
+    @property
+    def engine_index(self) -> int:
+        """Index selecting among multiple queues of the same capability."""
         ...
 
 
@@ -1289,6 +1936,11 @@ class Framebuffer:
     @property
     def height(self) -> int:
         """Height, in pixels, shared by all attached images."""
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this framebuffer was created from."""
         ...
 
 
@@ -1561,6 +2213,11 @@ class Window:
         """This window's per-frame timing stats (currently just fps)."""
         ...
 
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this window was created from."""
+        ...
+
     def label(self, text: str, value: float | str | None = None) -> None:
         """Displays `text` (optionally followed by `value`) via ImGui,
         drawn as an overlay on top of whatever this frame presents
@@ -1608,19 +2265,72 @@ class DescriptorSet:
     a given ``set`` index, obtained from :meth:`Pipeline.create_descriptor_set`.
     """
 
-    def bind(self, layout_id: LayoutHandle, resource: "Buffer | object") -> None:
-        """Writes a resource into the binding identified by ``layout_id``.
-
-        Accepts either a :class:`Buffer` (for a binding declared with
-        :attr:`DescriptorType.STORAGE_BUFFER` or
-        :attr:`DescriptorType.UNIFORM_BUFFER`) or an :class:`Image` (for
-        :attr:`DescriptorType.STORAGE_IMAGE` or
-        :attr:`DescriptorType.SAMPLED_IMAGE`; sampler-based descriptor
-        types are not yet supported).
+    @overload
+    def bind(self, layout_id: LayoutHandle, resource: Buffer) -> None:
+        """Writes `resource` into the binding identified by ``layout_id``.
 
         :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
-        :param resource: Resource to bind.
+        :param resource: A :class:`Buffer`, for a binding declared with
+            :attr:`DescriptorType.STORAGE_BUFFER` or
+            :attr:`DescriptorType.UNIFORM_BUFFER`.
         """
+        ...
+
+    @overload
+    def bind(self, layout_id: LayoutHandle, resource: "Image") -> None:
+        """Writes `resource` into the binding identified by ``layout_id``.
+
+        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
+        :param resource: An :class:`Image`, for a binding declared with
+            :attr:`DescriptorType.STORAGE_IMAGE` (read/write, no sampler)
+            or :attr:`DescriptorType.SAMPLED_IMAGE` (read-only, sampled in
+            the shader via a separately-bound :class:`Sampler` at another
+            binding -- see the ``(image, sampler)`` overload for a single
+            combined binding instead).
+        """
+        ...
+
+    @overload
+    def bind(self, layout_id: LayoutHandle, resource: "Sampler") -> None:
+        """Writes `resource` into the binding identified by ``layout_id``.
+
+        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
+        :param resource: A :class:`Sampler`, for a binding declared with
+            :attr:`DescriptorType.SAMPLER` (paired with a separate
+            :attr:`DescriptorType.SAMPLED_IMAGE` binding, e.g. GLSL
+            ``texture2D tex; sampler s;``).
+        """
+        ...
+
+    @overload
+    def bind(self, layout_id: LayoutHandle, image: "Image", sampler: "Sampler") -> None:
+        """Writes `image`+`sampler` together into the binding identified by
+        ``layout_id``.
+
+        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
+        :param image: Image to sample.
+        :param sampler: Sampler describing how to sample it. The binding's
+            declared type must be :attr:`DescriptorType.COMBINED_IMAGE_SAMPLER`
+            (GLSL ``sampler2D``).
+        """
+        ...
+
+    @overload
+    def bind(self, **bindings: object) -> None:
+        """Binds one or more resources by the ``name`` given to the
+        matching :meth:`Pipeline.layout` call(s) instead of its
+        ``LayoutHandle`` -- e.g. ``ds.bind(img=render_target, ubo=ubo)``.
+        A ``(image, sampler)`` tuple value binds a combined image/sampler.
+        Only works for a descriptor set whose originating
+        :class:`Pipeline` used ``name=...`` at :meth:`Pipeline.layout`.
+
+        :raises KeyError: If a keyword doesn't match any named binding.
+        """
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this descriptor set was created from."""
         ...
 
 
@@ -1651,7 +2361,12 @@ class Pipeline:
 
         :param set: Descriptor set index.
         :param binding: Binding index within ``set``.
-        :param description: Kind of resource this binding expects.
+        :param description: Kind of resource this binding expects. May
+            instead be passed as a single ``name=description`` keyword
+            (e.g. ``pipeline.layout(0, 0, img=DescriptorType.STORAGE_IMAGE)``),
+            remembering ``name`` so the matching :class:`DescriptorSet`
+            can later be bound via :meth:`DescriptorSet.bind` ``(name=resource)``
+            instead of the returned handle.
         :param count: Number of array elements at this binding.
         :return: An opaque handle identifying this binding, for use with
             :meth:`DescriptorSet.bind`.
@@ -1680,9 +2395,27 @@ class Pipeline:
         Graphics pipelines only. Must be called before :meth:`close`.
 
         :param slot: Fragment shader output location for this attachment.
-        :param format: Pixel format of this attachment.
+        :param format: Pixel format of this attachment. May instead be
+            passed as a single ``name=format`` keyword (e.g.
+            ``pipeline.attach(0, color=Format.RGBA32_Float)``), remembering
+            ``name`` so :meth:`create_framebuffer` can later be passed
+            ``name=image`` instead of the returned handle.
         :return: An opaque handle used to bind a render target image via
             :meth:`create_framebuffer`.
+        """
+        ...
+
+    def attach_depth(self, format: Format) -> None:
+        """Declares this pipeline's depth (or depth/stencil) attachment,
+        enabling :meth:`CommandBuffer.set_depth_test` and depth-tested
+        rendering. At most one per pipeline.
+
+        Graphics pipelines only. Must be called before :meth:`close`.
+
+        :param format: One of the ``Format.Depth*`` values.
+        :raises RuntimeError: If ``format`` isn't a depth format, a depth
+            attachment was already declared, or the device doesn't
+            support Vulkan 1.3 (extended dynamic state).
         """
         ...
 
@@ -1713,14 +2446,23 @@ class Pipeline:
         """
         ...
 
-    def create_framebuffer(self, attachments: list[tuple[AttachHandle, "Image"]]) -> Framebuffer:
+    def create_framebuffer(
+        self, attachments: "list[tuple[AttachHandle, Image]] | None" = None, depth_image: "Image | None" = None,
+        **named_attachments: "Image"
+    ) -> Framebuffer:
         """Creates a framebuffer compatible with this pipeline's render pass.
 
         Pipeline must be closed first. Graphics pipelines only.
 
         :param attachments: One ``(slot, image)`` pair per handle returned
             by :meth:`attach`, each image matching that attachment's
-            declared format, and all sharing the same dimensions.
+            declared format, and all sharing the same dimensions. Omit and
+            use ``name=image`` keywords instead (one per :meth:`attach`
+            call that used ``name=...``), e.g.
+            ``pipeline.create_framebuffer(color=render_target)``.
+        :param depth_image: Required (and matching :meth:`attach_depth`'s
+            format/dimensions) if and only if :meth:`attach_depth` was
+            called on this pipeline.
         :return: A new :class:`Framebuffer`.
         """
         ...
@@ -1732,13 +2474,19 @@ class Pipeline:
         Pipeline must be closed first.
 
         :param set: Descriptor set index, as passed to :meth:`layout`.
-        :return: A new :class:`DescriptorSet`.
+        :return: A new :class:`DescriptorSet`, whose :meth:`DescriptorSet.bind`
+            accepts this pipeline's ``name=...`` bindings, if any.
         """
         ...
 
     @property
     def is_closed(self) -> bool:
         """Whether :meth:`close` has already been called."""
+        ...
+
+    @property
+    def device_index(self) -> int:
+        """Index of the Device this pipeline was created from."""
         ...
 
 
@@ -1762,6 +2510,13 @@ class Device:
         """Releases all Vulkan resources owned by this device."""
         ...
 
+    @property
+    def index(self) -> int:
+        """Index of the physical Vulkan device this was created from
+        (the same value passed to :meth:`create_device`/:func:`create_device`).
+        """
+        ...
+
     @staticmethod
     def create_device(device_index: int = 0, enable_validation_layers: bool = False) -> "Device":
         """Creates and initializes a new Vulkan device.
@@ -1773,7 +2528,7 @@ class Device:
         """
         ...
 
-    def create_tensor(self, shape: list[int], scalar_type: ScalarType, location: MemoryLocation) -> Tensor:
+    def create_tensor(self, shape: list[int], scalar_type: Type, location: MemoryLocation) -> Tensor:
         """Creates a :class:`Tensor`: a plain N-dimensional array resource
         of a single scalar type.
 
@@ -1789,12 +2544,12 @@ class Device:
         ...
 
     @overload
-    def create_buffer(self, elements: int, scalar_type: ScalarType, location: MemoryLocation) -> Buffer:
+    def create_buffer(self, elements: int, scalar_type: Type, location: MemoryLocation) -> Buffer:
         """Creates a buffer to store an array of elements of a given scalar
         type. Its :attr:`Buffer.element_layout` is that scalar type.
 
         A raw byte buffer is just this with ``scalar_type =
-        ScalarType.UINT8``: its :attr:`Buffer.element_layout` dlpack-exports
+        Type.UINT8``: its :attr:`Buffer.element_layout` dlpack-exports
         as raw bytes, and :meth:`Buffer.slice`/:meth:`Buffer.element`
         operate byte-by-byte.
 
@@ -1870,6 +2625,73 @@ class Device:
         """
         ...
 
+    def create_depth_buffer_image(
+        self,
+        width: int,
+        height: int,
+        format: Format = Format.Depth32_Float,
+        location: MemoryLocation = MemoryLocation.DEVICE,
+    ) -> Image:
+        """Creates a 2D depth (or depth/stencil) attachment image, for use
+        with :meth:`Pipeline.attach_depth`/:meth:`Pipeline.create_framebuffer`
+        and :meth:`CommandBuffer.set_depth_test`.
+
+        Unlike :meth:`create_image`, its usage is depth/stencil-attachment
+        + sampled (color-attachment/storage usage is invalid for a depth
+        format). Like every other image, it's transitioned once to
+        ``VK_IMAGE_LAYOUT_GENERAL`` before this call returns.
+
+        :param width: Width in texels.
+        :param height: Height in texels.
+        :param format: One of the ``Format.Depth*`` values.
+        :param location: Memory location for the image's backing store.
+        :return: A new :class:`Image`.
+        :raises RuntimeError: If ``format`` isn't a depth format.
+        """
+        ...
+
+    def create_sampler(
+        self,
+        mag_filter: Filter = Filter.LINEAR,
+        min_filter: Filter = Filter.LINEAR,
+        mipmap_mode: MipmapMode = MipmapMode.LINEAR,
+        wrap_u: WrapMode = WrapMode.REPEAT,
+        wrap_v: WrapMode = WrapMode.REPEAT,
+        wrap_w: WrapMode = WrapMode.REPEAT,
+    ) -> Sampler:
+        """Creates a texture sampler, for use with an :class:`Image` via
+        :meth:`DescriptorSet.bind`.
+
+        :param mag_filter: Filtering used when magnifying (texture smaller
+            than the sampled area).
+        :param min_filter: Filtering used when minifying (texture larger
+            than the sampled area).
+        :param mipmap_mode: Filtering used between mip levels. There is no
+            LOD bias/clamp control -- every mip level an image has is
+            reachable.
+        :param wrap_u: Wrap mode for the U (X) texture coordinate axis.
+        :param wrap_v: Wrap mode for the V (Y) texture coordinate axis.
+        :param wrap_w: Wrap mode for the W (Z) texture coordinate axis
+            (3D images only).
+        :return: A new :class:`Sampler`.
+        """
+        ...
+
+    def create_ads(self, declaration: ADSDeclaration) -> AccelerationStructure:
+        """Creates (sizes and allocates, but does not build -- see
+        :meth:`CommandBuffer.build_ads`) an acceleration structure: a
+        bottom-level one (BLAS) for an :class:`ADSTriangles`/
+        :class:`ADSAABB` declaration, or a top-level one (TLAS) for an
+        :class:`ADSInstances` declaration.
+
+        :param declaration: Geometry description used to size the
+            acceleration structure.
+        :return: A new :class:`AccelerationStructure`.
+        :raises RuntimeError: If ``VK_KHR_acceleration_structure`` isn't
+            supported/enabled on this device.
+        """
+        ...
+
     def create_window(
         self,
         width: int,
@@ -1877,6 +2699,7 @@ class Device:
         title: str,
         format: Format,
         frames_on_the_fly: int = 3,
+        vsync: bool = True,
     ) -> Window:
         """Creates an OS window (via GLFW) with a Vulkan swapchain, ready
         to render into and present through.
@@ -1896,6 +2719,13 @@ class Device:
             number of pre-recorded, ready-to-submit frame slots); the
             actual count is whatever the surface capabilities grant for
             this request.
+        :param vsync: ``True`` (default) picks the always-supported,
+            vsync'd present mode (``VK_PRESENT_MODE_FIFO_KHR``). ``False``
+            tries to disable vsync: ``VK_PRESENT_MODE_MAILBOX_KHR``
+            (uncapped, triple-buffered, doesn't tear) if supported,
+            otherwise ``VK_PRESENT_MODE_IMMEDIATE_KHR`` (uncapped, can
+            tear), otherwise silently falls back to the vsync'd default
+            if this surface supports neither.
         :return: A new :class:`Window`.
         :raises RuntimeError: If VK_KHR_swapchain isn't supported/enabled
             on this device, GLFW window/surface creation fails, or this
@@ -1926,9 +2756,10 @@ class Device:
         """
         ...
 
+    @overload
     def create_staging(self, buffer: Buffer, location: MemoryLocation = MemoryLocation.HOST) -> Buffer:
-        """Creates a plain buffer sized to match ``buffer``, for staged
-        CPU/GPU data movement.
+        """Creates a plain, byte-addressable :class:`Buffer` sized to
+        match ``buffer``'s own ``size``, for staged CPU/GPU data movement.
 
         Device-local memory generally can't be mapped or read directly
         by the CPU. The correct Vulkan pattern is to allocate a staging
@@ -1939,14 +2770,33 @@ class Device:
         :param buffer: Buffer whose size the staging buffer should match.
         :param location: Memory location for the staging buffer, HOST
             by default.
-        :return: A new :class:`Buffer` of the same size as ``buffer``.
+        :return: A new :class:`Buffer` of the same size as ``buffer``,
+            with ``element_layout`` a plain ``Type.UINT8`` array
+            (i.e. untyped raw bytes -- ``buffer``'s own element type is
+            not preserved).
+        """
+        ...
+
+    @overload
+    def create_staging(self, image: "Image", location: MemoryLocation = MemoryLocation.HOST) -> Buffer:
+        """Creates a plain, byte-addressable :class:`Buffer` sized to
+        match ``image``'s own backing store, for staged CPU/GPU transfer
+        of its texel data (e.g. via :meth:`CommandBuffer.transfer` after
+        first blitting/copying into a same-size linear buffer -- see
+        ``image``'s own docs for the exact layout assumptions).
+
+        :param image: Image whose backing store size the staging buffer
+            should match.
+        :param location: Memory location for the staging buffer, HOST
+            by default.
+        :return: A new, untyped (``Type.UINT8`` element_layout)
+            :class:`Buffer`.
         """
         ...
 
     def wrap(
         self,
         obj: "Buffer | Tensor | object",
-        mode: WrapMode,
         location: MemoryLocation = MemoryLocation.DEVICE,
     ) -> WrappedMemory:
         """Wraps an external object as a :class:`WrappedMemory` exposing a
@@ -1956,25 +2806,23 @@ class Device:
         ``obj`` can be:
 
         - A :class:`Buffer` or :class:`Tensor`: its own device address is
-          used directly, no copy.
+          used directly, no copy, ever.
         - A DLPack-compatible object (e.g. a torch tensor): if it's
           already contiguous memory that belongs to this device's own
           memory managers (e.g. it came from ``torch.from_dlpack()`` on
           one of our own buffers), its corresponding device address is
           reused directly, no copy. Otherwise a new buffer is allocated
-          at ``location`` and the data is copied in (via the CUDA
-          interop plugin for CUDA-resident data, or a strided host
-          memcpy otherwise), respecting ``mode``.
+          at ``location``, and data is lazily copied in/out of it on
+          demand -- see :meth:`WrappedMemory.update_cpu`/
+          :meth:`WrappedMemory.update_gpu` -- via the CUDA interop
+          plugin for CUDA-resident data, or a strided host memcpy
+          otherwise.
         - A Python buffer-protocol object (e.g. a C-contiguous numpy
-          array): always copied into a new buffer at ``location``, since
-          a foreign host allocation has no Vulkan device address of its
-          own.
+          array): always copied into a new buffer at ``location`` on
+          demand, since a foreign host allocation has no Vulkan device
+          address of its own.
 
         :param obj: The object to wrap.
-        :param mode: Whether a required copy happens when the wrap is
-            created (``IN``), when :meth:`WrappedMemory.unwrap` is
-            called or this object is garbage collected (``OUT``), or
-            both (``INOUT``).
         :param location: Where to allocate a copy, if one is needed.
             Ignored when the object can be used directly.
         :return: A new :class:`WrappedMemory`.
@@ -1984,13 +2832,46 @@ class Device:
         """
         ...
 
+    def load_scene(
+        self,
+        filename: str,
+        resolution_mode: VertexResolutionMode = VertexResolutionMode.BY_ALL_ATTRIBUTES,
+    ) -> Scene:
+        """Loads a scene file into device-resident :class:`Mesh`
+        buffers, dispatching on ``filename``'s extension. Only ``.obj``
+        (via tinyobjloader) is currently supported.
 
-def create_device(device_index: int = 0, enable_validation_layers: bool = False) -> Device:
-    """Convenience wrapper around Device.create_device.
+        A group/shape referencing more than one material produces one
+        :class:`SceneNode` per material used within it (sharing the
+        group's name), rather than one node with a single, arbitrarily
+        chosen material.
 
-    :param device_index: Index of the physical Vulkan device to use.
-    :param enable_validation_layers: Whether to enable the Vulkan
-        validation layers, useful for debugging.
-    :return: A fully initialized :class:`Device`.
+        :param filename: Path to the scene file.
+        :param resolution_mode: How vertices are welded; see
+            :class:`VertexResolutionMode`.
+        :return: A new :class:`Scene`.
+        :raises RuntimeError: If the extension is unsupported or the
+            file fails to load.
+        """
+        ...
+
+
+def device_infos() -> list[dict]:
+    """Enumerates every Vulkan-visible physical device without creating a
+    logical :class:`Device` for any of them: a throwaway Vulkan instance
+    is created, queried, and destroyed within this call alone.
+
+    Each entry is a dict with keys ``"index"`` (the value to pass to
+    :meth:`Device.create_device`/:func:`create_device` for that GPU),
+    ``"name"``, ``"vendor"`` (a friendly name, e.g. ``"NVIDIA"``, or a
+    ``"0x...."`` hex string for an unrecognized vendor), ``"vendor_id"``,
+    ``"device_id"``, ``"device_type"`` (one of ``"discrete_gpu"``/
+    ``"integrated_gpu"``/``"virtual_gpu"``/``"cpu"``/``"other"``),
+    ``"api_version"`` (e.g. ``"1.3.278"``), ``"driver_version"`` (raw
+    ``int``, vendor-specific encoding), and ``"vram_bytes"`` (total
+    device-local memory heap size, in bytes).
+
+    :return: One dict per Vulkan-visible physical device, in the same
+        order/indexing as :meth:`Device.create_device` expects.
     """
     ...

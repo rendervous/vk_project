@@ -130,9 +130,9 @@ uint32_t formatSize(Format format) {
 
 // Maps a scalar component type/count (as found in a vertex-layout struct
 // field) to the named Format entry Vulkan expects for a vertex attribute.
-Format vertex_attribute_format(ScalarType component_type, int components) {
+Format vertex_attribute_format(Type component_type, int components) {
     switch (component_type) {
-        case ScalarType::FLOAT32:
+        case Type::FLOAT32:
             switch (components) {
                 case 1: return Format::R32_Float;
                 case 2: return Format::RG32_Float;
@@ -141,7 +141,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::INT32:
+        case Type::INT32:
             switch (components) {
                 case 1: return Format::R32_SInt;
                 case 2: return Format::RG32_SInt;
@@ -150,7 +150,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::UINT32:
+        case Type::UINT32:
             switch (components) {
                 case 1: return Format::R32_UInt;
                 case 2: return Format::RG32_UInt;
@@ -159,7 +159,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::FLOAT64:
+        case Type::FLOAT64:
             switch (components) {
                 case 1: return Format::R64_Float;
                 case 2: return Format::RG64_Float;
@@ -168,7 +168,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::INT64:
+        case Type::INT64:
             switch (components) {
                 case 1: return Format::R64_SInt;
                 case 2: return Format::RG64_SInt;
@@ -177,7 +177,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::UINT64:
+        case Type::UINT64:
             switch (components) {
                 case 1: return Format::R64_UInt;
                 case 2: return Format::RG64_UInt;
@@ -186,7 +186,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::FLOAT16:
+        case Type::FLOAT16:
             switch (components) {
                 case 1: return Format::R16_Float;
                 case 2: return Format::RG16_Float;
@@ -195,7 +195,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::INT16:
+        case Type::INT16:
             switch (components) {
                 case 1: return Format::R16_SInt;
                 case 2: return Format::RG16_SInt;
@@ -204,7 +204,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::UINT16:
+        case Type::UINT16:
             switch (components) {
                 case 1: return Format::R16_UInt;
                 case 2: return Format::RG16_UInt;
@@ -213,7 +213,7 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::INT8:
+        case Type::INT8:
             switch (components) {
                 case 1: return Format::R8_SInt;
                 case 2: return Format::RG8_SInt;
@@ -222,8 +222,8 @@ Format vertex_attribute_format(ScalarType component_type, int components) {
                 default: break;
             }
             break;
-        case ScalarType::UINT8:
-        case ScalarType::BOOL:
+        case Type::UINT8:
+        case Type::BOOL:
             switch (components) {
                 case 1: return Format::R8_UInt;
                 case 2: return Format::RG8_UInt;
@@ -325,78 +325,78 @@ struct TensorOwner {
     std::unique_ptr<std::int64_t[]> strides;
 };
 
-DLDataType dlpack_dtype (ScalarType scalar) {
+DLDataType dlpack_dtype (Type scalar) {
     switch (scalar) {
-        case ScalarType::FLOAT16: return {2, 16, 1};
-        case ScalarType::FLOAT32: return {2, 32, 1};
-        case ScalarType::FLOAT64: return {2, 64, 1 };
-        case ScalarType::INT8: return {0, 8, 1};
-        case ScalarType::BOOL: return {6, 8, 1};
-        case ScalarType::INT16: return {0, 16, 1};
-        case ScalarType::INT32: return {0, 32, 1};
-        case ScalarType::INT64: return {0, 64, 1};
-        case ScalarType::UINT8: return {1, 8, 1};
-        case ScalarType::UINT16: return {1, 16, 1};
-        case ScalarType::UINT32: return {1, 32, 1};
-        case ScalarType::UINT64: return {1, 64, 1};
+        case Type::FLOAT16: return {2, 16, 1};
+        case Type::FLOAT32: return {2, 32, 1};
+        case Type::FLOAT64: return {2, 64, 1 };
+        case Type::INT8: return {0, 8, 1};
+        case Type::BOOL: return {6, 8, 1};
+        case Type::INT16: return {0, 16, 1};
+        case Type::INT32: return {0, 32, 1};
+        case Type::INT64: return {0, 64, 1};
+        case Type::UINT8: return {1, 8, 1};
+        case Type::UINT16: return {1, 16, 1};
+        case Type::UINT32: return {1, 32, 1};
+        case Type::UINT64: return {1, 64, 1};
         default:
             throw std::invalid_argument("Wrong scalar type");
     }
 }
 
-// Reverse of dlpack_dtype(): the ScalarType matching an incoming DLPack
+// Reverse of dlpack_dtype(): the Type matching an incoming DLPack
 // tensor's dtype, for Device::wrap().
-ScalarType scalar_type_from_dlpack_dtype(const DLDataType& dtype) {
+Type scalar_type_from_dlpack_dtype(const DLDataType& dtype) {
     switch (dtype.code) {
         case 0: // signed int
             switch (dtype.bits) {
-                case 8: return ScalarType::INT8;
-                case 16: return ScalarType::INT16;
-                case 32: return ScalarType::INT32;
-                case 64: return ScalarType::INT64;
+                case 8: return Type::INT8;
+                case 16: return Type::INT16;
+                case 32: return Type::INT32;
+                case 64: return Type::INT64;
                 default: break;
             }
             break;
         case 1: // unsigned int
             switch (dtype.bits) {
-                case 8: return ScalarType::UINT8;
-                case 16: return ScalarType::UINT16;
-                case 32: return ScalarType::UINT32;
-                case 64: return ScalarType::UINT64;
+                case 8: return Type::UINT8;
+                case 16: return Type::UINT16;
+                case 32: return Type::UINT32;
+                case 64: return Type::UINT64;
                 default: break;
             }
             break;
         case 2: // float
             switch (dtype.bits) {
-                case 16: return ScalarType::FLOAT16;
-                case 32: return ScalarType::FLOAT32;
-                case 64: return ScalarType::FLOAT64;
+                case 16: return Type::FLOAT16;
+                case 32: return Type::FLOAT32;
+                case 64: return Type::FLOAT64;
                 default: break;
             }
             break;
         case 6: // bool
-            return ScalarType::BOOL;
+            return Type::BOOL;
         default:
             break;
     }
     throw std::runtime_error("Device::wrap: unsupported DLPack dtype");
 }
 
-// Best-effort ScalarType from a Python buffer-protocol format string
+// Best-effort Type from a Python buffer-protocol format string
 // (struct module conventions), for Device::wrap().
-ScalarType scalar_type_from_buffer_format(const std::string& format, std::uint64_t itemsize) {
-    if (format == "f") return ScalarType::FLOAT32;
-    if (format == "d") return ScalarType::FLOAT64;
-    if (format == "e") return ScalarType::FLOAT16;
-    if (format == "b" || format == "c") return ScalarType::INT8;
-    if (format == "B") return ScalarType::UINT8;
-    if (format == "?") return ScalarType::BOOL;
-    if (format == "h") return ScalarType::INT16;
-    if (format == "H") return ScalarType::UINT16;
-    if (format == "i" || format == "l") return itemsize == 8 ? ScalarType::INT64 : ScalarType::INT32;
-    if (format == "I" || format == "L") return itemsize == 8 ? ScalarType::UINT64 : ScalarType::UINT32;
-    if (format == "q") return ScalarType::INT64;
-    if (format == "Q") return ScalarType::UINT64;
+Type scalar_type_from_buffer_format(const std::string& format, std::uint64_t itemsize) {
+    if (format == "f") return Type::FLOAT32;
+    if (format == "d") return Type::FLOAT64;
+    if (format == "e") return Type::FLOAT16;
+    if (format == "b" || format == "c") return Type::INT8;
+    if (format == "B") return Type::UINT8;
+    if (format == "?") return Type::BOOL;
+    if (format == "h") return Type::INT16;
+    if (format == "H") return Type::UINT16;
+    if (format == "i" || format == "l") return itemsize == 8 ? Type::INT64 : Type::INT32;
+    if (format == "I" || format == "L") return itemsize == 8 ? Type::UINT64 : Type::UINT32;
+    if (format == "q") return Type::INT64;
+    if (format == "Q") return Type::UINT64;
     throw std::runtime_error("Device::wrap: unsupported buffer format '" + format + "'");
 }
 
@@ -545,8 +545,19 @@ uint32_t find_memory_type_index(
     return 0;
 }
 
-vk::BufferUsageFlags full_buffer_usage_flags() {
-    return vk::BufferUsageFlagBits::eTransferSrc |
+// `acceleration_structure_supported` gates
+// VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR (so
+// pooled buffers -- e.g. ADSTriangles::vertices -- can be used directly as
+// acceleration structure build input): it comes from
+// VK_KHR_acceleration_structure, so setting it when that extension isn't
+// enabled would be a validation error (even on a buffer never actually used
+// for one) -- see Device::vk_acceleration_structure_supported(). An
+// acceleration structure's own backing/storage buffer is allocated
+// separately (see vk_AccelerationStructure), with its own dedicated
+// VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR usage, so that bit
+// has no place here.
+vk::BufferUsageFlags full_buffer_usage_flags(bool acceleration_structure_supported) {
+    vk::BufferUsageFlags flags = vk::BufferUsageFlagBits::eTransferSrc |
            vk::BufferUsageFlagBits::eTransferDst |
            vk::BufferUsageFlagBits::eUniformTexelBuffer |
            vk::BufferUsageFlagBits::eStorageTexelBuffer |
@@ -556,6 +567,10 @@ vk::BufferUsageFlags full_buffer_usage_flags() {
            vk::BufferUsageFlagBits::eVertexBuffer |
            vk::BufferUsageFlagBits::eIndirectBuffer |
            vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    if (acceleration_structure_supported) {
+        flags |= vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR;
+    }
+    return flags;
 }
 
 vk::ImageUsageFlags full_image_usage_flags() {
@@ -569,7 +584,7 @@ vk::ImageUsageFlags full_image_usage_flags() {
 // Defined further below, alongside the rest of the Layout-inspection
 // helpers; forward-declared here so CommandBuffer::bind_indices (which
 // comes first in the file) can use it.
-ScalarType resolve_component_type(const Layout& layout);
+Type resolve_component_type(const Layout& layout);
 
 // Copies `total_bytes` from a DLPack-compatible or Python buffer-protocol
 // object `source` into `dst_external_ptr` (`dst_location`). Same
@@ -809,48 +824,59 @@ std::shared_ptr<Device> Device::create_device(uint32_t device_index, bool enable
     return dev;
 }
 
-int scalar_type_size(ScalarType type) {
+int scalar_type_size(Type type) {
     switch (type) {
-        case ScalarType::FLOAT16:
-        case ScalarType::INT16:
-        case ScalarType::UINT16:
+        case Type::FLOAT16:
+        case Type::INT16:
+        case Type::UINT16:
             return 2;
-        case ScalarType::FLOAT32:
-        case ScalarType::INT32:
-        case ScalarType::UINT32:
+        case Type::FLOAT32:
+        case Type::INT32:
+        case Type::UINT32:
             return 4;
-        case ScalarType::FLOAT64:
-        case ScalarType::INT64:
-        case ScalarType::UINT64:
+        case Type::FLOAT64:
+        case Type::INT64:
+        case Type::UINT64:
             return 8;
-        case ScalarType::INT8:
-        case ScalarType::UINT8:
-        case ScalarType::BOOL:
+        case Type::INT8:
+        case Type::UINT8:
+        case Type::BOOL:
             return 1;
         default:
             throw std::runtime_error("Unsupported scalar type");
     }
 }
 
-TypeDescriptor TypeDescriptor::scalar(ScalarType type) {
-    TypeDescriptor td;
-    td.payload_ = ScalarDesc{ type };
-    return td;
+TypeTraits type_traits(Type type) {
+    switch (type) {
+        case Type::VEC2: return { Type::FLOAT32, 2, 1 };
+        case Type::VEC3: return { Type::FLOAT32, 3, 1 };
+        case Type::VEC4: return { Type::FLOAT32, 4, 1 };
+        case Type::IVEC2: return { Type::INT32, 2, 1 };
+        case Type::IVEC3: return { Type::INT32, 3, 1 };
+        case Type::IVEC4: return { Type::INT32, 4, 1 };
+        case Type::UVEC2: return { Type::UINT32, 2, 1 };
+        case Type::UVEC3: return { Type::UINT32, 3, 1 };
+        case Type::UVEC4: return { Type::UINT32, 4, 1 };
+        case Type::BVEC2: return { Type::BOOL, 2, 1 };
+        case Type::BVEC3: return { Type::BOOL, 3, 1 };
+        case Type::BVEC4: return { Type::BOOL, 4, 1 };
+        case Type::MAT2: return { Type::FLOAT32, 2, 2 };
+        case Type::MAT2x3: return { Type::FLOAT32, 3, 2 };
+        case Type::MAT2x4: return { Type::FLOAT32, 4, 2 };
+        case Type::MAT3x2: return { Type::FLOAT32, 2, 3 };
+        case Type::MAT3: return { Type::FLOAT32, 3, 3 };
+        case Type::MAT3x4: return { Type::FLOAT32, 4, 3 };
+        case Type::MAT4x2: return { Type::FLOAT32, 2, 4 };
+        case Type::MAT4x3: return { Type::FLOAT32, 3, 4 };
+        case Type::MAT4: return { Type::FLOAT32, 4, 4 };
+        default: return { type, 1, 1 }; // plain scalar
+    }
 }
 
-TypeDescriptor TypeDescriptor::vector(ScalarType component_type, int components) {
-    if (components < 2 || components > 4)
-        throw std::runtime_error("Vector components must be in [2, 4]");
+TypeDescriptor TypeDescriptor::single(Type type) {
     TypeDescriptor td;
-    td.payload_ = VectorDesc{ component_type, components };
-    return td;
-}
-
-TypeDescriptor TypeDescriptor::matrix(ScalarType component_type, int rows, int columns) {
-    if (rows < 2 || rows > 4 || columns < 2 || columns > 4)
-        throw std::runtime_error("Matrix rows/columns must be in [2, 4]");
-    TypeDescriptor td;
-    td.payload_ = MatrixDesc{ component_type, rows, columns };
+    td.payload_ = SingleDesc{ type };
     return td;
 }
 
@@ -904,31 +930,34 @@ std::shared_ptr<Layout> compute_layout(const TypeDescriptor& type, LayoutRule ru
     auto layout = std::make_shared<Layout>();
     std::visit([&](auto&& desc) {
         using T = std::decay_t<decltype(desc)>;
-        if constexpr (std::is_same_v<T, ScalarDesc>) {
-            const std::uint64_t base = static_cast<std::uint64_t>(scalar_type_size(desc.type));
-            layout->kind = TypeKind::SCALAR;
-            layout->size = base;
-            layout->alignment = base;
-            layout->component_type = desc.type;
-        } else if constexpr (std::is_same_v<T, VectorDesc>) {
-            const std::uint64_t base = static_cast<std::uint64_t>(scalar_type_size(desc.component_type));
-            layout->kind = TypeKind::VECTOR;
-            layout->size = static_cast<std::uint64_t>(desc.components) * base;
-            if (rule == LayoutRule::Scalar)
+        if constexpr (std::is_same_v<T, SingleDesc>) {
+            const TypeTraits traits = type_traits(desc.type);
+            layout->kind = TypeKind::SINGLE;
+            layout->type = desc.type;
+            layout->component_type = traits.component_type;
+            const std::uint64_t base = static_cast<std::uint64_t>(scalar_type_size(traits.component_type));
+            if (traits.columns == 1 && traits.rows == 1) {
+                // Plain scalar.
+                layout->size = base;
                 layout->alignment = base;
-            else
-                layout->alignment = (desc.components == 2) ? 2 * base : 4 * base;
-            layout->component_type = desc.component_type;
-        } else if constexpr (std::is_same_v<T, MatrixDesc>) {
-            TypeDescriptor column = TypeDescriptor::vector(desc.component_type, desc.rows);
-            auto column_layout = compute_layout(column, rule);
-            layout->kind = TypeKind::MATRIX;
-            layout->element_layout = column_layout;
-            layout->stride = column_layout->aligned_size;
-            layout->count = static_cast<std::uint64_t>(desc.columns);
-            layout->size = layout->stride * layout->count;
-            layout->alignment = compute_array_alignment(column_layout, rule);
-            layout->component_type = desc.component_type;
+            } else if (traits.columns == 1) {
+                // Vector: `rows` components of `component_type`.
+                layout->size = static_cast<std::uint64_t>(traits.rows) * base;
+                if (rule == LayoutRule::Scalar)
+                    layout->alignment = base;
+                else
+                    layout->alignment = (traits.rows == 2) ? 2 * base : 4 * base;
+            } else {
+                // Matrix: `columns` columns, each a vector of `rows` components.
+                TypeDescriptor column = TypeDescriptor::single(
+                    traits.rows == 2 ? Type::VEC2 : traits.rows == 3 ? Type::VEC3 : Type::VEC4);
+                auto column_layout = compute_layout(column, rule);
+                layout->element_layout = column_layout;
+                layout->stride = column_layout->aligned_size;
+                layout->count = static_cast<std::uint64_t>(traits.columns);
+                layout->size = layout->stride * layout->count;
+                layout->alignment = compute_array_alignment(column_layout, rule);
+            }
         } else if constexpr (std::is_same_v<T, ArrayDesc>) {
             auto element_layout = compute_layout(*desc.element_type, rule);
             layout->kind = TypeKind::ARRAY;
@@ -965,7 +994,65 @@ std::shared_ptr<Layout> compute_layout(const TypeDescriptor& type, LayoutRule ru
     return layout;
 }
 
-ScalarType format_scalar_type(Format format)
+const LayoutField& Layout::field(const std::string& name) const {
+    if (kind != TypeKind::STRUCT) {
+        throw std::runtime_error("Layout::field: this layout is not a struct");
+    }
+    for (const auto& f : fields) {
+        if (f.name == name) return f;
+    }
+    throw std::runtime_error("Layout::field: no field named '" + name + "'");
+}
+
+const std::shared_ptr<Layout>& Layouts::index16() {
+    static const std::shared_ptr<Layout> layout = compute_layout(TypeDescriptor::single(Type::UINT16), LayoutRule::Scalar);
+    return layout;
+}
+
+const std::shared_ptr<Layout>& Layouts::index32() {
+    static const std::shared_ptr<Layout> layout = compute_layout(TypeDescriptor::single(Type::UINT32), LayoutRule::Scalar);
+    return layout;
+}
+
+const std::shared_ptr<Layout>& Layouts::position() {
+    static const std::shared_ptr<Layout> layout = compute_layout(TypeDescriptor::single(Type::VEC3), LayoutRule::Scalar);
+    return layout;
+}
+
+const std::shared_ptr<Layout>& Layouts::aabb() {
+    // Matches VkAabbPositionsKHR (6 tightly-packed floats) byte-for-byte
+    // under LayoutRule::Scalar.
+    static const std::shared_ptr<Layout> layout = compute_layout(TypeDescriptor::struct_of({
+        { "min_x", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::FLOAT32)) },
+        { "min_y", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::FLOAT32)) },
+        { "min_z", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::FLOAT32)) },
+        { "max_x", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::FLOAT32)) },
+        { "max_y", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::FLOAT32)) },
+        { "max_z", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::FLOAT32)) },
+    }), LayoutRule::Scalar);
+    return layout;
+}
+
+const std::shared_ptr<Layout>& Layouts::instance() {
+    // Matches VkAccelerationStructureInstanceKHR byte-for-byte under
+    // LayoutRule::Scalar: "transform" is VkTransformMatrixKHR (a plain,
+    // tightly-packed float[3][4], i.e. 3 row-major vec4 rows -- NOT one of
+    // this project's own column-major matrix Types, which wouldn't match
+    // this layout); the two bitfield-packed uint32 words and the trailing
+    // uint64 BLAS reference follow with no padding (56 already being
+    // 8-aligned), for a total of exactly 64 bytes, matching
+    // sizeof(VkAccelerationStructureInstanceKHR).
+    static const std::shared_ptr<Layout> layout = compute_layout(TypeDescriptor::struct_of({
+        { "transform", std::make_shared<TypeDescriptor>(TypeDescriptor::array_of(
+            std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::VEC4)), 3)) },
+        { "instance_custom_index_and_mask", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::UINT32)) },
+        { "instance_shader_binding_table_record_offset_and_flags", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::UINT32)) },
+        { "acceleration_structure_reference", std::make_shared<TypeDescriptor>(TypeDescriptor::single(Type::UINT64)) },
+    }), LayoutRule::Scalar);
+    return layout;
+}
+
+Type format_scalar_type(Format format)
 {
     vk::Format vk_format = (vk::Format) format;
     switch (vk_format)
@@ -977,7 +1064,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR8G8Uint:
         case vk::Format::eR8G8B8Uint:
         case vk::Format::eR8G8B8A8Uint:
-            return ScalarType::UINT8;
+            return Type::UINT8;
 
         // =======================
         // 8-bit SIGNED INT
@@ -986,7 +1073,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR8G8Sint:
         case vk::Format::eR8G8B8Sint:
         case vk::Format::eR8G8B8A8Sint:
-            return ScalarType::INT8;
+            return Type::INT8;
 
         // =======================
         // 8-bit NORMALIZED (treated as float-like)
@@ -999,7 +1086,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR8G8B8A8Snorm:
         case vk::Format::eB8G8R8A8Unorm:
         case vk::Format::eB8G8R8A8Srgb:
-            return ScalarType::FLOAT32; // normalized -> conceptual float
+            return Type::FLOAT32; // normalized -> conceptual float
 
         // =======================
         // 16-bit UNSIGNED INT
@@ -1007,7 +1094,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR16Uint:
         case vk::Format::eR16G16Uint:
         case vk::Format::eR16G16B16A16Uint:
-            return ScalarType::UINT16;
+            return Type::UINT16;
 
         // =======================
         // 16-bit SIGNED INT
@@ -1015,7 +1102,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR16Sint:
         case vk::Format::eR16G16Sint:
         case vk::Format::eR16G16B16A16Sint:
-            return ScalarType::INT16;
+            return Type::INT16;
 
         // =======================
         // 16-bit FLOAT
@@ -1023,7 +1110,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR16Sfloat:
         case vk::Format::eR16G16Sfloat:
         case vk::Format::eR16G16B16A16Sfloat:
-            return ScalarType::FLOAT16;
+            return Type::FLOAT16;
 
         // =======================
         // 32-bit UNSIGNED INT
@@ -1032,7 +1119,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR32G32Uint:
         case vk::Format::eR32G32B32Uint:
         case vk::Format::eR32G32B32A32Uint:
-            return ScalarType::UINT32;
+            return Type::UINT32;
 
         // =======================
         // 32-bit SIGNED INT
@@ -1041,7 +1128,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR32G32Sint:
         case vk::Format::eR32G32B32Sint:
         case vk::Format::eR32G32B32A32Sint:
-            return ScalarType::INT32;
+            return Type::INT32;
 
         // =======================
         // 32-bit FLOAT
@@ -1050,7 +1137,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR32G32Sfloat:
         case vk::Format::eR32G32B32Sfloat:
         case vk::Format::eR32G32B32A32Sfloat:
-            return ScalarType::FLOAT32;
+            return Type::FLOAT32;
 
         // =======================
         // 64-bit FLOAT
@@ -1059,7 +1146,7 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eR64G64Sfloat:
         case vk::Format::eR64G64B64Sfloat:
         case vk::Format::eR64G64B64A64Sfloat:
-            return ScalarType::FLOAT64;
+            return Type::FLOAT64;
 
         // =======================
         // Depth formats (special case)
@@ -1067,16 +1154,16 @@ ScalarType format_scalar_type(Format format)
         case vk::Format::eD16Unorm:
         case vk::Format::eD24UnormS8Uint:
         case vk::Format::eD32Sfloat:
-            return ScalarType::FLOAT32;
+            return Type::FLOAT32;
 
         // =======================
         // Stencil (special, integer)
         // =======================
         case vk::Format::eS8Uint:
-            return ScalarType::UINT8;
+            return Type::UINT8;
 
         default:
-            return ScalarType::UNDEFINED;
+            return Type::UNDEFINED;
     }
 }
 
@@ -1135,6 +1222,10 @@ Resource::Resource(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice
 
 Resource::~Resource() noexcept {
     dispose();
+}
+
+std::uint32_t Resource::device_index() const noexcept {
+    return data_->device()->device_index();
 }
 
 vk::BufferView Buffer::get_view() {
@@ -1253,6 +1344,91 @@ void CommandBuffer::transfer(const std::shared_ptr<Buffer>& source, const std::s
     command_buffer_->command_buffer.copyBuffer(source->vk_buffer(), destination->vk_buffer(), region);
 }
 
+namespace {
+
+// Builds one vk::BufferImageCopy per mip level `image` covers (tightly
+// packed: each mip's region immediately follows the previous one's bytes
+// in the buffer, no row/slice padding), covering every array layer `image`
+// covers in a single region per mip. Shared by
+// Device::create_staging(image) (sizing only, via the returned total) and
+// CommandBuffer::transfer(Image<->Buffer) (the actual copy regions).
+struct ImageCopyPlan {
+    std::vector<vk::BufferImageCopy> regions;
+    std::uint64_t total_bytes = 0;
+};
+
+ImageCopyPlan plan_image_copy(const Image& image, std::uint64_t buffer_offset) {
+    const vk::ImageCreateInfo info = image.vk_image_info();
+    const vk::ImageAspectFlags aspect = is_depth_format(image.format())
+        ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+    const std::uint64_t texel_size = static_cast<std::uint64_t>(formatSize(image.format()));
+    const std::uint64_t layer_count = static_cast<std::uint64_t>(image.array_count());
+
+    ImageCopyPlan plan;
+    plan.regions.reserve(static_cast<std::size_t>(image.mip_count()));
+    std::uint64_t offset = buffer_offset;
+    for (int m = 0; m < image.mip_count(); ++m) {
+        const int mip = image.vk_mip_start() + m;
+        const std::uint32_t w = std::max<std::uint32_t>(1, info.extent.width >> mip);
+        const std::uint32_t h = std::max<std::uint32_t>(1, info.extent.height >> mip);
+        const std::uint32_t d = std::max<std::uint32_t>(1, info.extent.depth >> mip);
+
+        vk::BufferImageCopy region{};
+        region.bufferOffset = static_cast<vk::DeviceSize>(offset);
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource.aspectMask = aspect;
+        region.imageSubresource.mipLevel = static_cast<std::uint32_t>(mip);
+        region.imageSubresource.baseArrayLayer = static_cast<std::uint32_t>(image.vk_array_start());
+        region.imageSubresource.layerCount = static_cast<std::uint32_t>(image.array_count());
+        region.imageOffset = vk::Offset3D{0, 0, 0};
+        region.imageExtent = vk::Extent3D{w, h, d};
+        plan.regions.push_back(region);
+
+        offset += static_cast<std::uint64_t>(w) * h * d * texel_size * layer_count;
+    }
+    plan.total_bytes = offset - buffer_offset;
+    return plan;
+}
+
+} // namespace
+
+// Total byte size of `image` (every mip level/array layer it covers,
+// tightly packed with no row/slice padding) -- the size
+// Device::create_staging(image) allocates and CommandBuffer::transfer
+// (Image<->Buffer) reads/writes.
+std::uint64_t vk_image_byte_size(const Image& image) {
+    return plan_image_copy(image, 0).total_bytes;
+}
+
+void CommandBuffer::transfer(const std::shared_ptr<Image>& source, const std::shared_ptr<Buffer>& destination) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot record a transfer into a closed command buffer");
+    }
+    const ImageCopyPlan plan = plan_image_copy(*source, destination->vk_buffer_offset());
+    if (destination->size() != plan.total_bytes) {
+        throw std::runtime_error("CommandBuffer::transfer: destination buffer size does not match the source image's byte size");
+    }
+    command_buffer_->command_buffer.copyImageToBuffer(
+        source->vk_image(), vk::ImageLayout::eGeneral, destination->vk_buffer(), plan.regions);
+    bound_images_.push_back(source);
+    bound_vertex_index_buffers_.push_back(destination);
+}
+
+void CommandBuffer::transfer(const std::shared_ptr<Buffer>& source, const std::shared_ptr<Image>& destination) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot record a transfer into a closed command buffer");
+    }
+    const ImageCopyPlan plan = plan_image_copy(*destination, source->vk_buffer_offset());
+    if (source->size() != plan.total_bytes) {
+        throw std::runtime_error("CommandBuffer::transfer: source buffer size does not match the destination image's byte size");
+    }
+    command_buffer_->command_buffer.copyBufferToImage(
+        source->vk_buffer(), destination->vk_image(), vk::ImageLayout::eGeneral, plan.regions);
+    bound_images_.push_back(destination);
+    bound_vertex_index_buffers_.push_back(source);
+}
+
 void CommandBuffer::set_pipeline(const std::shared_ptr<Pipeline>& pipeline) {
     if (is_closed()) {
         throw std::runtime_error("Cannot set a pipeline on a closed command buffer");
@@ -1331,13 +1507,18 @@ void CommandBuffer::set_framebuffer(const std::shared_ptr<Framebuffer>& framebuf
     // Every attachment's render pass loadOp is eClear (see vk_Pipeline::vk_close),
     // so a clear value must be provided for each; a plain opaque black is
     // as reasonable a default as any, since there's no per-attachment
-    // clear-color API yet.
+    // clear-color API yet. The depth attachment, if any, is always last
+    // (see vk_Pipeline::vk_close()'s comment) and cleared to 1.0 (the
+    // "farthest" depth) instead.
     std::vector<vk::ClearValue> clear_values(framebuffer->vk_attachment_count());
     for (auto& cv : clear_values) {
         cv.color.float32[0] = 0.0f;
         cv.color.float32[1] = 0.0f;
         cv.color.float32[2] = 0.0f;
         cv.color.float32[3] = 1.0f;
+    }
+    if (framebuffer->vk_has_depth()) {
+        clear_values.back().depthStencil = vk::ClearDepthStencilValue{ 1.0f, 0 };
     }
 
     vk::RenderPassBeginInfo info{};
@@ -1350,6 +1531,7 @@ void CommandBuffer::set_framebuffer(const std::shared_ptr<Framebuffer>& framebuf
 
     command_buffer_->command_buffer.beginRenderPass(info, vk::SubpassContents::eInline);
     render_pass_active_ = true;
+    active_framebuffer_has_depth_ = framebuffer->vk_has_depth();
     // Appended, not overwritten: see bound_pipelines_ above -- the same
     // applies to every framebuffer ever set during this recording.
     bound_framebuffers_.push_back(framebuffer);
@@ -1366,6 +1548,57 @@ void CommandBuffer::set_viewport(float x, float y, float width, float height) {
     };
     command_buffer_->command_buffer.setViewport(0, viewport);
     command_buffer_->command_buffer.setScissor(0, scissor);
+}
+
+namespace {
+vk::CullModeFlags to_vk_cull_mode(CullMode mode) {
+    switch (mode) {
+        case CullMode::NONE: return vk::CullModeFlagBits::eNone;
+        case CullMode::FRONT: return vk::CullModeFlagBits::eFront;
+        case CullMode::BACK: return vk::CullModeFlagBits::eBack;
+        case CullMode::FRONT_AND_BACK: return vk::CullModeFlagBits::eFrontAndBack;
+    }
+    throw std::runtime_error("Invalid CullMode");
+}
+} // namespace
+
+void CommandBuffer::set_cull_mode(CullMode mode) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot set cull mode on a closed command buffer");
+    }
+    if (!device_->vk_extended_dynamic_state_supported()) {
+        throw std::runtime_error("CommandBuffer::set_cull_mode: requires Vulkan 1.3 (extended dynamic state)");
+    }
+    command_buffer_->command_buffer.setCullMode(to_vk_cull_mode(mode));
+}
+
+void CommandBuffer::set_front_face(FrontFace front_face) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot set front face on a closed command buffer");
+    }
+    if (!device_->vk_extended_dynamic_state_supported()) {
+        throw std::runtime_error("CommandBuffer::set_front_face: requires Vulkan 1.3 (extended dynamic state)");
+    }
+    command_buffer_->command_buffer.setFrontFace(
+        front_face == FrontFace::CLOCKWISE ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
+}
+
+void CommandBuffer::set_depth_test(bool enable, bool write_enable, CompareOp compare_op) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot set depth test state on a closed command buffer");
+    }
+    if (!device_->vk_extended_dynamic_state_supported()) {
+        throw std::runtime_error("CommandBuffer::set_depth_test: requires Vulkan 1.3 (extended dynamic state)");
+    }
+    if (!render_pass_active_) {
+        throw std::runtime_error("CommandBuffer::set_depth_test: no active render pass (call set_framebuffer first)");
+    }
+    if (enable && !active_framebuffer_has_depth_) {
+        throw std::runtime_error("CommandBuffer::set_depth_test: the active framebuffer has no depth attachment (see Pipeline::attach_depth)");
+    }
+    command_buffer_->command_buffer.setDepthTestEnable(enable ? VK_TRUE : VK_FALSE);
+    command_buffer_->command_buffer.setDepthWriteEnable(write_enable ? VK_TRUE : VK_FALSE);
+    command_buffer_->command_buffer.setDepthCompareOp(static_cast<vk::CompareOp>(compare_op));
 }
 
 void CommandBuffer::blit_image(const std::shared_ptr<Image>& src, const std::shared_ptr<Image>& dst, Filter filter) {
@@ -1420,9 +1653,9 @@ void CommandBuffer::bind_indices(const std::shared_ptr<Buffer>& index_buffer) {
     }
     const Layout& layout = *index_buffer->element_layout();
     vk::IndexType index_type;
-    if (layout.kind != TypeKind::STRUCT && resolve_component_type(layout) == ScalarType::UINT16) {
+    if (layout.kind != TypeKind::STRUCT && resolve_component_type(layout) == Type::UINT16) {
         index_type = vk::IndexType::eUint16;
-    } else if (layout.kind != TypeKind::STRUCT && resolve_component_type(layout) == ScalarType::UINT32) {
+    } else if (layout.kind != TypeKind::STRUCT && resolve_component_type(layout) == Type::UINT32) {
         index_type = vk::IndexType::eUint32;
     } else {
         throw std::runtime_error("CommandBuffer::bind_indices: index buffer's element_layout must be a scalar UINT16 or UINT32");
@@ -1479,6 +1712,21 @@ void CommandBuffer::release() {
     bound_vertex_index_buffers_.clear();
     bound_images_.clear();
     render_pass_active_ = false;
+}
+
+std::uint32_t CommandBuffer::device_index() const {
+    if (is_released()) throw std::runtime_error("CommandBuffer: already released");
+    return device_->device_index();
+}
+
+EngineType CommandBuffer::engine_type() const {
+    if (is_released()) throw std::runtime_error("CommandBuffer: already released");
+    return engine_->engine_type();
+}
+
+std::uint32_t CommandBuffer::engine_index() const {
+    if (is_released()) throw std::runtime_error("CommandBuffer: already released");
+    return engine_->engine_index();
 }
 
 void vk_Engine::dispose() noexcept {
@@ -1629,6 +1877,10 @@ Engine::Engine(std::shared_ptr<Device> device, std::shared_ptr<vk_Engine> engine
     engine_index_ = index;
 }
 
+std::uint32_t Engine::device_index() const noexcept {
+    return device_->device_index();
+}
+
 void Resource::dispose() {
     data_ = nullptr;
     slice_ = {};
@@ -1686,11 +1938,11 @@ Image::~Image() noexcept {
     }
 }
 
-std::shared_ptr<Buffer> Buffer::cast(ScalarType scalar) const {
+std::shared_ptr<Buffer> Buffer::cast(Type scalar) const {
     if (data_->resource_type() != ResourceType::BUFFER) {
         throw std::runtime_error("Buffer::cast can only be called on buffer resources");
     }
-    auto layout = compute_layout(TypeDescriptor::scalar(scalar), LayoutRule::Scalar);
+    auto layout = compute_layout(TypeDescriptor::single(scalar), LayoutRule::Scalar);
     ResourceSlice view_slice{};
     view_slice.type = ResourceType::BUFFER;
     view_slice.buffer.offset = slice_.buffer.offset;
@@ -1702,9 +1954,9 @@ std::shared_ptr<Buffer> Buffer::cast(Format format) const {
     if (data_->resource_type() != ResourceType::BUFFER) {
         throw std::runtime_error("Buffer::cast can only be called on buffer resources");
     }
-    const ScalarType component_type = format_scalar_type(format);
+    const Type component_type = format_scalar_type(format);
     const int components = static_cast<int>(formatSize(format)) / scalar_type_size(component_type);
-    auto element_type = std::make_shared<TypeDescriptor>(TypeDescriptor::scalar(component_type));
+    auto element_type = std::make_shared<TypeDescriptor>(TypeDescriptor::single(component_type));
     auto layout = compute_layout(TypeDescriptor::array_of(std::move(element_type), components), LayoutRule::Scalar);
     ResourceSlice view_slice{};
     view_slice.type = ResourceType::BUFFER;
@@ -1750,12 +2002,12 @@ DLDevice Buffer::vk_dlpack_device() const noexcept {
 }
 
 namespace {
-    // Leaf scalar component type of `layout`: itself for SCALAR/VECTOR/MATRIX,
-    // or recursively its element's for ARRAY. Throws for STRUCT (and any
-    // layout that somehow has neither a component_type nor an element_layout),
-    // since a struct isn't a single numeric type.
-    ScalarType resolve_component_type(const Layout& layout) {
-        if (layout.component_type != ScalarType::UNDEFINED) {
+    // Leaf scalar component type of `layout`: itself for a SINGLE (scalar,
+    // vector or matrix), or recursively its element's for ARRAY. Throws for
+    // STRUCT (and any layout that somehow has neither a component_type nor
+    // an element_layout), since a struct isn't a single numeric type.
+    Type resolve_component_type(const Layout& layout) {
+        if (layout.component_type != Type::UNDEFINED) {
             return layout.component_type;
         }
         if (layout.element_layout) {
@@ -1765,23 +2017,26 @@ namespace {
     }
 
     // Appends the tensor dimensions (shape + strides, in elements of
-    // `scalar_size`-byte components) contributed by `layout` itself: none for
-    // SCALAR, one for VECTOR, two for MATRIX (columns, rows), and one plus
-    // whatever its element contributes for ARRAY. Throws for STRUCT.
+    // `scalar_size`-byte components) contributed by `layout` itself: none
+    // for a scalar SINGLE, one for a vector SINGLE, two for a matrix SINGLE
+    // (columns, rows), and one plus whatever its element contributes for
+    // ARRAY. Throws for STRUCT.
     void append_tensor_dims(const Layout& layout, std::uint64_t scalar_size,
         std::vector<std::int64_t>& shape, std::vector<std::int64_t>& strides) {
         switch (layout.kind) {
-            case TypeKind::SCALAR:
-                break;
-            case TypeKind::VECTOR:
-                shape.push_back(static_cast<std::int64_t>(layout.size / scalar_size));
-                strides.push_back(1);
-                break;
-            case TypeKind::MATRIX:
-                shape.push_back(static_cast<std::int64_t>(layout.count));
-                shape.push_back(static_cast<std::int64_t>(layout.element_layout->size / scalar_size));
-                strides.push_back(static_cast<std::int64_t>(layout.stride / scalar_size));
-                strides.push_back(1);
+            case TypeKind::SINGLE:
+                if (layout.element_layout) {
+                    // Matrix.
+                    shape.push_back(static_cast<std::int64_t>(layout.count));
+                    shape.push_back(static_cast<std::int64_t>(layout.element_layout->size / scalar_size));
+                    strides.push_back(static_cast<std::int64_t>(layout.stride / scalar_size));
+                    strides.push_back(1);
+                } else if (type_traits(layout.type).rows > 1) {
+                    // Vector.
+                    shape.push_back(static_cast<std::int64_t>(layout.size / scalar_size));
+                    strides.push_back(1);
+                }
+                // Else: plain scalar, no dims contributed.
                 break;
             case TypeKind::ARRAY:
                 shape.push_back(static_cast<std::int64_t>(layout.count));
@@ -1856,40 +2111,114 @@ namespace {
     }
 
     // Reads one scalar of `type` from `ptr`, returned as a plain Python number.
-    pybind11::object read_scalar(const void* ptr, ScalarType type) {
+    pybind11::object read_scalar(const void* ptr, Type type) {
         switch (type) {
-            case ScalarType::BOOL: { std::uint8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v != 0); }
-            case ScalarType::INT8: { std::int8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v); }
-            case ScalarType::UINT8: { std::uint8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v); }
-            case ScalarType::INT16: { std::int16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); }
-            case ScalarType::UINT16: { std::uint16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); }
-            case ScalarType::FLOAT16: { std::uint16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); } // raw bit pattern
-            case ScalarType::INT32: { std::int32_t v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
-            case ScalarType::UINT32: { std::uint32_t v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
-            case ScalarType::FLOAT32: { float v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
-            case ScalarType::INT64: { std::int64_t v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
-            case ScalarType::UINT64: { std::uint64_t v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
-            case ScalarType::FLOAT64: { double v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
+            case Type::BOOL: { std::uint8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v != 0); }
+            case Type::INT8: { std::int8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v); }
+            case Type::UINT8: { std::uint8_t v; std::memcpy(&v, ptr, 1); return pybind11::cast(v); }
+            case Type::INT16: { std::int16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); }
+            case Type::UINT16: { std::uint16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); }
+            case Type::FLOAT16: { std::uint16_t v; std::memcpy(&v, ptr, 2); return pybind11::cast(v); } // raw bit pattern
+            case Type::INT32: { std::int32_t v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
+            case Type::UINT32: { std::uint32_t v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
+            case Type::FLOAT32: { float v; std::memcpy(&v, ptr, 4); return pybind11::cast(v); }
+            case Type::INT64: { std::int64_t v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
+            case Type::UINT64: { std::uint64_t v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
+            case Type::FLOAT64: { double v; std::memcpy(&v, ptr, 8); return pybind11::cast(v); }
             default: throw std::runtime_error("Unsupported scalar type");
         }
     }
 
     // Writes one scalar of `type`, given as a plain Python number, to `ptr`.
-    void write_scalar(void* ptr, ScalarType type, const pybind11::object& value) {
+    void write_scalar(void* ptr, Type type, const pybind11::object& value) {
         switch (type) {
-            case ScalarType::BOOL: { std::uint8_t v = value.cast<bool>() ? 1 : 0; std::memcpy(ptr, &v, 1); return; }
-            case ScalarType::INT8: { auto v = value.cast<std::int8_t>(); std::memcpy(ptr, &v, 1); return; }
-            case ScalarType::UINT8: { auto v = value.cast<std::uint8_t>(); std::memcpy(ptr, &v, 1); return; }
-            case ScalarType::INT16: { auto v = value.cast<std::int16_t>(); std::memcpy(ptr, &v, 2); return; }
-            case ScalarType::UINT16: { auto v = value.cast<std::uint16_t>(); std::memcpy(ptr, &v, 2); return; }
-            case ScalarType::FLOAT16: { auto v = value.cast<std::uint16_t>(); std::memcpy(ptr, &v, 2); return; } // raw bit pattern
-            case ScalarType::INT32: { auto v = value.cast<std::int32_t>(); std::memcpy(ptr, &v, 4); return; }
-            case ScalarType::UINT32: { auto v = value.cast<std::uint32_t>(); std::memcpy(ptr, &v, 4); return; }
-            case ScalarType::FLOAT32: { auto v = value.cast<float>(); std::memcpy(ptr, &v, 4); return; }
-            case ScalarType::INT64: { auto v = value.cast<std::int64_t>(); std::memcpy(ptr, &v, 8); return; }
-            case ScalarType::UINT64: { auto v = value.cast<std::uint64_t>(); std::memcpy(ptr, &v, 8); return; }
-            case ScalarType::FLOAT64: { auto v = value.cast<double>(); std::memcpy(ptr, &v, 8); return; }
+            case Type::BOOL: { std::uint8_t v = value.cast<bool>() ? 1 : 0; std::memcpy(ptr, &v, 1); return; }
+            case Type::INT8: { auto v = value.cast<std::int8_t>(); std::memcpy(ptr, &v, 1); return; }
+            case Type::UINT8: { auto v = value.cast<std::uint8_t>(); std::memcpy(ptr, &v, 1); return; }
+            case Type::INT16: { auto v = value.cast<std::int16_t>(); std::memcpy(ptr, &v, 2); return; }
+            case Type::UINT16: { auto v = value.cast<std::uint16_t>(); std::memcpy(ptr, &v, 2); return; }
+            case Type::FLOAT16: { auto v = value.cast<std::uint16_t>(); std::memcpy(ptr, &v, 2); return; } // raw bit pattern
+            case Type::INT32: { auto v = value.cast<std::int32_t>(); std::memcpy(ptr, &v, 4); return; }
+            case Type::UINT32: { auto v = value.cast<std::uint32_t>(); std::memcpy(ptr, &v, 4); return; }
+            case Type::FLOAT32: { auto v = value.cast<float>(); std::memcpy(ptr, &v, 4); return; }
+            case Type::INT64: { auto v = value.cast<std::int64_t>(); std::memcpy(ptr, &v, 8); return; }
+            case Type::UINT64: { auto v = value.cast<std::uint64_t>(); std::memcpy(ptr, &v, 8); return; }
+            case Type::FLOAT64: { auto v = value.cast<double>(); std::memcpy(ptr, &v, 8); return; }
             default: throw std::runtime_error("Unsupported scalar type");
+        }
+    }
+
+    // Imports the `vk.math3d` module (mirrors module_install_dir()'s use of
+    // py::module_::import for a different purpose). Not cached in a static:
+    // a static py::object's destructor runs at process-exit time, which can
+    // fire after Py_Finalize and crash trying to Py_DECREF with no GIL/
+    // interpreter left. Cheap to call repeatedly regardless -- Python's own
+    // sys.modules cache makes a re-import of an already-imported module a
+    // simple dict lookup. Returns an empty (falsy) object if the import
+    // fails for any reason; callers fall back to raw bytes in that case.
+    pybind11::object vk_math3d_module() {
+        try {
+            return pybind11::module_::import("vk.math3d");
+        } catch (const pybind11::error_already_set&) {
+            return pybind11::object();
+        }
+    }
+
+    // Name of the vk.math3d class matching a VECTOR field (e.g. FLOAT32/3
+    // -> "vec3", INT32/2 -> "ivec2"), or "" if there's no equivalent
+    // math3d type (math3d only covers the GLSL-like float/int/uint/bool
+    // scalar types, 2 to 4 components).
+    std::string vk_math3d_vector_name(Type component_type, int components) {
+        if (components < 2 || components > 4) return {};
+        const char* prefix;
+        switch (component_type) {
+            case Type::FLOAT32: prefix = "vec"; break;
+            case Type::INT32: prefix = "ivec"; break;
+            case Type::UINT32: prefix = "uvec"; break;
+            case Type::BOOL: prefix = "bvec"; break;
+            default: return {};
+        }
+        return prefix + std::to_string(components);
+    }
+
+    // Name of the vk.math3d class matching a MATRIX field, or "" if there's
+    // no equivalent (math3d, like GLSL, only has float matrices).
+    std::string vk_math3d_matrix_name(Type component_type, int columns, int rows) {
+        if (component_type != Type::FLOAT32) return {};
+        if (columns < 2 || columns > 4 || rows < 2 || rows > 4) return {};
+        return "mat" + std::to_string(columns) + (columns == rows ? "" : "x" + std::to_string(rows));
+    }
+
+    // Calls a Python callable with a dynamically-sized tuple of positional
+    // arguments -- pybind11 has no C++ spelling for Python's `f(*args)`.
+    pybind11::object vk_call_with_args(const pybind11::object& callable, const pybind11::tuple& args) {
+        pybind11::object result = pybind11::reinterpret_steal<pybind11::object>(PyObject_CallObject(callable.ptr(), args.ptr()));
+        if (!result) throw pybind11::error_already_set();
+        return result;
+    }
+
+    // Recursively flattens `value` -- expected to be nested `shape.size()`
+    // levels deep, each level of length `shape[dim]` (matching
+    // append_tensor_dims's shape convention: one dim of components for a
+    // vector, [columns, rows] for a matrix) -- into `out`, `scalar_size`
+    // bytes at a time via write_scalar. Accepts any object supporting the
+    // Python sequence protocol at each level: a math3d vec*/mat* (whose
+    // `__getitem__` yields components, or columns for a matrix), or a
+    // plain nested Python list/tuple.
+    void vk_flatten_sequence_into(
+        const pybind11::object& value, Type component_type, std::uint64_t scalar_size,
+        const std::vector<std::int64_t>& shape, std::size_t dim, char*& out) {
+        if (dim == shape.size()) {
+            write_scalar(out, component_type, value);
+            out += scalar_size;
+            return;
+        }
+        pybind11::sequence seq = value.cast<pybind11::sequence>();
+        if (static_cast<std::int64_t>(seq.size()) != shape[dim]) {
+            throw std::runtime_error("Buffer::write: source sequence size does not match the field's shape");
+        }
+        for (auto item : seq) {
+            vk_flatten_sequence_into(pybind11::reinterpret_borrow<pybind11::object>(item), component_type, scalar_size, shape, dim + 1, out);
         }
     }
 }
@@ -1909,11 +2238,11 @@ pybind11::object Buffer::vk_dlpack() const {
     // field(), just for the buffer's own top-level layout instead of one of
     // its fields (with instance_count = size() / element_layout()->aligned_size
     // as the outer dimension).
-    ScalarType dtype_scalar;
+    Type dtype_scalar;
     std::vector<std::int64_t> shape;
     std::vector<std::int64_t> strides;
     if (layout_->kind == TypeKind::STRUCT) {
-        dtype_scalar = ScalarType::UINT8;
+        dtype_scalar = Type::UINT8;
         shape = { static_cast<std::int64_t>(size()) };
         strides = { 1 };
     } else {
@@ -1969,7 +2298,7 @@ pybind11::object Buffer::field(const LayoutField& field) const {
         throw std::runtime_error("A DEVICE tensor was requested but the external pointer is unavailable");
     }
 
-    const ScalarType component_type = resolve_component_type(*field.layout);
+    const Type component_type = resolve_component_type(*field.layout);
     const std::uint64_t scalar_size = static_cast<std::uint64_t>(scalar_type_size(component_type));
 
     std::vector<std::int64_t> shape;
@@ -2027,11 +2356,13 @@ pybind11::object Buffer::read(const LayoutField& field) const {
     char* ptr = vk_resolve_field_ptr(field);
     const Layout& layout = *field.layout;
 
-    if (layout.kind == TypeKind::SCALAR) {
+    const bool is_matrix = layout.kind == TypeKind::SINGLE && layout.element_layout != nullptr;
+    const bool is_vector = layout.kind == TypeKind::SINGLE && !is_matrix && type_traits(layout.type).rows > 1;
+    if (layout.kind == TypeKind::SINGLE && !is_matrix && !is_vector) {
         return read_scalar(ptr, layout.component_type);
     }
 
-    const ScalarType component_type = resolve_component_type(layout);
+    const Type component_type = resolve_component_type(layout);
     const std::uint64_t scalar_size = static_cast<std::uint64_t>(scalar_type_size(component_type));
     std::vector<std::int64_t> shape, strides;
     append_tensor_dims(layout, scalar_size, shape, strides);
@@ -2040,6 +2371,31 @@ pybind11::object Buffer::read(const LayoutField& field) const {
 
     std::string packed(static_cast<std::size_t>(total_elements * scalar_size), '\0');
     copy_field_elements(ptr, packed.data(), scalar_size, shape, strides, /*strided_to_tight=*/true);
+
+    // A vector or matrix field is returned as the matching vk.math3d
+    // vec*/mat* object (e.g. FLOAT32 vec3 -> vk.math3d.vec3, INT32 vec2 ->
+    // ivec2) when one exists, instead of raw bytes.
+    std::string type_name;
+    if (is_vector) {
+        type_name = vk_math3d_vector_name(component_type, static_cast<int>(total_elements));
+    } else if (is_matrix) {
+        type_name = vk_math3d_matrix_name(
+            component_type, static_cast<int>(layout.count),
+            static_cast<int>(layout.element_layout->size / scalar_size));
+    }
+    if (!type_name.empty()) {
+        pybind11::object module = vk_math3d_module();
+        if (module && pybind11::hasattr(module, type_name.c_str())) {
+            pybind11::object cls = module.attr(type_name.c_str());
+            pybind11::tuple args(static_cast<std::size_t>(total_elements));
+            const char* p = packed.data();
+            for (std::uint64_t i = 0; i < total_elements; ++i) {
+                args[static_cast<std::size_t>(i)] = read_scalar(p, component_type);
+                p += scalar_size;
+            }
+            return vk_call_with_args(cls, args);
+        }
+    }
     return pybind11::bytes(packed);
 }
 
@@ -2047,12 +2403,14 @@ void Buffer::write(const LayoutField& field, const pybind11::object& value) cons
     char* ptr = vk_resolve_field_ptr(field);
     const Layout& layout = *field.layout;
 
-    if (layout.kind == TypeKind::SCALAR) {
+    const bool is_matrix = layout.kind == TypeKind::SINGLE && layout.element_layout != nullptr;
+    const bool is_vector = layout.kind == TypeKind::SINGLE && !is_matrix && type_traits(layout.type).rows > 1;
+    if (layout.kind == TypeKind::SINGLE && !is_matrix && !is_vector) {
         write_scalar(ptr, layout.component_type, value);
         return;
     }
 
-    const ScalarType component_type = resolve_component_type(layout);
+    const Type component_type = resolve_component_type(layout);
     const std::uint64_t scalar_size = static_cast<std::uint64_t>(scalar_type_size(component_type));
     std::vector<std::int64_t> shape, strides;
     append_tensor_dims(layout, scalar_size, shape, strides);
@@ -2101,9 +2459,25 @@ void Buffer::write(const LayoutField& field, const pybind11::object& value) cons
         return;
     }
 
+    // A math3d-style vec*/mat* object, or any plain (possibly nested, for
+    // a matrix) Python sequence of numbers: written element-by-element via
+    // write_scalar, so int/uint/bool components convert correctly
+    // regardless of the source's own representation. Only reached for
+    // vector/matrix fields (an ARRAY-of-scalars field still requires a
+    // buffer-protocol/DLPack source, above).
+    if ((is_vector || is_matrix)
+        && pybind11::hasattr(value, "__len__") && pybind11::hasattr(value, "__getitem__")) {
+        std::string packed(static_cast<std::size_t>(total_bytes), '\0');
+        char* out = packed.data();
+        vk_flatten_sequence_into(value, component_type, scalar_size, shape, 0, out);
+        copy_field_elements(ptr, packed.data(), scalar_size, shape, strides, /*strided_to_tight=*/false);
+        return;
+    }
+
     throw std::runtime_error(
-        "Buffer::write: value must be a plain number for a scalar field, or a Python buffer "
-        "object / DLPack-compatible object for a vector, matrix or array-of-scalars field");
+        "Buffer::write: value must be a plain number for a scalar field, a vk.math3d vec*/mat* "
+        "object or nested Python sequence for a vector/matrix field, or a Python buffer object / "
+        "DLPack-compatible object for a vector, matrix or array-of-scalars field");
 }
 
 std::shared_ptr<Image> Image::cast_format(Format new_format) const {
@@ -2142,6 +2516,93 @@ std::shared_ptr<Image> Image::slice(int mip_start, int mip_count, int array_star
     return std::make_shared<Image>(data_, view_slice);
 }
 
+namespace {
+
+// Best-effort PCI vendor ID -> friendly name, for the vendors this project
+// is realistically tested against; falls back to a hex string for
+// anything else (still useful, just not a friendly name).
+std::string vk_vendor_name(std::uint32_t vendor_id) {
+    switch (vendor_id) {
+        case 0x1002: return "AMD";
+        case 0x10DE: return "NVIDIA";
+        case 0x8086: return "Intel";
+        case 0x13B5: return "ARM";
+        case 0x5143: return "Qualcomm";
+        case 0x1010: return "ImgTec";
+        case 0x106B: return "Apple";
+        default: {
+            std::ostringstream oss;
+            oss << "0x" << std::hex << vendor_id;
+            return oss.str();
+        }
+    }
+}
+
+std::string vk_device_type_name(vk::PhysicalDeviceType type) {
+    switch (type) {
+        case vk::PhysicalDeviceType::eIntegratedGpu: return "integrated_gpu";
+        case vk::PhysicalDeviceType::eDiscreteGpu: return "discrete_gpu";
+        case vk::PhysicalDeviceType::eVirtualGpu: return "virtual_gpu";
+        case vk::PhysicalDeviceType::eCpu: return "cpu";
+        default: return "other";
+    }
+}
+
+std::string vk_format_api_version(std::uint32_t version) {
+    std::ostringstream oss;
+    oss << VK_API_VERSION_MAJOR(version) << "." << VK_API_VERSION_MINOR(version) << "." << VK_API_VERSION_PATCH(version);
+    return oss.str();
+}
+
+} // namespace
+
+std::vector<DeviceInfo> query_device_infos() {
+    // Same instance-creation recipe as Device::Device(), minus the
+    // layers/surface extensions (irrelevant for a query-only instance
+    // that's destroyed before this function returns).
+    uint32_t loader_version = VK_API_VERSION_1_1;
+    if (vkEnumerateInstanceVersion(&loader_version) != VK_SUCCESS) {
+        loader_version = VK_API_VERSION_1_1;
+    }
+    const uint32_t api_version = std::min(loader_version, VK_API_VERSION_1_3);
+    vk::ApplicationInfo app("vk", 1, "vk", 1, api_version);
+    vk::InstanceCreateInfo ci{};
+    ci.pApplicationInfo = &app;
+
+    vk::Instance instance = vk::createInstance(ci);
+    std::vector<DeviceInfo> result;
+    try {
+        const auto gpus = instance.enumeratePhysicalDevices();
+        result.reserve(gpus.size());
+        for (std::uint32_t i = 0; i < gpus.size(); ++i) {
+            const vk::PhysicalDeviceProperties props = gpus[i].getProperties();
+            const vk::PhysicalDeviceMemoryProperties mem_props = gpus[i].getMemoryProperties();
+            std::uint64_t vram_bytes = 0;
+            for (std::uint32_t h = 0; h < mem_props.memoryHeapCount; ++h) {
+                if (mem_props.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                    vram_bytes += mem_props.memoryHeaps[h].size;
+                }
+            }
+            DeviceInfo info{};
+            info.index = i;
+            info.name = std::string(props.deviceName.data());
+            info.vendor = vk_vendor_name(props.vendorID);
+            info.vendor_id = props.vendorID;
+            info.device_id = props.deviceID;
+            info.device_type = vk_device_type_name(props.deviceType);
+            info.api_version = vk_format_api_version(props.apiVersion);
+            info.driver_version = props.driverVersion;
+            info.vram_bytes = vram_bytes;
+            result.push_back(std::move(info));
+        }
+    } catch (...) {
+        instance.destroy();
+        throw;
+    }
+    instance.destroy();
+    return result;
+}
+
 Device::Device(uint32_t device_index, bool enable_validation_layers) {
     device_index_ = device_index;
     uint32_t loader_version = VK_API_VERSION_1_1;
@@ -2151,6 +2612,11 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
 
     const uint32_t api_version = std::min(loader_version, VK_API_VERSION_1_3);
     vk::ApplicationInfo app("vk", 1, "vk", 1, api_version);
+    // Extended dynamic state (dynamic cull mode/front face/depth test/depth
+    // write/depth compare op -- see CommandBuffer::set_cull_mode/
+    // set_front_face/set_depth_test) is core, unconditional functionality
+    // from Vulkan 1.3 onwards; no separate extension/feature check needed.
+    extended_dynamic_state_supported_ = api_version >= VK_API_VERSION_1_3;
 
     std::vector<const char*> enabled_layers;
     const std::vector<VkLayerProperties> instance_layers = enumerate_instance_layers();
@@ -2241,6 +2707,13 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     // Gates Device::create_window: without VK_KHR_swapchain there is no
     // way to present anything.
     swapchain_supported_ = supports_extension(supported_extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    // Gates Device::create_ads() and the acceleration-structure-related
+    // buffer usage flags (see full_buffer_usage_flags()).
+    // VK_KHR_deferred_host_operations is VK_KHR_acceleration_structure's own
+    // hard dependency.
+    acceleration_structure_supported_ =
+        supports_extension(supported_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+        supports_extension(supported_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
 
     vk::PhysicalDeviceProperties2 properties2{};
     vk::PhysicalDeviceVulkan12Properties vulkan12_properties{};
@@ -2301,6 +2774,12 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     dci.ppEnabledExtensionNames = enabled_extensions.empty() ? nullptr : enabled_extensions.data();
 
     device_ = physical_.createDevice(dci);
+
+    // See Device::vk_dynamic_dispatch()'s comment: acceleration-structure
+    // entry points aren't guaranteed to be resolvable as directly-linked
+    // symbols, so load them dynamically here instead.
+    dynamic_dispatch_.init(static_cast<VkInstance>(instance_), vkGetInstanceProcAddr,
+        static_cast<VkDevice>(device_), vkGetDeviceProcAddr);
 }
 
 vk::PhysicalDevice Device::physical_device() const noexcept {
@@ -2574,20 +3053,21 @@ void vk_Pipeline::vk_vertex_layout(int start_location, const Layout& layout) {
     int location = start_location;
     for (const auto& field : layout.fields) {
         const Layout& field_layout = *field.layout;
-        if (field_layout.kind == TypeKind::MATRIX) {
+        if (field_layout.kind != TypeKind::SINGLE) {
+            throw std::runtime_error("Pipeline::vertex_layout: fields must be scalar, vector or matrix");
+        }
+        if (field_layout.element_layout) {
+            // Matrix: one vertex attribute location per column.
             const int column_components = static_cast<int>(field_layout.element_layout->size / scalar_type_size(field_layout.component_type));
             const Format fmt = vertex_attribute_format(field_layout.component_type, column_components);
             for (std::uint64_t c = 0; c < field_layout.count; ++c) {
                 binding.fields.push_back({ location++, (vk::Format)fmt, field.offset + c * field_layout.stride });
             }
-        } else if (field_layout.kind == TypeKind::SCALAR || field_layout.kind == TypeKind::VECTOR) {
-            const int components = field_layout.kind == TypeKind::SCALAR
-                ? 1
-                : static_cast<int>(field_layout.size / scalar_type_size(field_layout.component_type));
+        } else {
+            // Scalar or vector.
+            const int components = type_traits(field_layout.type).rows;
             const Format fmt = vertex_attribute_format(field_layout.component_type, components);
             binding.fields.push_back({ location++, (vk::Format)fmt, field.offset });
-        } else {
-            throw std::runtime_error("Pipeline::vertex_layout: fields must be scalar, vector or matrix");
         }
     }
     vertex_bindings_.push_back(std::move(binding));
@@ -2601,6 +3081,19 @@ int vk_Pipeline::vk_attach(int slot, Format format) {
     }
     attachments_.push_back({ slot, format });
     return slot;
+}
+
+void vk_Pipeline::vk_attach_depth(Format format) {
+    if (closed_) throw std::runtime_error("Pipeline::attach_depth: pipeline is already closed");
+    if (type_ != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::attach_depth: only valid for RASTERIZATION pipelines");
+    if (!is_depth_format(format)) throw std::runtime_error("Pipeline::attach_depth: format must be one of the Format::Depth* values");
+    if (depth_attachment_format_.has_value()) throw std::runtime_error("Pipeline::attach_depth: a depth attachment is already declared");
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Pipeline::attach_depth: device has been disposed");
+    if (!device->vk_extended_dynamic_state_supported()) {
+        throw std::runtime_error("Pipeline::attach_depth: requires Vulkan 1.3 (extended dynamic state)");
+    }
+    depth_attachment_format_ = format;
 }
 
 void vk_Pipeline::vk_set_local_size(std::uint32_t x, std::uint32_t y, std::uint32_t z) {
@@ -2710,10 +3203,32 @@ void vk_Pipeline::vk_close() {
             attachment_descs.push_back(desc);
             attachment_refs.push_back({ static_cast<std::uint32_t>(i), vk::ImageLayout::eColorAttachmentOptimal });
         }
+
+        // Depth/stencil attachment, if attach_depth() was called: appended
+        // after every color attachment, so its render-pass attachment index
+        // is always attachment_descs.size() at this point -- Pipeline::
+        // create_framebuffer() and CommandBuffer::set_framebuffer() rely on
+        // this same "depth is last" ordering.
+        vk::AttachmentReference depth_ref{};
+        if (depth_attachment_format_) {
+            vk::AttachmentDescription desc{};
+            desc.format = (vk::Format)*depth_attachment_format_;
+            desc.samples = vk::SampleCountFlagBits::e1;
+            desc.loadOp = vk::AttachmentLoadOp::eClear;
+            desc.storeOp = vk::AttachmentStoreOp::eStore;
+            desc.stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+            desc.stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+            desc.initialLayout = vk::ImageLayout::eUndefined;
+            desc.finalLayout = vk::ImageLayout::eGeneral;
+            depth_ref = { static_cast<std::uint32_t>(attachment_descs.size()), vk::ImageLayout::eDepthStencilAttachmentOptimal };
+            attachment_descs.push_back(desc);
+        }
+
         vk::SubpassDescription subpass{};
         subpass.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
         subpass.colorAttachmentCount = static_cast<std::uint32_t>(attachment_refs.size());
         subpass.pColorAttachments = attachment_refs.data();
+        if (depth_attachment_format_) subpass.pDepthStencilAttachment = &depth_ref;
 
         vk::RenderPassCreateInfo render_pass_info{};
         render_pass_info.attachmentCount = static_cast<std::uint32_t>(attachment_descs.size());
@@ -2771,7 +3286,34 @@ void vk_Pipeline::vk_close() {
         color_blend.attachmentCount = static_cast<std::uint32_t>(blend_attachments.size());
         color_blend.pAttachments = blend_attachments.data();
 
-        std::array<vk::DynamicState, 2> dynamic_states{ vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+        // Depth test enable/write/compare-op are never baked into the
+        // pipeline -- only ever set dynamically, via
+        // CommandBuffer::set_depth_test() -- so the values here are just
+        // placeholders, overridden at draw time. depthBoundsTestEnable/
+        // stencilTestEnable stay off: this project doesn't implement depth
+        // bounds or stencil testing.
+        vk::PipelineDepthStencilStateCreateInfo depth_stencil{};
+        depth_stencil.depthTestEnable = VK_TRUE;
+        depth_stencil.depthWriteEnable = VK_TRUE;
+        depth_stencil.depthCompareOp = vk::CompareOp::eLess;
+        depth_stencil.minDepthBounds = 0.0f;
+        depth_stencil.maxDepthBounds = 1.0f;
+
+        // Extended dynamic state (cull mode/front face always, when
+        // supported; depth test/write/compare op additionally when a depth
+        // attachment was declared) -- see
+        // Device::vk_extended_dynamic_state_supported()'s comment.
+        const bool extended_dynamic_state = device->vk_extended_dynamic_state_supported();
+        std::vector<vk::DynamicState> dynamic_states{ vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+        if (extended_dynamic_state) {
+            dynamic_states.push_back(vk::DynamicState::eCullMode);
+            dynamic_states.push_back(vk::DynamicState::eFrontFace);
+            if (depth_attachment_format_) {
+                dynamic_states.push_back(vk::DynamicState::eDepthTestEnable);
+                dynamic_states.push_back(vk::DynamicState::eDepthWriteEnable);
+                dynamic_states.push_back(vk::DynamicState::eDepthCompareOp);
+            }
+        }
         vk::PipelineDynamicStateCreateInfo dynamic_state{};
         dynamic_state.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
         dynamic_state.pDynamicStates = dynamic_states.data();
@@ -2785,6 +3327,7 @@ void vk_Pipeline::vk_close() {
         info.pRasterizationState = &rasterization;
         info.pMultisampleState = &multisample;
         info.pColorBlendState = &color_blend;
+        info.pDepthStencilState = depth_attachment_format_ ? &depth_stencil : nullptr;
         info.pDynamicState = &dynamic_state;
         info.layout = pipeline_layout_;
         info.renderPass = render_pass_;
@@ -2824,12 +3367,20 @@ const vk_DescriptorBinding& vk_Pipeline::vk_binding(int layout_id) const {
     return bindings_[static_cast<std::size_t>(layout_id)];
 }
 
-std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<AttachHandle, std::shared_ptr<Image>>> attachments) {
+std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(
+    std::vector<std::pair<AttachHandle, std::shared_ptr<Image>>> attachments, std::shared_ptr<Image> depth_image) {
     if (!pipeline_->is_closed()) throw std::runtime_error("Pipeline::create_framebuffer: pipeline must be closed first");
     if (pipeline_->type() != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::create_framebuffer: only valid for RASTERIZATION pipelines");
+    if (pipeline_->vk_has_depth_attachment() != (depth_image != nullptr)) {
+        throw std::runtime_error(
+            pipeline_->vk_has_depth_attachment()
+                ? "Pipeline::create_framebuffer: this pipeline declared a depth attachment (attach_depth()); depth_image is required"
+                : "Pipeline::create_framebuffer: this pipeline declared no depth attachment; depth_image must not be provided");
+    }
 
     const auto& attachment_descs = pipeline_->vk_attachments();
-    std::vector<vk::ImageView> views(attachment_descs.size());
+    const bool has_depth = depth_image != nullptr;
+    std::vector<vk::ImageView> views(attachment_descs.size() + (has_depth ? 1 : 0));
     std::vector<bool> filled(attachment_descs.size(), false);
     std::uint32_t width = 0, height = 0;
 
@@ -2856,6 +3407,21 @@ std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<
         if (!f) throw std::runtime_error("Pipeline::create_framebuffer: missing an image for one of the declared attachments");
     }
 
+    if (has_depth) {
+        if (depth_image->format() != pipeline_->vk_depth_attachment_format()) {
+            throw std::runtime_error("Pipeline::create_framebuffer: depth_image format does not match attach_depth()'s declared format");
+        }
+        const vk::Extent3D extent = depth_image->vk_image_info().extent;
+        if (width != 0 && (width != extent.width || height != extent.height)) {
+            throw std::runtime_error("Pipeline::create_framebuffer: depth_image dimensions do not match the color attachments");
+        }
+        width = extent.width;
+        height = extent.height;
+        // Always last -- see vk_Pipeline::vk_close()'s comment on depth
+        // attachment ordering.
+        views.back() = depth_image->get_view();
+    }
+
     vk::FramebufferCreateInfo info{};
     info.renderPass = pipeline_->vk_render_pass();
     info.attachmentCount = static_cast<std::uint32_t>(views.size());
@@ -2866,7 +3432,7 @@ std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(std::vector<std::pair<
 
     vk::Framebuffer framebuffer = device_->logical_device().createFramebuffer(info);
     auto vk_fb = std::make_shared<vk_Framebuffer>(
-        device_, framebuffer, pipeline_->vk_render_pass(), static_cast<std::uint32_t>(views.size()), width, height);
+        device_, framebuffer, pipeline_->vk_render_pass(), static_cast<std::uint32_t>(views.size()), width, height, has_depth);
     device_->vk_register_framebuffer(vk_fb);
     return std::make_shared<Framebuffer>(std::move(vk_fb));
 }
@@ -2877,10 +3443,20 @@ std::shared_ptr<DescriptorSet> Pipeline::create_descriptor_set(int set) {
     return std::make_shared<DescriptorSet>(std::move(vk_ds));
 }
 
+std::uint32_t Pipeline::device_index() const noexcept {
+    return device_->device_index();
+}
+
 vk_Framebuffer::vk_Framebuffer(std::weak_ptr<Device> device, vk::Framebuffer framebuffer, vk::RenderPass render_pass,
-    std::uint32_t attachment_count, std::uint32_t width, std::uint32_t height) noexcept
+    std::uint32_t attachment_count, std::uint32_t width, std::uint32_t height, bool has_depth) noexcept
     : device_(std::move(device)), framebuffer_(framebuffer), render_pass_(render_pass),
-      attachment_count_(attachment_count), width_(width), height_(height) {}
+      attachment_count_(attachment_count), width_(width), height_(height), has_depth_(has_depth) {}
+
+std::uint32_t vk_Framebuffer::device_index() const {
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Framebuffer: device is disposed");
+    return device->device_index();
+}
 
 void vk_Framebuffer::dispose() noexcept {
     if (!framebuffer_) return;
@@ -2889,6 +3465,63 @@ void vk_Framebuffer::dispose() noexcept {
         device->logical_device().destroyFramebuffer(framebuffer_);
     }
     framebuffer_ = nullptr;
+}
+
+vk_Sampler::vk_Sampler(std::weak_ptr<Device> device, vk::Sampler sampler) noexcept
+    : device_(std::move(device)), sampler_(sampler) {}
+
+std::uint32_t vk_Sampler::device_index() const {
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Sampler: device is disposed");
+    return device->device_index();
+}
+
+void vk_Sampler::dispose() noexcept {
+    if (!sampler_) return;
+    auto device = device_.lock();
+    if (device && !device->is_disposed()) {
+        device->logical_device().destroySampler(sampler_);
+    }
+    sampler_ = nullptr;
+}
+
+vk_AccelerationStructure::vk_AccelerationStructure(std::weak_ptr<Device> device, vk::AccelerationStructureKHR handle,
+    vk::Buffer storage_buffer, vk::DeviceMemory storage_memory,
+    vk::AccelerationStructureTypeKHR type, std::uint64_t build_scratch_size) noexcept
+    : device_(std::move(device)), handle_(handle), storage_buffer_(storage_buffer), storage_memory_(storage_memory),
+      type_(type), build_scratch_size_(build_scratch_size) {}
+
+void vk_AccelerationStructure::dispose() noexcept {
+    if (!handle_) return;
+    auto device = device_.lock();
+    if (device && !device->is_disposed()) {
+        vk::Device dev = device->logical_device();
+        dev.destroyAccelerationStructureKHR(handle_, nullptr, device->vk_dynamic_dispatch());
+        if (storage_buffer_) dev.destroyBuffer(storage_buffer_);
+        if (storage_memory_) dev.freeMemory(storage_memory_);
+    }
+    handle_ = nullptr;
+    storage_buffer_ = nullptr;
+    storage_memory_ = nullptr;
+}
+
+std::uint64_t vk_AccelerationStructure::vk_device_address() const {
+    if (device_address_ != 0) return device_address_;
+    auto device = device_.lock();
+    if (!device || device->is_disposed() || !handle_) {
+        throw std::runtime_error("AccelerationStructure::device_address: acceleration structure is disposed");
+    }
+    vk::AccelerationStructureDeviceAddressInfoKHR info{};
+    info.accelerationStructure = handle_;
+    device_address_ = static_cast<std::uint64_t>(
+        device->logical_device().getAccelerationStructureAddressKHR(info, device->vk_dynamic_dispatch()));
+    return device_address_;
+}
+
+std::uint32_t vk_AccelerationStructure::device_index() const {
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("AccelerationStructure: device is disposed");
+    return device->device_index();
 }
 
 namespace {
@@ -2952,8 +3585,8 @@ void glfw_release() {
 } // namespace
 
 vk_Window::vk_Window(std::shared_ptr<Device> device, std::uint32_t width, std::uint32_t height,
-    const std::string& title, Format format, std::uint32_t frames_on_the_fly)
-    : device_(device), format_(format), frames_on_the_fly_(std::max<std::uint32_t>(frames_on_the_fly, 1)) {
+    const std::string& title, Format format, std::uint32_t frames_on_the_fly, bool vsync)
+    : device_(device), format_(format), frames_on_the_fly_(std::max<std::uint32_t>(frames_on_the_fly, 1)), vsync_(vsync) {
     if (!device->vk_swapchain_supported()) {
         throw std::runtime_error("Window: VK_KHR_swapchain is not supported/enabled on this device");
     }
@@ -3240,21 +3873,21 @@ namespace {
 // former: their raw bytes are copied directly into image_target via
 // vkCmdCopyBufferToImage, and tensor_target's dtype/shape are exposed
 // as-is to the caller (e.g. via DLPack).
-std::pair<ScalarType, std::uint64_t> physical_pixel_layout(Format format) {
+std::pair<Type, std::uint64_t> physical_pixel_layout(Format format) {
     switch (static_cast<vk::Format>(format)) {
         case vk::Format::eR8Unorm:
         case vk::Format::eR8G8Unorm:
         case vk::Format::eR8G8B8Unorm:
         case vk::Format::eR8G8B8A8Unorm:
         case vk::Format::eB8G8R8A8Unorm:
-            return { ScalarType::UINT8, formatSize(format) };
+            return { Type::UINT8, formatSize(format) };
         case vk::Format::eR8Snorm:
         case vk::Format::eR8G8Snorm:
         case vk::Format::eR8G8B8Snorm:
         case vk::Format::eR8G8B8A8Snorm:
-            return { ScalarType::INT8, formatSize(format) };
+            return { Type::INT8, formatSize(format) };
         default: {
-            const ScalarType scalar = format_scalar_type(format);
+            const Type scalar = format_scalar_type(format);
             return { scalar, formatSize(format) / scalar_type_size(scalar) };
         }
     }
@@ -3316,8 +3949,18 @@ void vk_Window::create_swapchain() {
     vk_format_ = swapchain_format;
 
     vk::PresentModeKHR present_mode = vk::PresentModeKHR::eFifo; // always supported, vsync'd
-    for (const auto& mode : present_modes) {
-        if (mode == vk::PresentModeKHR::eFifo) { present_mode = mode; break; }
+    if (!vsync_) {
+        // Prefer Mailbox (uncapped, triple-buffered, doesn't tear) over
+        // Immediate (uncapped, can tear); silently falls back to the
+        // vsync'd Fifo above if this surface supports neither.
+        for (const auto& mode : present_modes) {
+            if (mode == vk::PresentModeKHR::eMailbox) { present_mode = mode; break; }
+        }
+        if (present_mode == vk::PresentModeKHR::eFifo) {
+            for (const auto& mode : present_modes) {
+                if (mode == vk::PresentModeKHR::eImmediate) { present_mode = mode; break; }
+            }
+        }
     }
 
     vk::Extent2D extent;
@@ -3531,6 +4174,12 @@ bool vk_Window::check_alive() {
         alive_ = false;
     }
     return alive_;
+}
+
+std::uint32_t vk_Window::device_index() const {
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("Window: device is disposed");
+    return device->device_index();
 }
 
 void vk_Window::set_title(const std::string& title) {
@@ -3756,8 +4405,8 @@ void Frame::present() {
 }
 
 Window::Window(std::shared_ptr<Device> device, std::uint32_t width, std::uint32_t height, const std::string& title,
-    Format format, std::uint32_t frames_on_the_fly)
-    : window_(std::make_shared<vk_Window>(std::move(device), width, height, title, format, frames_on_the_fly)) {
+    Format format, std::uint32_t frames_on_the_fly, bool vsync)
+    : window_(std::make_shared<vk_Window>(std::move(device), width, height, title, format, frames_on_the_fly, vsync)) {
 }
 
 std::shared_ptr<Frame> Window::begin_frame() {
@@ -3767,14 +4416,20 @@ std::shared_ptr<Frame> Window::begin_frame() {
 }
 
 std::shared_ptr<Window> Device::create_window(std::uint32_t width, std::uint32_t height, const std::string& title,
-    Format format, std::uint32_t frames_on_the_fly) {
-    auto window = std::make_shared<Window>(shared_from_this(), width, height, title, format, frames_on_the_fly);
+    Format format, std::uint32_t frames_on_the_fly, bool vsync) {
+    auto window = std::make_shared<Window>(shared_from_this(), width, height, title, format, frames_on_the_fly, vsync);
     vk_register_window(window->vk_window());
     return window;
 }
 
 vk_DescriptorSet::vk_DescriptorSet(std::weak_ptr<Device> device, std::shared_ptr<vk_Pipeline> pipeline, int set, vk::DescriptorSet descriptor_set) noexcept
     : device_(std::move(device)), pipeline_(std::move(pipeline)), set_(set), descriptor_set_(descriptor_set) {}
+
+std::uint32_t vk_DescriptorSet::device_index() const {
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet: device is disposed");
+    return device->device_index();
+}
 
 void vk_DescriptorSet::vk_bind_buffer(LayoutHandle layout_id, const std::shared_ptr<Buffer>& buffer) {
     const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
@@ -3804,7 +4459,9 @@ void vk_DescriptorSet::vk_bind_image(LayoutHandle layout_id, const std::shared_p
     const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
     if (binding.type != DescriptorType::STORAGE_IMAGE && binding.type != DescriptorType::SAMPLED_IMAGE) {
-        throw std::runtime_error("DescriptorSet::bind: this binding type requires a sampler, not yet supported");
+        throw std::runtime_error(
+            "DescriptorSet::bind: this binding's declared type requires a sampler; "
+            "call bind(layout_id, sampler) for a SAMPLER binding, or bind(layout_id, image, sampler) for COMBINED_IMAGE_SAMPLER");
     }
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
@@ -3827,6 +4484,52 @@ void vk_DescriptorSet::vk_bind_image(LayoutHandle layout_id, const std::shared_p
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
+void vk_DescriptorSet::vk_bind_sampler(LayoutHandle layout_id, const std::shared_ptr<Sampler>& sampler) {
+    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+    if (binding.type != DescriptorType::SAMPLER) {
+        throw std::runtime_error("DescriptorSet::bind: this binding does not expect a standalone sampler");
+    }
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    vk::DescriptorImageInfo image_info{};
+    image_info.sampler = sampler->vk_sampler();
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.descriptorCount = 1;
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pImageInfo = &image_info;
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+void vk_DescriptorSet::vk_bind_combined(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
+    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+    if (binding.type != DescriptorType::COMBINED_IMAGE_SAMPLER) {
+        throw std::runtime_error("DescriptorSet::bind: this binding is not a COMBINED_IMAGE_SAMPLER");
+    }
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    vk::DescriptorImageInfo image_info{};
+    image_info.sampler = sampler->vk_sampler();
+    image_info.imageView = image->get_view();
+    image_info.imageLayout = vk::ImageLayout::eGeneral; // see vk_bind_image's comment
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.descriptorCount = 1;
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pImageInfo = &image_info;
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
 std::shared_ptr<vk_ResourceData> Device::vk_allocate_buffer_data(std::uint64_t size, MemoryLocation location) {
     auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
     auto memory = manager->allocate(size, 256);
@@ -3835,8 +4538,8 @@ std::shared_ptr<vk_ResourceData> Device::vk_allocate_buffer_data(std::uint64_t s
     return data;
 }
 
-std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, ScalarType type, MemoryLocation location) {
-    auto layout = compute_layout(TypeDescriptor::scalar(type), LayoutRule::Scalar);
+std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, Type type, MemoryLocation location) {
+    auto layout = compute_layout(TypeDescriptor::single(type), LayoutRule::Scalar);
     const std::uint64_t bytes = elements * layout->aligned_size;
     auto data = vk_allocate_buffer_data(bytes, location);
     ResourceSlice full_slice {};
@@ -3849,9 +4552,9 @@ std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, ScalarType
 }
 
 std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, Format format, MemoryLocation location) {
-    const ScalarType component_type = format_scalar_type(format);
+    const Type component_type = format_scalar_type(format);
     const int components = static_cast<int>(formatSize(format)) / scalar_type_size(component_type);
-    auto element_type = std::make_shared<TypeDescriptor>(TypeDescriptor::scalar(component_type));
+    auto element_type = std::make_shared<TypeDescriptor>(TypeDescriptor::single(component_type));
     auto layout = compute_layout(TypeDescriptor::array_of(std::move(element_type), components), LayoutRule::Scalar);
     const std::uint64_t bytes = elements * layout->aligned_size;
     auto data = vk_allocate_buffer_data(bytes, location);
@@ -3880,7 +4583,7 @@ std::shared_ptr<Buffer> Device::create_buffer(std::uint64_t elements, const std:
 }
 
 void Device::vk_transition_image_layout(vk::Image image, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
-    std::uint32_t mip_levels, std::uint32_t array_layers) {
+    std::uint32_t mip_levels, std::uint32_t array_layers, vk::ImageAspectFlags aspect) {
     std::shared_ptr<Engine> engine;
     for (EngineType type : { EngineType::COMPUTE, EngineType::GRAPHICS, EngineType::TRANSFER }) {
         try {
@@ -3903,15 +4606,18 @@ void Device::vk_transition_image_layout(vk::Image image, vk::ImageLayout old_lay
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.aspectMask = aspect;
     barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = mip_levels;
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = array_layers;
     barrier.srcAccessMask = vk::AccessFlags{};
+    // Over-broad on purpose (both color- and depth/stencil-attachment write
+    // access, regardless of `aspect`): harmless, and keeps this one helper
+    // shared by both create_image() and create_depth_buffer_image().
     barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
         | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite
-        | vk::AccessFlagBits::eColorAttachmentWrite;
+        | vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eDepthStencilAttachmentWrite;
 
     vk_cmd->command_buffer.pipelineBarrier(
         vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eAllCommands,
@@ -3994,16 +4700,286 @@ std::shared_ptr<Image> Device::create_image(int width, int height, int depth, in
     return std::make_shared<Image>(data, slice);
 }
 
+std::shared_ptr<Image> Device::create_depth_buffer_image(int width, int height, Format format, MemoryLocation location) {
+    if (width <= 0 || height <= 0) {
+        throw std::runtime_error("Device::create_depth_buffer_image: width and height must be positive");
+    }
+    if (!is_depth_format(format)) {
+        throw std::runtime_error("Device::create_depth_buffer_image: format must be one of the Format::Depth* values");
+    }
+
+    vk::ImageCreateInfo image_info{};
+    image_info.imageType = vk::ImageType::e2D;
+    image_info.format = static_cast<vk::Format>(format);
+    image_info.extent = vk::Extent3D{ static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), 1 };
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = vk::SampleCountFlagBits::e1;
+    image_info.tiling = vk::ImageTiling::eOptimal;
+    // Not full_image_usage_flags(): eColorAttachment/eStorage are invalid
+    // usages for a depth/stencil format. eSampled is kept so a depth buffer
+    // can still be read from a shader later (e.g. for shadow mapping).
+    image_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment
+        | vk::ImageUsageFlagBits::eSampled
+        | vk::ImageUsageFlagBits::eTransferSrc
+        | vk::ImageUsageFlagBits::eTransferDst;
+    image_info.sharingMode = vk::SharingMode::eExclusive;
+    image_info.initialLayout = vk::ImageLayout::eUndefined;
+
+    vk::Device dev = logical_device();
+    vk::Image image = dev.createImage(image_info);
+
+    const vk::MemoryRequirements requirements = dev.getImageMemoryRequirements(image);
+    auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
+    vk::MemoryAllocateInfo alloc_info(requirements.size, manager->vk_memory_type_index());
+    vk::DeviceMemory memory;
+    try {
+        memory = dev.allocateMemory(alloc_info);
+        dev.bindImageMemory(image, memory, 0);
+    } catch (...) {
+        dev.destroyImage(image);
+        throw;
+    }
+
+    // Same "always eGeneral" convention as create_image() -- see
+    // vk_transition_image_layout's comment -- just with the depth aspect
+    // instead of color.
+    try {
+        vk_transition_image_layout(image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, 1, 1, vk::ImageAspectFlagBits::eDepth);
+    } catch (...) {
+        dev.destroyImage(image);
+        dev.freeMemory(memory);
+        throw;
+    }
+
+    auto memory_slice = std::make_shared<MemorySlice>(shared_from_this(), nullptr, 0, 0, 0, 0);
+    auto data = std::make_shared<vk_ResourceData>(shared_from_this(), memory_slice, image, image_info, memory);
+    resources_.push_back(data);
+
+    ResourceSlice slice{};
+    slice.type = ResourceType::IMAGE;
+    slice.image.format = format;
+    slice.image.mip_start = 0;
+    slice.image.mip_count = 1;
+    slice.image.array_start = 0;
+    slice.image.array_count = 1;
+
+    return std::make_shared<Image>(data, slice);
+}
+
+std::shared_ptr<Sampler> Device::create_sampler(
+    Filter mag_filter, Filter min_filter, MipmapMode mipmap_mode,
+    WrapMode wrap_u, WrapMode wrap_v, WrapMode wrap_w) {
+    vk::SamplerCreateInfo info{};
+    info.magFilter = static_cast<vk::Filter>(mag_filter);
+    info.minFilter = static_cast<vk::Filter>(min_filter);
+    info.mipmapMode = static_cast<vk::SamplerMipmapMode>(mipmap_mode);
+    info.addressModeU = static_cast<vk::SamplerAddressMode>(wrap_u);
+    info.addressModeV = static_cast<vk::SamplerAddressMode>(wrap_v);
+    info.addressModeW = static_cast<vk::SamplerAddressMode>(wrap_w);
+    info.borderColor = vk::BorderColor::eFloatOpaqueBlack;
+    info.anisotropyEnable = VK_FALSE;
+    info.compareEnable = VK_FALSE;
+    info.minLod = 0.0f;
+    info.maxLod = 1000.0f; // effectively unbounded: every real image has far fewer mip levels.
+    info.unnormalizedCoordinates = VK_FALSE;
+
+    vk::Sampler sampler = logical_device().createSampler(info);
+    auto data = std::make_shared<vk_Sampler>(weak_from_this(), sampler);
+    vk_register_sampler(data);
+    return std::make_shared<Sampler>(std::move(data));
+}
+
+namespace {
+
+// Vulkan geometry description (plus primitive/instance count and implied AS
+// type) for `declaration`, shared by Device::create_ads() (sizing only) and
+// CommandBuffer::build_ads() (the actual build). Throws if a required
+// buffer is missing, or an index buffer's element type isn't UINT16/UINT32.
+struct AdsGeometryInfo {
+    vk::AccelerationStructureGeometryKHR geometry;
+    std::uint32_t primitive_count = 0;
+    vk::AccelerationStructureTypeKHR type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+};
+
+AdsGeometryInfo vk_build_ads_geometry_info(const ADSDeclaration& declaration) {
+    AdsGeometryInfo result{};
+    std::visit([&](auto&& decl) {
+        using T = std::decay_t<decltype(decl)>;
+        if constexpr (std::is_same_v<T, ADSTriangles>) {
+            const vk::GeometryFlagsKHR flags = decl.opaque ? vk::GeometryFlagsKHR(vk::GeometryFlagBitsKHR::eOpaque) : vk::GeometryFlagsKHR{};
+            if (!decl.vertices) throw std::runtime_error("ADSTriangles: vertices buffer is required");
+            vk::AccelerationStructureGeometryTrianglesDataKHR triangles{};
+            triangles.vertexFormat = vk::Format::eR32G32B32Sfloat;
+            triangles.vertexData.deviceAddress = decl.vertices->device_ptr();
+            triangles.vertexStride = decl.vertices->element_layout()->aligned_size;
+            triangles.maxVertex = decl.vertex_count > 0 ? decl.vertex_count - 1 : 0;
+            if (decl.indices) {
+                const Type idx_scalar = decl.indices->element_layout()->component_type;
+                if (idx_scalar == Type::UINT16) triangles.indexType = vk::IndexType::eUint16;
+                else if (idx_scalar == Type::UINT32) triangles.indexType = vk::IndexType::eUint32;
+                else throw std::runtime_error("ADSTriangles: indices must be a UINT16 or UINT32 buffer");
+                triangles.indexData.deviceAddress = decl.indices->device_ptr();
+            } else {
+                triangles.indexType = vk::IndexType::eNoneKHR;
+            }
+            result.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+            result.primitive_count = decl.primitive_count;
+            result.geometry = vk::AccelerationStructureGeometryKHR(vk::GeometryTypeKHR::eTriangles, triangles, flags);
+        } else if constexpr (std::is_same_v<T, ADSAABB>) {
+            const vk::GeometryFlagsKHR flags = decl.opaque ? vk::GeometryFlagsKHR(vk::GeometryFlagBitsKHR::eOpaque) : vk::GeometryFlagsKHR{};
+            if (!decl.aabbs) throw std::runtime_error("ADSAABB: aabbs buffer is required");
+            vk::AccelerationStructureGeometryAabbsDataKHR aabbs{};
+            aabbs.data.deviceAddress = decl.aabbs->device_ptr();
+            aabbs.stride = decl.aabbs->element_layout()->aligned_size;
+            result.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+            result.primitive_count = decl.count;
+            result.geometry = vk::AccelerationStructureGeometryKHR(vk::GeometryTypeKHR::eAabbs, aabbs, flags);
+        } else if constexpr (std::is_same_v<T, ADSInstances>) {
+            if (!decl.instances) throw std::runtime_error("ADSInstances: instances buffer is required");
+            vk::AccelerationStructureGeometryInstancesDataKHR instances{};
+            instances.arrayOfPointers = VK_FALSE;
+            instances.data.deviceAddress = decl.instances->device_ptr();
+            result.type = vk::AccelerationStructureTypeKHR::eTopLevel;
+            result.primitive_count = decl.count;
+            result.geometry = vk::AccelerationStructureGeometryKHR(vk::GeometryTypeKHR::eInstances, instances, vk::GeometryFlagsKHR{});
+        }
+    }, declaration);
+    return result;
+}
+
+} // namespace
+
+std::shared_ptr<AccelerationStructure> Device::create_ads(const ADSDeclaration& declaration) {
+    if (!acceleration_structure_supported_) {
+        throw std::runtime_error("Device::create_ads: VK_KHR_acceleration_structure is not supported/enabled on this device");
+    }
+
+    AdsGeometryInfo info = vk_build_ads_geometry_info(declaration);
+
+    vk::AccelerationStructureBuildGeometryInfoKHR build_info{};
+    build_info.type = info.type;
+    build_info.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+    build_info.mode = vk::BuildAccelerationStructureModeKHR::eBuild;
+    build_info.geometryCount = 1;
+    build_info.pGeometries = &info.geometry;
+
+    vk::Device dev = logical_device();
+    vk::AccelerationStructureBuildSizesInfoKHR size_info = dev.getAccelerationStructureBuildSizesKHR(
+        vk::AccelerationStructureBuildTypeKHR::eDevice, build_info, info.primitive_count, dynamic_dispatch_);
+
+    // The acceleration structure's backing storage buffer is allocated
+    // separately from every other Buffer (which sub-allocate from a shared,
+    // pooled MemoryPage -- see MemoryPage's constructor): it needs its own
+    // dedicated VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+    // usage, which full_buffer_usage_flags() deliberately does not grant to
+    // the shared pool (see its own comment).
+    vk::BufferCreateInfo storage_info{};
+    storage_info.size = size_info.accelerationStructureSize;
+    storage_info.usage = vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    storage_info.sharingMode = vk::SharingMode::eExclusive;
+    vk::Buffer storage_buffer = dev.createBuffer(storage_info);
+
+    const vk::MemoryRequirements requirements = dev.getBufferMemoryRequirements(storage_buffer);
+    vk::MemoryAllocateFlagsInfo alloc_flags_info{};
+    alloc_flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+    vk::MemoryAllocateInfo alloc_info(requirements.size, device_memory_manager_->vk_memory_type_index());
+    alloc_info.pNext = &alloc_flags_info;
+    vk::DeviceMemory storage_memory;
+    vk::AccelerationStructureKHR handle;
+    try {
+        storage_memory = dev.allocateMemory(alloc_info);
+        dev.bindBufferMemory(storage_buffer, storage_memory, 0);
+
+        vk::AccelerationStructureCreateInfoKHR create_info{};
+        create_info.buffer = storage_buffer;
+        create_info.offset = 0;
+        create_info.size = size_info.accelerationStructureSize;
+        create_info.type = info.type;
+        handle = dev.createAccelerationStructureKHR(create_info, nullptr, dynamic_dispatch_);
+    } catch (...) {
+        dev.destroyBuffer(storage_buffer);
+        if (storage_memory) dev.freeMemory(storage_memory);
+        throw;
+    }
+
+    auto vk_ads = std::make_shared<vk_AccelerationStructure>(
+        weak_from_this(), handle, storage_buffer, storage_memory, info.type, size_info.buildScratchSize);
+    vk_register_acceleration_structure(vk_ads);
+    return std::make_shared<AccelerationStructure>(std::move(vk_ads));
+}
+
+void CommandBuffer::build_ads(const std::shared_ptr<AccelerationStructure>& ads, const ADSDeclaration& declaration) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot build an acceleration structure on a closed command buffer");
+    }
+    if (!ads) {
+        throw std::runtime_error("CommandBuffer::build_ads: ads must not be null");
+    }
+
+    AdsGeometryInfo info = vk_build_ads_geometry_info(declaration);
+    const auto& vk_ads = ads->vk_ads();
+    if (vk_ads->vk_type() != info.type) {
+        throw std::runtime_error("CommandBuffer::build_ads: declaration's acceleration structure type does not match ads's own type");
+    }
+
+    // A fresh, temporary buffer every build -- see bound_scratch_buffers_'s
+    // comment: it only needs to stay alive/valid while the GPU executes
+    // this command buffer, no different from a vertex/index buffer.
+    auto scratch_buffer = device_->create_buffer(
+        std::max<std::uint64_t>(vk_ads->vk_build_scratch_size(), 1), Type::UINT8, MemoryLocation::DEVICE);
+
+    vk::AccelerationStructureBuildGeometryInfoKHR build_info{};
+    build_info.type = info.type;
+    build_info.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+    build_info.mode = vk::BuildAccelerationStructureModeKHR::eBuild;
+    build_info.dstAccelerationStructure = vk_ads->vk_handle();
+    build_info.geometryCount = 1;
+    build_info.pGeometries = &info.geometry;
+    build_info.scratchData.deviceAddress = scratch_buffer->device_ptr();
+
+    vk::AccelerationStructureBuildRangeInfoKHR range_info{};
+    range_info.primitiveCount = info.primitive_count;
+    const vk::AccelerationStructureBuildRangeInfoKHR* p_range_info = &range_info;
+
+    command_buffer_->command_buffer.buildAccelerationStructuresKHR(build_info, p_range_info, device_->vk_dynamic_dispatch());
+
+    bound_acceleration_structures_.push_back(ads);
+    bound_scratch_buffers_.push_back(scratch_buffer);
+    std::visit([&](auto&& decl) {
+        using T = std::decay_t<decltype(decl)>;
+        if constexpr (std::is_same_v<T, ADSTriangles>) {
+            bound_ads_input_buffers_.push_back(decl.vertices);
+            if (decl.indices) bound_ads_input_buffers_.push_back(decl.indices);
+        } else if constexpr (std::is_same_v<T, ADSAABB>) {
+            bound_ads_input_buffers_.push_back(decl.aabbs);
+        } else if constexpr (std::is_same_v<T, ADSInstances>) {
+            bound_ads_input_buffers_.push_back(decl.instances);
+        }
+    }, declaration);
+}
+
 std::shared_ptr<Buffer> Device::create_staging(const std::shared_ptr<Buffer>& buffer, MemoryLocation location) {
-    return create_buffer(buffer->size(), ScalarType::UINT8, location);
+    return create_buffer(buffer->size(), Type::UINT8, location);
 }
 
 std::shared_ptr<Buffer> Device::create_staging(const std::shared_ptr<Image>& image, MemoryLocation location) {
-    throw std::runtime_error("create_staging: image staging is not yet supported (Image does not expose its byte size)");
+    // A contiguous buffer of texels in `image`'s own format: each element
+    // is [components, component_type] (same convention as Buffer::cast(Format)/
+    // create_buffer(elements, Format, ...)), and the element count is the
+    // product of every extent dimension (width * height * depth).
+    const vk::ImageCreateInfo info = image->vk_image_info();
+    const Type component_type = format_scalar_type(image->format());
+    const int components = static_cast<int>(formatSize(image->format())) / scalar_type_size(component_type);
+    const std::uint64_t texel_count =
+        static_cast<std::uint64_t>(info.extent.width) * info.extent.height * info.extent.depth;
+    auto component_desc = std::make_shared<TypeDescriptor>(TypeDescriptor::single(component_type));
+    auto texel_layout = compute_layout(TypeDescriptor::array_of(std::move(component_desc), components), LayoutRule::Scalar);
+    return create_buffer(texel_count, texel_layout, location);
 }
 
 Tensor::Tensor(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice,
-    std::vector<std::uint64_t> shape, ScalarType scalar_type)
+    std::vector<std::uint64_t> shape, Type scalar_type)
     : Resource(std::move(resource_data), view_slice), shape_(std::move(shape)), scalar_type_(scalar_type) {
     assert(view_slice.type == ResourceType::BUFFER);
 }
@@ -4057,7 +5033,7 @@ void Tensor::save(const pybind11::object& target) const {
     copy_pyobject_from(*data_->device(), external_ptr(), data_->is_cpu() ? MemoryLocation::HOST : MemoryLocation::DEVICE, size(), target);
 }
 
-std::shared_ptr<Tensor> Device::create_tensor(const std::vector<std::uint64_t>& shape, ScalarType type, MemoryLocation location) {
+std::shared_ptr<Tensor> Device::create_tensor(const std::vector<std::uint64_t>& shape, Type type, MemoryLocation location) {
     if (shape.empty()) {
         throw std::runtime_error("Device::create_tensor: shape must have at least one dimension");
     }
@@ -4107,18 +5083,18 @@ void Device::vk_copy_out(
     copy_strided_host(reinterpret_cast<void*>(static_cast<std::uintptr_t>(src_external_ptr)), dst_data, shape, strides, ndim, itemsize, /*contiguous_is_dst=*/false);
 }
 
-std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, WrapMode mode, MemoryLocation location) {
+std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, MemoryLocation location) {
     // Case 1: one of our own Buffers -- always a direct, contiguous mapping
     // already in the right place; never needs a copy.
     if (py::isinstance<Buffer>(obj)) {
         auto buffer = obj.cast<std::shared_ptr<Buffer>>();
         const Layout& layout = *buffer->element_layout();
-        const ScalarType scalar = layout.kind == TypeKind::STRUCT ? ScalarType::UINT8 : resolve_component_type(layout);
+        const Type scalar = layout.kind == TypeKind::STRUCT ? Type::UINT8 : resolve_component_type(layout);
         const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar));
         std::vector<std::uint64_t> shape{ buffer->size() / itemsize };
         return std::make_shared<WrappedMemory>(
             weak_from_this(), buffer->device_ptr(), std::move(shape), scalar,
-            nullptr, location, mode, WrappedMemory::SourceKind::NONE, pybind11::object());
+            nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object());
     }
 
     // Case 1b: one of our own Tensors -- same as a Buffer, always a direct
@@ -4128,7 +5104,7 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, WrapMode mode,
         auto tensor = obj.cast<std::shared_ptr<Tensor>>();
         return std::make_shared<WrappedMemory>(
             weak_from_this(), tensor->device_ptr(), tensor->shape(), tensor->scalar_type(),
-            nullptr, location, mode, WrappedMemory::SourceKind::NONE, pybind11::object());
+            nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object());
     }
 
     // Case 2: a DLPack-compatible object (e.g. a torch tensor).
@@ -4145,8 +5121,7 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, WrapMode mode,
 
         std::vector<std::uint64_t> shape(static_cast<std::size_t>(t.ndim));
         for (int i = 0; i < t.ndim; ++i) shape[static_cast<std::size_t>(i)] = static_cast<std::uint64_t>(t.shape[i]);
-        const ScalarType scalar = scalar_type_from_dlpack_dtype(t.dtype);
-        const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar));
+        const Type scalar = scalar_type_from_dlpack_dtype(t.dtype);
         std::uint64_t elements = 1;
         for (auto d : shape) elements *= d;
 
@@ -4163,36 +5138,30 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, WrapMode mode,
             if (own_device_ptr != 0) {
                 return std::make_shared<WrappedMemory>(
                     weak_from_this(), own_device_ptr, std::move(shape), scalar,
-                    nullptr, location, mode, WrappedMemory::SourceKind::NONE, pybind11::object());
+                    nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object());
             }
         }
 
+        // No copy happens here: the returned WrappedMemory starts out
+        // CPU-fresh, and update_gpu() lazily performs this copy on demand.
         auto temp = create_buffer(elements, scalar, location);
-        if (mode == WrapMode::CopyIn || mode == WrapMode::CopyInOut) {
-            vk_copy_in(temp->external_ptr(), location, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
-        }
         return std::make_shared<WrappedMemory>(
             weak_from_this(), temp->device_ptr(), std::move(shape), scalar,
-            temp, location, mode, WrappedMemory::SourceKind::DLPACK, std::move(obj));
+            temp, location, WrappedMemory::SourceKind::DLPACK, std::move(obj));
     }
 
     // Case 3: a plain Python buffer-protocol object (e.g. a numpy array).
     if (PyObject_CheckBuffer(obj.ptr())) {
         pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(obj);
         pybind11::buffer_info info = buf.request();
-        const ScalarType scalar = scalar_type_from_buffer_format(info.format, static_cast<std::uint64_t>(info.itemsize));
+        const Type scalar = scalar_type_from_buffer_format(info.format, static_cast<std::uint64_t>(info.itemsize));
         const std::uint64_t elements = static_cast<std::uint64_t>(info.size);
 
         auto temp = create_buffer(elements, scalar, location);
-        if (mode == WrapMode::CopyIn || mode == WrapMode::CopyInOut) {
-            const std::int64_t total = static_cast<std::int64_t>(elements);
-            const std::int64_t stride1 = 1;
-            vk_copy_in(temp->external_ptr(), location, info.ptr, &total, &stride1, 1, static_cast<std::uint64_t>(info.itemsize), /*source_is_cuda=*/false);
-        }
         std::vector<std::uint64_t> shape{ elements };
         return std::make_shared<WrappedMemory>(
             weak_from_this(), temp->device_ptr(), std::move(shape), scalar,
-            temp, location, mode, WrappedMemory::SourceKind::BUFFER_PROTOCOL, std::move(obj));
+            temp, location, WrappedMemory::SourceKind::BUFFER_PROTOCOL, std::move(obj));
     }
 
     throw std::runtime_error("Device::wrap: value must be a Buffer, a DLPack-compatible object, or a Python buffer object");
@@ -4202,57 +5171,83 @@ WrappedMemory::WrappedMemory(
     std::weak_ptr<Device> device,
     std::uint64_t device_ptr,
     std::vector<std::uint64_t> shape,
-    ScalarType scalar_type,
+    Type scalar_type,
     std::shared_ptr<Buffer> owned_buffer,
     MemoryLocation owned_location,
-    WrapMode mode,
     SourceKind source_kind,
     pybind11::object source) noexcept
     : device_(std::move(device)), device_ptr_(device_ptr), shape_(std::move(shape)), scalar_type_(scalar_type),
-      owned_buffer_(std::move(owned_buffer)), owned_location_(owned_location), mode_(mode), source_kind_(source_kind),
-      source_(source.is_none() ? nullptr : std::make_unique<pybind11::object>(std::move(source))) {
+      owned_buffer_(std::move(owned_buffer)), owned_location_(owned_location), source_kind_(source_kind),
+      source_(source.is_none() ? nullptr : std::make_unique<pybind11::object>(std::move(source))),
+      // A freshly wrapped copy starts out CPU-fresh: the wrapped object's
+      // data hasn't been pushed into owned_buffer_ yet, so the first
+      // update_gpu() call performs that copy. Irrelevant when is_direct().
+      cpu_version_(1), gpu_version_(0) {
 }
 
-void WrappedMemory::unwrap() {
-    if (unwrapped_) return;
-    unwrapped_ = true;
+void WrappedMemory::make_cpu_dirty() noexcept {
+    if (is_direct()) return;
+    cpu_version_ = gpu_version_ + 1;
+}
 
-    // Move out before any early return so a second call (or the destructor,
-    // which also calls unwrap()) never re-runs this, regardless of outcome.
-    auto owned_buffer = std::move(owned_buffer_);
-    auto source = std::move(source_);
+void WrappedMemory::make_gpu_dirty() noexcept {
+    if (is_direct()) return;
+    gpu_version_ = cpu_version_ + 1;
+}
 
-    if (mode_ != WrapMode::CopyOut && mode_ != WrapMode::CopyInOut) return;
-    if (source_kind_ == SourceKind::NONE || !owned_buffer || !source) return;
+void WrappedMemory::update_gpu() {
+    if (is_direct()) return;
+    if (gpu_version_ >= cpu_version_) return;
     auto device = device_.lock();
     if (!device || device->is_disposed()) return;
 
     const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar_type_));
     if (source_kind_ == SourceKind::DLPACK) {
-        pybind11::object capsule = source->attr("__dlpack__")();
+        pybind11::object capsule = source_->attr("__dlpack__")();
         auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
         if (managed) {
             const DLTensor& t = managed->dl_tensor;
             char* data_ptr = reinterpret_cast<char*>(t.data) + t.byte_offset;
             const bool is_cuda_device = (t.device.device_type == 2);
-            device->vk_copy_out(owned_buffer->external_ptr(), owned_location_, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
+            device->vk_copy_in(owned_buffer_->external_ptr(), owned_location_, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
         }
     } else if (source_kind_ == SourceKind::BUFFER_PROTOCOL) {
-        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(*source);
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(*source_);
         pybind11::buffer_info info = buf.request();
         const std::int64_t total = static_cast<std::int64_t>(info.size);
         const std::int64_t stride1 = 1;
-        device->vk_copy_out(owned_buffer->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*dst_is_cuda=*/false);
+        device->vk_copy_in(owned_buffer_->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*source_is_cuda=*/false);
     }
+    gpu_version_ = cpu_version_;
 }
 
-WrappedMemory::~WrappedMemory() noexcept {
-    try {
-        unwrap();
-    } catch (...) {
-        // Destructors must not throw; best-effort copy-back.
+void WrappedMemory::update_cpu() {
+    if (is_direct()) return;
+    if (cpu_version_ >= gpu_version_) return;
+    auto device = device_.lock();
+    if (!device || device->is_disposed()) return;
+
+    const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar_type_));
+    if (source_kind_ == SourceKind::DLPACK) {
+        pybind11::object capsule = source_->attr("__dlpack__")();
+        auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
+        if (managed) {
+            const DLTensor& t = managed->dl_tensor;
+            char* data_ptr = reinterpret_cast<char*>(t.data) + t.byte_offset;
+            const bool is_cuda_device = (t.device.device_type == 2);
+            device->vk_copy_out(owned_buffer_->external_ptr(), owned_location_, data_ptr, t.shape, t.strides, t.ndim, itemsize, is_cuda_device);
+        }
+    } else if (source_kind_ == SourceKind::BUFFER_PROTOCOL) {
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(*source_);
+        pybind11::buffer_info info = buf.request();
+        const std::int64_t total = static_cast<std::int64_t>(info.size);
+        const std::int64_t stride1 = 1;
+        device->vk_copy_out(owned_buffer_->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*dst_is_cuda=*/false);
     }
+    cpu_version_ = gpu_version_;
 }
+
+WrappedMemory::~WrappedMemory() noexcept = default;
 
 void Device::dispose() noexcept {
     try {
@@ -4311,6 +5306,24 @@ void Device::dispose() noexcept {
             window->vk_dispose_with(device_, instance_);
     }
     windows_.clear();
+
+    // Destroy any still-alive samplers before the device/instance (same
+    // rationale as windows_/framebuffers_ above).
+    for (const auto& s : samplers_) {
+        auto sampler = s.lock();
+        if (sampler)
+            sampler->dispose();
+    }
+    samplers_.clear();
+
+    // Destroy any still-alive acceleration structures before the
+    // device/instance (same rationale as windows_/samplers_ above).
+    for (const auto& a : acceleration_structures_) {
+        auto ads = a.lock();
+        if (ads)
+            ads->dispose();
+    }
+    acceleration_structures_.clear();
 
     // Destroy now any pending resource
     for (const auto& r: resources_) {
@@ -4569,7 +5582,7 @@ MemoryPage::MemoryPage(std::weak_ptr<Device> device, uint32_t memory_type_index,
     vk::BufferCreateInfo buffer_info(
         vk::BufferCreateFlags{},
         static_cast<vk::DeviceSize>(capacity_),
-        full_buffer_usage_flags(),
+        full_buffer_usage_flags(device_ptr->vk_acceleration_structure_supported()),
         vk::SharingMode::eExclusive
     );
     if (!host_visible_) {
@@ -4604,18 +5617,11 @@ MemoryPage::MemoryPage(std::weak_ptr<Device> device, uint32_t memory_type_index,
 
     if (host_visible_) {
         external_ptr_ = reinterpret_cast<std::uint64_t>(dev.mapMemory(memory_, 0, VK_WHOLE_SIZE));
-    } else if (try_import_memory_) {
-        external_ptr_ = try_import_memory_(dev, device_ptr->device_index(), static_cast<VkDeviceMemory>(memory_), capacity_);
     }
-
-    const int device_id = device_ptr->device_index();
-    if (host_visible_) {
-        dl_device_ = {1, device_id};
-    } else if (external_ptr_) {
-        dl_device_ = {2, device_id};
-    } else {
-        dl_device_ = {0, device_id};
-    }
+    // Non-host_visible_ (DEVICE) pages: external_ptr_ is left at 0 here.
+    // The CUDA import (try_import_memory_) is deliberately deferred to
+    // ensure_external_ptr_imported(), the first time external_ptr()/
+    // dl_device() is actually called -- see that method's comment.
 }
 
 MemoryPage::~MemoryPage() noexcept {
@@ -4664,7 +5670,29 @@ std::uint64_t MemoryPage::capacity() const noexcept { return capacity_; }
 vk::Buffer MemoryPage::buffer() const noexcept { return buffer_; }
 vk::DeviceMemory MemoryPage::memory() const noexcept { return memory_; }
 std::uint64_t MemoryPage::device_ptr() const noexcept { return device_ptr_; }
-std::uint64_t MemoryPage::external_ptr() const noexcept { return external_ptr_; }
+
+void MemoryPage::ensure_external_ptr_imported() const noexcept {
+    if (host_visible_ || external_ptr_import_attempted_) return;
+    external_ptr_import_attempted_ = true;
+    if (!try_import_memory_) return;
+    auto device = device_.lock();
+    if (!device) return;
+    external_ptr_ = try_import_memory_(device->vk_device(), device->device_index(), static_cast<VkDeviceMemory>(memory_), capacity_);
+}
+
+std::uint64_t MemoryPage::external_ptr() const noexcept {
+    ensure_external_ptr_imported();
+    return external_ptr_;
+}
+
+DLDevice MemoryPage::dl_device() const noexcept {
+    ensure_external_ptr_imported();
+    auto device = device_.lock();
+    const int device_id = device ? device->device_index() : 0;
+    if (host_visible_) return {1, device_id};
+    if (external_ptr_) return {2, device_id};
+    return {0, device_id};
+}
 
 std::uint64_t MemoryPage::external_to_device(std::uint64_t external_ptr) const noexcept {
     if (external_ptr_ == 0) {

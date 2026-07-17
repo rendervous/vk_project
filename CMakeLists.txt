@@ -78,6 +78,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
+# -----------------------------------------------------------------------------
+# tinyobjloader (fetched and built from source; used by loaders.cpp to load
+# .obj scenes)
+# -----------------------------------------------------------------------------
+
+FetchContent_Declare(
+        tinyobjloader
+        GIT_REPOSITORY https://github.com/tinyobjloader/tinyobjloader.git
+        GIT_TAG v2.0.0rc13
+        GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(tinyobjloader)
+
 set(IMGUI_SOURCES
         ${imgui_SOURCE_DIR}/imgui.cpp
         ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -160,6 +173,7 @@ install(TARGETS vk_cuda_interop
 pybind11_add_module(vk
         cpp/bindings.cpp
         cpp/device.cpp
+        cpp/loaders.cpp
         ${IMGUI_SOURCES}
 )
 
@@ -167,6 +181,7 @@ target_link_libraries(vk
         PRIVATE
         Vulkan::Vulkan
         glfw
+        tinyobjloader
 )
 
 target_include_directories(vk

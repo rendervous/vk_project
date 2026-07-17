@@ -7,6 +7,8 @@
 #include <deque>
 #include <string>
 #include <variant>
+#include <array>
+#include <optional>
 #include <chrono>
 
 namespace pybind11 { class object; }
@@ -45,6 +47,11 @@ class vk_Framebuffer;
 class Framebuffer;
 class vk_DescriptorSet;
 class DescriptorSet;
+class vk_Sampler;
+class Sampler;
+class vk_AccelerationStructure;
+class AccelerationStructure;
+class Layouts;
 
 // GUI
 class vk_Window;
@@ -65,7 +72,11 @@ enum class MemoryLocation : int {
 
 using ExternalImportFn = std::uint64_t (*)(vk::Device device, int device_index, vk::DeviceMemory memory, std::uint64_t size);
 
-enum class ScalarType : int {
+// Every value a GPU-buffer-resident TypeDescriptor::single() can hold:
+// scalars, plus every GLSL vector/matrix shape (matCxR: C columns, R rows).
+// INT8/UINT8 aren't valid GLSL shader types but are kept for byte-level
+// buffer/Format-channel use (Buffer::cast, create_buffer, format_scalar_type).
+enum class Type : int {
     UNDEFINED = 0,
     BOOL = 1,
     FLOAT16 = 2,
@@ -79,6 +90,22 @@ enum class ScalarType : int {
     UINT16 = 10,
     UINT32 = 11,
     UINT64 = 12,
+
+    VEC2 = 13, VEC3 = 14, VEC4 = 15,
+    IVEC2 = 16, IVEC3 = 17, IVEC4 = 18,
+    UVEC2 = 19, UVEC3 = 20, UVEC4 = 21,
+    BVEC2 = 22, BVEC3 = 23, BVEC4 = 24,
+
+    // matCxR: C columns, R rows (GLSL convention).
+    MAT2 = 25,   // 2x2
+    MAT2x3 = 26,
+    MAT2x4 = 27,
+    MAT3x2 = 28,
+    MAT3 = 29,   // 3x3
+    MAT3x4 = 30,
+    MAT4x2 = 31,
+    MAT4x3 = 32,
+    MAT4 = 33,   // 4x4
 };
 
 enum class Format : int {
@@ -176,7 +203,20 @@ enum class Format : int {
     RG64_Float   = static_cast<int>(vk::Format::eR64G64Sfloat),
     RGB64_Float  = static_cast<int>(vk::Format::eR64G64B64Sfloat),
     RGBA64_Float = static_cast<int>(vk::Format::eR64G64B64A64Sfloat),
+
+    // Depth/stencil (for Device::create_depth_buffer_image only -- not
+    // valid as a color attachment/sampled/storage format).
+    Depth16_UNorm             = static_cast<int>(vk::Format::eD16Unorm),
+    Depth32_Float             = static_cast<int>(vk::Format::eD32Sfloat),
+    Depth24_UNorm_Stencil8_UInt = static_cast<int>(vk::Format::eD24UnormS8Uint),
+    Depth32_Float_Stencil8_UInt = static_cast<int>(vk::Format::eD32SfloatS8Uint),
 };
+
+// Whether `format` is one of the Format::Depth* values above.
+[[nodiscard]] inline bool is_depth_format(Format format) noexcept {
+    return format == Format::Depth16_UNorm || format == Format::Depth32_Float
+        || format == Format::Depth24_UNorm_Stencil8_UInt || format == Format::Depth32_Float_Stencil8_UInt;
+}
 
 enum class ResourceType : int {
     UNDEFINED = 0,
@@ -235,6 +275,52 @@ enum class Filter : int {
     LINEAR = 1,
 };
 
+// How a Sampler filters between mip levels (Sampler::mipmap_mode, set via
+// Device::create_sampler). Values match vk::SamplerMipmapMode's own, so a
+// plain static_cast suffices.
+enum class MipmapMode : int {
+    NEAREST = 0,
+    LINEAR = 1,
+};
+
+// How a Sampler handles texture coordinates outside [0, 1] (one per axis:
+// Device::create_sampler's wrap_u/wrap_v/wrap_w). Values match
+// vk::SamplerAddressMode's own, so a plain static_cast suffices.
+enum class WrapMode : int {
+    REPEAT = 0,
+    MIRRORED_REPEAT = 1,
+    CLAMP_TO_EDGE = 2,
+    // Texels outside [0, 1] read a fixed border color (opaque black --
+    // Device::create_sampler has no separate border-color parameter).
+    CLAMP_TO_BORDER = 3,
+};
+
+// Dynamic rasterization state -- see CommandBuffer::set_cull_mode/
+// set_front_face/set_depth_test. Requires Vulkan 1.3 (core "extended
+// dynamic state"); see Device::vk_extended_dynamic_state_supported().
+enum class CullMode : int {
+    NONE = 0,
+    FRONT = 1,
+    BACK = 2,
+    FRONT_AND_BACK = 3,
+};
+
+enum class FrontFace : int {
+    COUNTER_CLOCKWISE = 0,
+    CLOCKWISE = 1,
+};
+
+enum class CompareOp : int {
+    NEVER = 0,
+    LESS = 1,
+    EQUAL = 2,
+    LESS_OR_EQUAL = 3,
+    GREATER = 4,
+    NOT_EQUAL = 5,
+    GREATER_OR_EQUAL = 6,
+    ALWAYS = 7,
+};
+
 // Opaque handle returned by Pipeline::layout(), identifying one declared
 // descriptor set binding. Not constructible from Python: only meaningful
 // when passed back to DescriptorSet::bind() on a descriptor set from the
@@ -259,28 +345,18 @@ private:
 };
 
 enum class TypeKind : int {
-    SCALAR = 0,
-    VECTOR = 1,
-    MATRIX = 2,
-    ARRAY = 3,
-    STRUCT = 4
+    // A scalar, vector or matrix value (see Layout::type for which):
+    // distinguished from ARRAY/STRUCT, but no longer from each other --
+    // Type already encodes that distinction on its own.
+    SINGLE = 0,
+    ARRAY = 1,
+    STRUCT = 2
 };
 
 enum class LayoutRule : int {
     Std140 = 0,
     Std430 = 1,
     Scalar = 2
-};
-
-// When Device::wrap() must copy the wrapped object's data through a
-// temporary buffer (see WrappedMemory), determines when that copy happens.
-// Enumerator names avoid the literal IN/OUT (Windows headers #define these
-// as empty parameter-annotation macros); exposed to Python as IN/OUT/INOUT
-// regardless (see bindings.cpp).
-enum class WrapMode : int {
-    CopyIn = 0,    // Copy the source in at wrap() time; never copied back.
-    CopyOut = 1,   // Never copied in; copied back to the source when the WrappedMemory is destroyed.
-    CopyInOut = 2, // Both.
 };
 
 /*  ============== STRUCTS ============== */
@@ -308,19 +384,8 @@ struct ResourceSlice{
 };
 
 // Payload structs for TypeDescriptor's flat hierarchy (see TypeDescriptor below).
-struct ScalarDesc {
-    ScalarType type;
-};
-
-struct VectorDesc {
-    ScalarType component_type;
-    int components; // in {2, 3, 4}
-};
-
-struct MatrixDesc {
-    ScalarType component_type;
-    int rows;    // in {2, 3, 4}
-    int columns; // in {2, 3, 4}; column-major
+struct SingleDesc {
+    Type type; // any scalar, vector or matrix Type value
 };
 
 struct ArrayDesc {
@@ -369,7 +434,16 @@ struct vk_AttachmentDesc {
 
 /*  ============== FUNCTIONS ============== */
 
-int scalar_type_size(ScalarType type);
+int scalar_type_size(Type type);
+
+// Component type (itself, for a scalar), row count (components, for a
+// vector) and column count (1 for scalar/vector) of any Type value.
+struct TypeTraits {
+    Type component_type;
+    int rows;
+    int columns;
+};
+TypeTraits type_traits(Type type);
 
 // Computes the byte size/alignment layout of `type` under `rule` (std140,
 // std430 or scalar block layout rules). Pure host-side arithmetic, does not
@@ -379,20 +453,16 @@ std::shared_ptr<Layout> compute_layout(const TypeDescriptor& type, LayoutRule ru
 /*  ============== CLASSES ============== */
 
 /**
- * Describes the shape of a GPU-buffer-resident type (scalar, vector, matrix,
- * array or struct) as a flat hierarchy via std::variant. Used together with
- * LayoutRule and compute_layout() to determine byte offsets/sizes/strides
- * without touching the GPU.
+ * Describes the shape of a GPU-buffer-resident type (a single scalar/
+ * vector/matrix Type value, an array or a struct) as a flat hierarchy via
+ * std::variant. Used together with LayoutRule and compute_layout() to
+ * determine byte offsets/sizes/strides without touching the GPU.
  */
 class TypeDescriptor {
 public:
-    using Payload = std::variant<ScalarDesc, VectorDesc, MatrixDesc, ArrayDesc, StructDesc>;
+    using Payload = std::variant<SingleDesc, ArrayDesc, StructDesc>;
 
-    static TypeDescriptor scalar(ScalarType type);
-    // Throws std::runtime_error if components is not in [2, 4].
-    static TypeDescriptor vector(ScalarType component_type, int components);
-    // Throws std::runtime_error if rows or columns is not in [2, 4].
-    static TypeDescriptor matrix(ScalarType component_type, int rows, int columns);
+    static TypeDescriptor single(Type type);
     // count == 0 denotes an unsized/runtime array.
     static TypeDescriptor array_of(std::shared_ptr<TypeDescriptor> element_type, std::uint64_t count);
     static TypeDescriptor struct_of(std::vector<StructField> fields);
@@ -406,7 +476,7 @@ private:
 /**
  * Computed byte layout of a TypeDescriptor under a given LayoutRule: size,
  * alignment and, depending on the type's kind, per-field offsets (STRUCT) or
- * element stride/count (ARRAY/MATRIX).
+ * element stride/count (ARRAY, or a matrix-shaped SINGLE).
  */
 class Layout {
 public:
@@ -415,21 +485,36 @@ public:
     // Size this layout would occupy as one element of an array of itself,
     // i.e. size rounded up to alignment (and, under Std140, up to 16) --
     // the byte stride between consecutive elements. Used both to size
-    // ARRAY/MATRIX strides and by Device::create_buffer(layout, ..., count > 1).
+    // ARRAY/matrix strides and by Device::create_buffer(layout, ..., count > 1).
     std::uint64_t aligned_size = 0;
-    TypeKind kind = TypeKind::SCALAR;
-    // SCALAR/VECTOR/MATRIX only: the scalar component type (UNDEFINED for
-    // ARRAY/STRUCT, since those don't have one leaf type of their own).
-    ScalarType component_type = ScalarType::UNDEFINED;
+    TypeKind kind = TypeKind::SINGLE;
+    // SINGLE only: the exact scalar/vector/matrix Type this Layout was
+    // computed for (UNDEFINED for ARRAY/STRUCT).
+    Type type = Type::UNDEFINED;
+    // SINGLE only: `type`'s own base scalar component (itself, for a
+    // scalar) -- UNDEFINED for ARRAY/STRUCT, since those don't have one
+    // leaf type of their own.
+    Type component_type = Type::UNDEFINED;
 
     // STRUCT only: ordered fields with their offsets and sub-layouts.
     std::vector<LayoutField> fields;
 
-    // ARRAY/MATRIX only: layout of a single element (ARRAY) or column (MATRIX),
-    // the byte stride between consecutive elements/columns, and their count.
+    // ARRAY, or a matrix-shaped SINGLE, only: layout of a single element
+    // (ARRAY) or column (matrix), the byte stride between consecutive
+    // elements/columns, and their count. Null for a scalar/vector SINGLE.
     std::shared_ptr<Layout> element_layout;
     std::uint64_t stride = 0;
     std::uint64_t count = 0;
+
+    // Looks up a named field of this STRUCT layout (as produced by
+    // compute_layout() on a TypeDescriptor::struct_of()), for navigating a
+    // Layout tree by name (e.g. Layouts::instance()->field("transform")).
+    // Chain into a nested struct via the returned field's own `.layout`
+    // (itself a Layout, so `.field(...)` applies again), or into an
+    // ARRAY/MATRIX field via `.layout->element_layout`. Throws
+    // std::runtime_error if this layout isn't a STRUCT, or no field named
+    // `name` exists.
+    [[nodiscard]] const LayoutField& field(const std::string& name) const;
 };
 
 /**
@@ -487,6 +572,11 @@ public:
     Resource& operator=(Resource&& other) noexcept = delete;
     virtual ~Resource() noexcept;
     void dispose();
+    // Index of the Device this resource was created from (Device::index in
+    // Python) -- lets Python-level code hidden behind an implicit "current
+    // device" still identify which device a returned object belongs to.
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const noexcept;
 protected:
     std::shared_ptr<vk_ResourceData> data_;
     ResourceSlice slice_{};
@@ -495,7 +585,7 @@ protected:
 class Buffer: public Resource {
 public:
     // `layout` describes a single element of this buffer: the scalar type
-    // (Device::create_buffer(elements, ScalarType, ...)), an array of a
+    // (Device::create_buffer(elements, Type, ...)), an array of a
     // format's per-channel scalar (Device::create_buffer(elements, Format,
     // ...)), or the passed-in Layout as-is (Device::create_buffer(layout,
     // ...)). Every Buffer has one -- there is no "untyped" buffer. `format`
@@ -518,7 +608,7 @@ public:
 
     // Reinterprets this buffer's bytes (same underlying offset/size) as a
     // flat array of `scalar` elements.
-    std::shared_ptr<Buffer> cast(ScalarType scalar) const;
+    std::shared_ptr<Buffer> cast(Type scalar) const;
     // Reinterprets this buffer's bytes as a flat array of `format` texels
     // (internally, an array of the format's own per-channel scalar type).
     std::shared_ptr<Buffer> cast(Format format) const;
@@ -615,7 +705,7 @@ private:
 class Tensor: public Resource {
 public:
     Tensor(std::shared_ptr<vk_ResourceData> resource_data, ResourceSlice view_slice,
-        std::vector<std::uint64_t> shape, ScalarType scalar_type);
+        std::vector<std::uint64_t> shape, Type scalar_type);
     Tensor() = delete;
     Tensor(const Tensor&) = delete;
     Tensor& operator=(const Tensor&) = delete;
@@ -625,7 +715,7 @@ public:
 
     [[nodiscard]] std::uint64_t size() const noexcept { return slice_.buffer.size; }
     [[nodiscard]] const std::vector<std::uint64_t>& shape() const noexcept { return shape_; }
-    [[nodiscard]] ScalarType scalar_type() const noexcept { return scalar_type_; }
+    [[nodiscard]] Type scalar_type() const noexcept { return scalar_type_; }
 
     // Exports this tensor as a dlpack tensor, using shape()/scalar_type()
     // directly (no element_layout() struct-fallback logic, unlike
@@ -650,39 +740,41 @@ public:
     [[nodiscard]] std::uint64_t vk_buffer_offset() const noexcept;
 private:
     std::vector<std::uint64_t> shape_;
-    ScalarType scalar_type_;
+    Type scalar_type_;
 };
 
 /**
  * A device-usable view over externally-owned memory, obtained from
- * Device::wrap(). If the wrapped object could be used directly (one of
- * this library's own Buffers; an already-contiguous DLPack tensor whose
- * memory happens to already be one of this Device's own allocations; or a
- * host-visible Python buffer-protocol object when the requested location
- * is HOST), this simply forwards its pointer -- no copy is made, and none
- * is made on destruction either. Otherwise it owns a temporary Buffer:
- * WrapMode::CopyIn/CopyInOut copies the source into it at wrap() time;
- * WrapMode::CopyOut/CopyInOut copies it back into the source when this
- * WrappedMemory is destroyed.
+ * Device::wrap(). If the wrapped object is directly accessible from both
+ * the CPU and GPU sides (one of this library's own Buffers or Tensors; or
+ * an already-contiguous DLPack tensor whose memory happens to already be
+ * one of this Device's own allocations), this simply forwards its pointer
+ * -- no copy is ever made, and every dirty/update method below is a no-op.
+ *
+ * Otherwise it owns a temporary Buffer standing in for the GPU side, and
+ * tracks which side (the wrapped object, "cpu", or the temporary buffer,
+ * "gpu") most recently changed via a pair of version counters. Call
+ * make_cpu_dirty()/make_gpu_dirty() after modifying one side, and
+ * update_cpu()/update_gpu() to lazily pull the other side's changes across
+ * -- a copy only actually happens when the destination is stale.
  */
 class WrappedMemory {
 public:
-    // Only meaningful internally, to know how (or whether) to copy back on
-    // destruction; not exposed to Python.
+    // Only meaningful internally, to know how (or whether) to copy across;
+    // not exposed to Python.
     enum class SourceKind : int {
-        NONE = 0,            // Directly mapped: no copy-back.
-        DLPACK = 1,           // Copy back via `source`'s __dlpack__() export.
-        BUFFER_PROTOCOL = 2,  // Copy back via `source`'s buffer-protocol memory.
+        NONE = 0,             // Directly mapped: no copy, ever.
+        DLPACK = 1,           // Copy via `source`'s __dlpack__() export.
+        BUFFER_PROTOCOL = 2,  // Copy via `source`'s buffer-protocol memory.
     };
 
     WrappedMemory(
         std::weak_ptr<Device> device,
         std::uint64_t device_ptr,
         std::vector<std::uint64_t> shape,
-        ScalarType scalar_type,
+        Type scalar_type,
         std::shared_ptr<Buffer> owned_buffer,
         MemoryLocation owned_location,
-        WrapMode mode,
         SourceKind source_kind,
         pybind11::object source) noexcept;
     WrappedMemory() = delete;
@@ -692,13 +784,23 @@ public:
     WrappedMemory& operator=(WrappedMemory&& other) noexcept = delete;
     ~WrappedMemory() noexcept;
 
-    // Performs, immediately, whatever copy-back this wrap's WrapMode calls
-    // for (OUT/INOUT), rather than leaving it to whenever the Python
-    // garbage collector gets around to destroying this object. Safe to
-    // call more than once -- only the first call has any effect. Unlike
-    // the destructor, exceptions raised while copying back propagate to
-    // the caller instead of being swallowed.
-    void unwrap();
+    // Marks the CPU side (the wrapped Python object) as holding the
+    // freshest data, so the next update_gpu() call will copy it across.
+    // No-op for a direct mapping (see class comment).
+    void make_cpu_dirty() noexcept;
+    // Symmetric to make_cpu_dirty(): marks the GPU side (this wrap's own
+    // device_ptr, e.g. after a shader wrote through it) as holding the
+    // freshest data, so the next update_cpu() call will copy it back.
+    void make_gpu_dirty() noexcept;
+    // Copies GPU -> CPU (this wrap's temporary buffer back into the
+    // wrapped Python object) only if the GPU side is currently the fresher
+    // one; a no-op otherwise, and always a no-op for a direct mapping.
+    // Exceptions raised while copying propagate to the caller.
+    void update_cpu();
+    // Symmetric to update_cpu(): copies CPU -> GPU (the wrapped Python
+    // object into this wrap's temporary buffer) only if the CPU side is
+    // currently the fresher one.
+    void update_gpu();
 
     // Vulkan buffer device address of this wrapped memory -- a raw
     // pointer usable from within a shader (e.g. through
@@ -706,30 +808,40 @@ public:
     // external-memory-exported (e.g. CUDA) pointer.
     [[nodiscard]] std::uint64_t device_ptr() const noexcept { return device_ptr_; }
     [[nodiscard]] const std::vector<std::uint64_t>& shape() const noexcept { return shape_; }
-    [[nodiscard]] ScalarType scalar_type() const noexcept { return scalar_type_; }
+    [[nodiscard]] Type scalar_type() const noexcept { return scalar_type_; }
 private:
+    // True when device_ptr_ aliases the wrapped object's own memory
+    // directly: there is only one copy of the data, so dirty/update calls
+    // have nothing to do.
+    [[nodiscard]] bool is_direct() const noexcept { return source_kind_ == SourceKind::NONE; }
+
     std::weak_ptr<Device> device_;
     std::uint64_t device_ptr_;
     std::vector<std::uint64_t> shape_;
-    ScalarType scalar_type_;
+    Type scalar_type_;
     // Non-null only when a temporary allocation backs device_ptr_ (i.e. the
-    // source couldn't be used directly); keeps it alive and is the source
-    // of the OUT/INOUT copy-back.
+    // source couldn't be used directly); keeps it alive and is the source/
+    // destination of update_gpu()/update_cpu().
     std::shared_ptr<Buffer> owned_buffer_;
     // Where owned_buffer_ was allocated (HOST or DEVICE); irrelevant when
-    // owned_buffer_ is null. Needed at copy-back time since a wrap()
-    // request can ask for either location regardless of the source's own.
+    // owned_buffer_ is null. Needed at copy time since a wrap() request can
+    // ask for either location regardless of the source's own.
     MemoryLocation owned_location_;
-    WrapMode mode_;
     SourceKind source_kind_;
     // The original wrapped Python object; kept alive so its __dlpack__()/
-    // buffer-protocol export can be revisited for the copy-back. Heap
-    // allocated since pybind11::object (only forward-declared here) can't
-    // be a direct member of a class defined in this header.
+    // buffer-protocol export can be revisited on every update_cpu()/
+    // update_gpu() call. Heap allocated since pybind11::object (only
+    // forward-declared here) can't be a direct member of a class defined
+    // in this header.
     std::unique_ptr<pybind11::object> source_;
-    // Set by unwrap() so it (and the destructor, which calls it) only
-    // performs the copy-back/release once.
-    bool unwrapped_ = false;
+    // Version counters implementing lazy CPU/GPU synchronization: whichever
+    // side has the strictly higher counter is the one holding fresh data.
+    // update_cpu()/update_gpu() copy from the fresher side into the stale
+    // one and then equalize the two counters; make_cpu_dirty()/
+    // make_gpu_dirty() bump one strictly above the other. Meaningless (and
+    // never touched) when is_direct() is true.
+    std::uint64_t cpu_version_;
+    std::uint64_t gpu_version_;
 };
 
 class Image: public Resource {
@@ -758,6 +870,155 @@ public:
     [[nodiscard]] int vk_array_start() const noexcept { return slice_.image.array_start; }
 private:
     vk::ImageView image_view_;
+};
+
+/**
+ * Tool class with commonly-needed Layouts for ray tracing acceleration
+ * structure buffers, precomputed once and cached: an ADSTriangles::indices
+ * buffer (index16()/index32()), an ADSTriangles::vertices buffer
+ * (position()), an ADSAABB::aabbs buffer (aabb(), VkAabbPositionsKHR-
+ * shaped), and an ADSInstances::instances buffer (instance(),
+ * VkAccelerationStructureInstanceKHR-shaped). Every layout here is computed
+ * under LayoutRule::Scalar (tightly packed, natural alignment), matching
+ * the corresponding Vulkan C struct's own byte layout exactly -- navigable
+ * field-by-field via Layout::field(), e.g.
+ * Layouts::instance()->field("transform").
+ */
+class Layouts {
+public:
+    // A single UINT16 triangle-mesh index (ADSTriangles::indices).
+    [[nodiscard]] static const std::shared_ptr<Layout>& index16();
+    // A single UINT32 triangle-mesh index (ADSTriangles::indices).
+    [[nodiscard]] static const std::shared_ptr<Layout>& index32();
+    // A single tightly-packed FLOAT32 vec3 vertex position
+    // (ADSTriangles::vertices).
+    [[nodiscard]] static const std::shared_ptr<Layout>& position();
+    // A single VkAabbPositionsKHR-shaped procedural AABB entry
+    // (ADSAABB::aabbs): fields "min_x"/"min_y"/"min_z"/"max_x"/"max_y"/"max_z".
+    [[nodiscard]] static const std::shared_ptr<Layout>& aabb();
+    // A single VkAccelerationStructureInstanceKHR-shaped TLAS instance entry
+    // (ADSInstances::instances): fields "transform" (the row-major 3x4
+    // affine transform, as an array of 3 vec4 rows), "instance_custom_index_
+    // and_mask" and "instance_shader_binding_table_record_offset_and_flags"
+    // (each packing two bitfields into one uint32 -- low 24 bits/high 8
+    // bits respectively, since Layout has no bitfield notion of its own:
+    // pack via `(mask << 24) | (custom_index & 0xFFFFFF)`), and
+    // "acceleration_structure_reference" (the referenced BLAS's device
+    // address, see AccelerationStructure::device_address()).
+    [[nodiscard]] static const std::shared_ptr<Layout>& instance();
+private:
+    Layouts() = delete;
+};
+
+// Declares the geometry for a bottom-level acceleration structure (BLAS)
+// built from a triangle mesh. `vertices` must be a DEVICE-resident buffer
+// of tightly-packed FLOAT32 vec3 positions (e.g. Layouts::position()) with
+// at least `vertex_count` elements. `indices`, if given, must be a DEVICE-
+// resident buffer whose element_layout() is a scalar UINT16 or UINT32 (non-
+// indexed triangles are used otherwise); `primitive_count` is the triangle
+// count either way (indices->size() / 3 elements, or vertex_count / 3 for
+// non-indexed).
+struct ADSTriangles {
+    std::shared_ptr<Buffer> vertices;
+    std::uint32_t vertex_count = 0;
+    std::shared_ptr<Buffer> indices;
+    std::uint32_t primitive_count = 0;
+    bool opaque = true;
+};
+
+// Declares the geometry for a bottom-level acceleration structure (BLAS)
+// built from procedural AABBs. `aabbs` must be a DEVICE-resident buffer of
+// Layouts::aabb()-shaped entries, with at least `count` elements.
+struct ADSAABB {
+    std::shared_ptr<Buffer> aabbs;
+    std::uint32_t count = 0;
+    bool opaque = true;
+};
+
+// Declares a top-level acceleration structure (TLAS) built from instances
+// of other, already-built bottom-level acceleration structures. `instances`
+// must be a DEVICE-resident buffer of Layouts::instance()-shaped entries,
+// with at least `count` elements.
+struct ADSInstances {
+    std::shared_ptr<Buffer> instances;
+    std::uint32_t count = 0;
+};
+
+// Declares the geometry backing one acceleration structure build:
+// ADSTriangles/ADSAABB build a BLAS, ADSInstances builds a TLAS. Passed to
+// Device::create_ads() (to size and allocate the acceleration structure)
+// and CommandBuffer::build_ads() (to actually record the build).
+using ADSDeclaration = std::variant<ADSTriangles, ADSAABB, ADSInstances>;
+
+/**
+ * Owns a vk::AccelerationStructureKHR and its dedicated backing buffer.
+ * Not exposed to users directly: they interact with it through
+ * AccelerationStructure.
+ */
+class vk_AccelerationStructure {
+public:
+    vk_AccelerationStructure(std::weak_ptr<Device> device, vk::AccelerationStructureKHR handle,
+        vk::Buffer storage_buffer, vk::DeviceMemory storage_memory,
+        vk::AccelerationStructureTypeKHR type, std::uint64_t build_scratch_size) noexcept;
+    vk_AccelerationStructure() = delete;
+    vk_AccelerationStructure(const vk_AccelerationStructure&) = delete;
+    vk_AccelerationStructure& operator=(const vk_AccelerationStructure&) = delete;
+    vk_AccelerationStructure(vk_AccelerationStructure&& other) noexcept = delete;
+    vk_AccelerationStructure& operator=(vk_AccelerationStructure&& other) noexcept = delete;
+    ~vk_AccelerationStructure() noexcept { dispose(); }
+    // Destroys the underlying vk::AccelerationStructureKHR and its backing
+    // buffer/memory now, if not already done. Idempotent. Called
+    // proactively by Device::dispose() (see vk_Sampler::dispose's rationale),
+    // and by the destructor as a fallback.
+    void dispose() noexcept;
+    [[nodiscard]] vk::AccelerationStructureKHR vk_handle() const noexcept { return handle_; }
+    [[nodiscard]] vk::AccelerationStructureTypeKHR vk_type() const noexcept { return type_; }
+    [[nodiscard]] std::uint64_t vk_build_scratch_size() const noexcept { return build_scratch_size_; }
+    // Vulkan device address of this acceleration structure, queried lazily
+    // (and memoized) the first time it's needed -- e.g. to fill in a TLAS
+    // instance entry's "acceleration_structure_reference" field (see
+    // Layouts::instance()).
+    [[nodiscard]] std::uint64_t vk_device_address() const;
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const;
+private:
+    std::weak_ptr<Device> device_;
+    vk::AccelerationStructureKHR handle_;
+    vk::Buffer storage_buffer_;
+    vk::DeviceMemory storage_memory_;
+    vk::AccelerationStructureTypeKHR type_;
+    std::uint64_t build_scratch_size_;
+    mutable std::uint64_t device_address_ = 0;
+};
+
+/**
+ * User-facing handle to a built (or build-pending) acceleration structure,
+ * obtained from Device::create_ads(). Pass it to CommandBuffer::build_ads()
+ * to actually record its build, and to DescriptorSet::bind() (declared type
+ * ACCELERATION_STRUCTURE) to use it from a shader, or reference it from a
+ * TLAS instance entry via device_address().
+ */
+class AccelerationStructure {
+public:
+    explicit AccelerationStructure(std::shared_ptr<vk_AccelerationStructure> ads) noexcept : ads_(std::move(ads)) {}
+    AccelerationStructure() = delete;
+    AccelerationStructure(const AccelerationStructure&) = delete;
+    AccelerationStructure& operator=(const AccelerationStructure&) = delete;
+    AccelerationStructure(AccelerationStructure&& other) noexcept = delete;
+    AccelerationStructure& operator=(AccelerationStructure&& other) noexcept = delete;
+    ~AccelerationStructure() noexcept = default;
+
+    // This acceleration structure's Vulkan device address: for a BLAS, the
+    // value to place in a TLAS instance entry's
+    // "acceleration_structure_reference" field (see Layouts::instance()).
+    [[nodiscard]] std::uint64_t device_address() const { return ads_->vk_device_address(); }
+    [[nodiscard]] std::uint32_t device_index() const { return ads_->device_index(); }
+
+    // Underlying vk_AccelerationStructure. Used internally by
+    // CommandBuffer::build_ads, not exposed to Python.
+    [[nodiscard]] const std::shared_ptr<vk_AccelerationStructure>& vk_ads() const noexcept { return ads_; }
+private:
+    std::shared_ptr<vk_AccelerationStructure> ads_;
 };
 
 class SubmittedTask {
@@ -822,6 +1083,17 @@ public:
 
     // Records a device-side copy from `source` into `destination`.
     void transfer(const std::shared_ptr<Buffer>& source, const std::shared_ptr<Buffer>& destination);
+    // Records a device-side copy of every mip level/array layer `source`
+    // covers into `destination` (tightly packed, mip-by-mip, no row/slice
+    // padding -- matching Device::create_staging(image)'s own sizing).
+    // `source` is assumed to be in VK_IMAGE_LAYOUT_GENERAL (true of every
+    // Image -- see its docstring). `destination` must be exactly
+    // `source`'s byte size (see Device::create_staging(image)).
+    void transfer(const std::shared_ptr<Image>& source, const std::shared_ptr<Buffer>& destination);
+    // Symmetric to transfer(Image, Buffer): copies `source`'s bytes into
+    // every mip level/array layer `destination` covers, in the same
+    // tightly-packed layout.
+    void transfer(const std::shared_ptr<Buffer>& source, const std::shared_ptr<Image>& destination);
 
     // Binds `pipeline` for subsequent bind()/dispatch_threads() (compute) or
     // draw commands (graphics). `pipeline` must already be closed. Keeps a
@@ -854,6 +1126,25 @@ public:
     // Sets the dynamic viewport and scissor rectangle (identically) used by
     // subsequent draw calls. Graphics pipelines only.
     void set_viewport(float x, float y, float width, float height);
+
+    // Sets the dynamic cull mode used by subsequent draw calls. Graphics
+    // pipelines only. Requires Device::vk_extended_dynamic_state_supported().
+    void set_cull_mode(CullMode mode);
+
+    // Sets the dynamic front-face winding order used by subsequent draw
+    // calls. Graphics pipelines only. Requires
+    // Device::vk_extended_dynamic_state_supported().
+    void set_front_face(FrontFace front_face);
+
+    // Sets dynamic depth testing state used by subsequent draw calls:
+    // `enable` toggles the depth test itself, `write_enable` whether a
+    // passing fragment writes its depth, and `compare_op` how the
+    // fragment's depth compares against the depth buffer. Requires an
+    // active render pass (set_framebuffer()) whose pipeline declared a
+    // depth attachment via Pipeline::attach_depth(), and
+    // Device::vk_extended_dynamic_state_supported(). Graphics pipelines
+    // only.
+    void set_depth_test(bool enable, bool write_enable = true, CompareOp compare_op = CompareOp::LESS);
 
     // Records a device-side blit (resizing/format-converting as needed,
     // using `filter` for magnification/minification) from `src` into `dst`.
@@ -888,6 +1179,16 @@ public:
     // a RASTERIZATION pipeline to be bound, and an active render pass
     // (set_framebuffer()).
     void dispatch_indexed_primitives(std::uint32_t indices, std::uint32_t index_start = 0, std::int32_t vertex_offset = 0);
+
+    // Records a build of `ads` (previously sized/allocated by
+    // Device::create_ads()) from the geometry described by `declaration`,
+    // which must be the same kind (ADSTriangles/ADSAABB vs ADSInstances) it
+    // was created with -- allocates a temporary scratch buffer for the
+    // build, kept alive (like every buffer/acceleration structure
+    // referenced here) for as long as this command buffer is, including
+    // while submitted and pending on the GPU. Requires a COMPUTE-capable
+    // engine.
+    void build_ads(const std::shared_ptr<AccelerationStructure>& ads, const ADSDeclaration& declaration);
 
     // ends recording (and any still-active render pass) and submits the command buffer for execution on its engine.
     void close();
@@ -926,6 +1227,16 @@ public:
     [[nodiscard]] std::shared_ptr<vk_CommandBuffer> vk_command_buffer() const {
         return command_buffer_;
     }
+
+    // Index of the Device/EngineType/engine this command buffer was created
+    // from (Engine::create_command_buffer) -- lets Python-level code hidden
+    // behind an implicit "current device"/"current engine" still identify
+    // which one produced a given command buffer. Throw if already
+    // release()d, since device_/engine_ are reset then. Defined out-of-line
+    // in device.cpp: Device/Engine aren't complete types yet here.
+    [[nodiscard]] std::uint32_t device_index() const;
+    [[nodiscard]] EngineType engine_type() const;
+    [[nodiscard]] std::uint32_t engine_index() const;
 private:
     std::shared_ptr<Device> device_;
     std::shared_ptr<Engine> engine_;
@@ -939,16 +1250,25 @@ private:
     // the currently active pipeline (used by bind()/dispatch_threads()).
     std::vector<std::shared_ptr<Pipeline>> bound_pipelines_;
     std::vector<std::shared_ptr<DescriptorSet>> bound_descriptor_sets_;
-    // Framebuffers (set_framebuffer), vertex/index buffers (bind_vertices/
-    // bind_indices) and images (blit_image) ever referenced during this
-    // recording, kept alive the same way and for the same reason as
+    // Framebuffers (set_framebuffer), buffers (bind_vertices/bind_indices/
+    // transfer) and images (blit_image/transfer) ever referenced during
+    // this recording, kept alive the same way and for the same reason as
     // bound_pipelines_/bound_descriptor_sets_ above.
     std::vector<std::shared_ptr<Framebuffer>> bound_framebuffers_;
     std::vector<std::shared_ptr<Buffer>> bound_vertex_index_buffers_;
     std::vector<std::shared_ptr<Image>> bound_images_;
+    // Acceleration structures built (build_ads), the geometry input buffers
+    // they were built from, and their temporary scratch buffers, kept alive
+    // the same way and for the same reason as bound_pipelines_ above.
+    std::vector<std::shared_ptr<AccelerationStructure>> bound_acceleration_structures_;
+    std::vector<std::shared_ptr<Buffer>> bound_ads_input_buffers_;
+    std::vector<std::shared_ptr<Buffer>> bound_scratch_buffers_;
     // Whether a render pass begun by set_framebuffer() is still active
     // (i.e. hasn't been ended by a later set_framebuffer() or close()).
     bool render_pass_active_ = false;
+    // Whether the framebuffer bound by the most recent set_framebuffer()
+    // has a depth attachment -- gates set_depth_test(true, ...).
+    bool active_framebuffer_has_depth_ = false;
 };
 
 /**
@@ -981,6 +1301,7 @@ public:
     void vk_wait_for(std::uint64_t submission_id);
     // check if timeline on gpu and collect all completed.
     std::uint64_t vk_check_completion();
+    [[nodiscard]] EngineType engine_type() const noexcept { return engine_type_; }
 private:
     // iterate all submitted tasks with submission_id <= submission_id and collect them as completed. This is called automatically by vk_wait_for and vk_is_completed when the timeline semaphore has reached the submission_id.
     // notify completion.
@@ -1015,6 +1336,9 @@ public:
     ~Engine() noexcept { device_.reset(); engine_.reset(); }
 
     std::uint32_t engine_index() const noexcept { return engine_index_; }
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const noexcept;
+    [[nodiscard]] EngineType engine_type() const noexcept { return engine_->engine_type(); }
 
     void vk_release_command_buffer(const std::shared_ptr<vk_CommandBuffer>& command_buffer) {
         engine_->release_command_buffer(command_buffer);
@@ -1118,6 +1442,13 @@ public:
     int vk_layout(int set, int binding, DescriptorType description, int count);
     void vk_vertex_layout(int start_location, const Layout& layout);
     int vk_attach(int slot, Format format);
+    // Declares this pipeline's depth/stencil attachment (at most one).
+    // `format` must satisfy is_depth_format(). Requires
+    // Device::vk_extended_dynamic_state_supported() (depth test/write/
+    // compare op are only ever set dynamically -- see
+    // CommandBuffer::set_depth_test() -- never baked into the pipeline).
+    // Graphics pipelines only. Must be called before close().
+    void vk_attach_depth(Format format);
     // Declares the compute shader's own workgroup size (its
     // `layout(local_size_x = ..., ...)` declaration in GLSL). Must match the
     // actual shader code -- there is no way to verify this from the compiled
@@ -1131,6 +1462,8 @@ public:
     [[nodiscard]] const vk_DescriptorBinding& vk_binding(int layout_id) const;
     [[nodiscard]] vk::RenderPass vk_render_pass() const noexcept { return render_pass_; }
     [[nodiscard]] const std::vector<vk_AttachmentDesc>& vk_attachments() const noexcept { return attachments_; }
+    [[nodiscard]] bool vk_has_depth_attachment() const noexcept { return depth_attachment_format_.has_value(); }
+    [[nodiscard]] Format vk_depth_attachment_format() const noexcept { return *depth_attachment_format_; }
     // Underlying vk::Pipeline and vk::PipelineLayout. Used internally by
     // CommandBuffer::set_pipeline, not exposed to Python.
     [[nodiscard]] vk::Pipeline vk_handle() const noexcept { return pipeline_; }
@@ -1168,6 +1501,7 @@ private:
     std::vector<vk_DescriptorBinding> bindings_;
     std::vector<VertexBinding> vertex_bindings_;
     std::vector<vk_AttachmentDesc> attachments_;
+    std::optional<Format> depth_attachment_format_;
 
     std::vector<vk::DescriptorSetLayout> descriptor_set_layouts_;
     vk::PipelineLayout pipeline_layout_;
@@ -1220,6 +1554,13 @@ public:
     // close().
     AttachHandle attach(int slot, Format format) { return AttachHandle(pipeline_->vk_attach(slot, format)); }
 
+    // Declares this pipeline's depth (or depth/stencil) attachment, enabling
+    // CommandBuffer::set_depth_test() and depth-buffer-aware rendering.
+    // `format` must satisfy is_depth_format(). At most one per pipeline.
+    // Requires Device::vk_extended_dynamic_state_supported() (Vulkan 1.3).
+    // Graphics pipelines only. Must be called before close().
+    void attach_depth(Format format) { pipeline_->vk_attach_depth(format); }
+
     // Declares the compute shader's own workgroup size (its
     // `layout(local_size_x = ..., ...)` declaration in GLSL) so that
     // CommandBuffer::dispatch_threads can compute the number of workgroups
@@ -1238,8 +1579,13 @@ public:
 
     // Creates a framebuffer compatible with this (closed) pipeline's render
     // pass. `attachments` must provide exactly one image per slot declared
-    // via attach(), matching format and dimensions. Graphics pipelines only.
-    [[nodiscard]] std::shared_ptr<Framebuffer> create_framebuffer(std::vector<std::pair<AttachHandle, std::shared_ptr<Image>>> attachments);
+    // via attach(), matching format and dimensions. `depth_image` must be
+    // provided (matching attach_depth()'s format and attachments' dimensions)
+    // if and only if attach_depth() was called on this pipeline. Graphics
+    // pipelines only.
+    [[nodiscard]] std::shared_ptr<Framebuffer> create_framebuffer(
+        std::vector<std::pair<AttachHandle, std::shared_ptr<Image>>> attachments,
+        std::shared_ptr<Image> depth_image = nullptr);
 
     // Allocates a new descriptor set matching the layout declared for `set`
     // via layout(). Pipeline must be closed first.
@@ -1248,6 +1594,8 @@ public:
     [[nodiscard]] bool is_closed() const noexcept { return pipeline_->is_closed(); }
 
     [[nodiscard]] std::shared_ptr<vk_Pipeline> vk_pipeline() const noexcept { return pipeline_; }
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const noexcept;
 private:
     std::shared_ptr<Device> device_;
     std::shared_ptr<vk_Pipeline> pipeline_;
@@ -1260,7 +1608,7 @@ private:
 class vk_Framebuffer {
 public:
     vk_Framebuffer(std::weak_ptr<Device> device, vk::Framebuffer framebuffer, vk::RenderPass render_pass,
-        std::uint32_t attachment_count, std::uint32_t width, std::uint32_t height) noexcept;
+        std::uint32_t attachment_count, std::uint32_t width, std::uint32_t height, bool has_depth) noexcept;
     vk_Framebuffer() = delete;
     vk_Framebuffer(const vk_Framebuffer&) = delete;
     vk_Framebuffer& operator=(const vk_Framebuffer&) = delete;
@@ -1287,6 +1635,13 @@ public:
     // number of clear values CommandBuffer::set_framebuffer must provide at
     // vkCmdBeginRenderPass time.
     [[nodiscard]] std::uint32_t attachment_count() const noexcept { return attachment_count_; }
+    // Whether the last attachment (see attachment_count()) is a depth/
+    // stencil attachment (Pipeline::attach_depth() was called) -- used by
+    // CommandBuffer::set_framebuffer (an extra depth/stencil clear value)
+    // and set_depth_test (only valid while such a framebuffer is active).
+    [[nodiscard]] bool has_depth() const noexcept { return has_depth_; }
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const;
 private:
     std::weak_ptr<Device> device_;
     vk::Framebuffer framebuffer_;
@@ -1294,6 +1649,7 @@ private:
     std::uint32_t attachment_count_;
     std::uint32_t width_;
     std::uint32_t height_;
+    bool has_depth_;
 };
 
 /**
@@ -1315,10 +1671,11 @@ public:
     [[nodiscard]] vk::Framebuffer vk_framebuffer() const noexcept { return framebuffer_->vk_handle(); }
     [[nodiscard]] vk::RenderPass vk_render_pass() const noexcept { return framebuffer_->vk_render_pass(); }
     [[nodiscard]] std::uint32_t vk_attachment_count() const noexcept { return framebuffer_->attachment_count(); }
+    [[nodiscard]] bool vk_has_depth() const noexcept { return framebuffer_->has_depth(); }
+    [[nodiscard]] std::uint32_t device_index() const { return framebuffer_->device_index(); }
 private:
     std::shared_ptr<vk_Framebuffer> framebuffer_;
 };
-
 
 /**
  * Owns the GLFW window, Vulkan surface, swapchain, and per-slot ("frame on
@@ -1349,7 +1706,7 @@ private:
 class vk_Window : public std::enable_shared_from_this<vk_Window> {
 public:
     vk_Window(std::shared_ptr<Device> device, std::uint32_t width, std::uint32_t height,
-        const std::string& title, Format format, std::uint32_t frames_on_the_fly);
+        const std::string& title, Format format, std::uint32_t frames_on_the_fly, bool vsync = true);
     vk_Window() = delete;
     vk_Window(const vk_Window&) = delete;
     vk_Window& operator=(const vk_Window&) = delete;
@@ -1378,6 +1735,8 @@ public:
     void set_size(std::uint32_t width, std::uint32_t height);
     [[nodiscard]] std::uint32_t width() const noexcept { return extent_.width; }
     [[nodiscard]] std::uint32_t height() const noexcept { return extent_.height; }
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const;
 
     // One slot's resources, for Window::begin_frame to wrap into a Frame.
     struct FrameResources {
@@ -1494,6 +1853,11 @@ private:
     // vk_begin_frame.
     std::vector<vk::Fence> images_in_flight_;
     std::uint32_t frames_on_the_fly_ = 0;
+    // Whether create_swapchain() picks the vsync'd Fifo present mode
+    // (always supported; the default) or tries to disable vsync (Mailbox,
+    // falling back to Immediate, falling back to Fifo if this surface
+    // supports neither) -- see Device::create_window's `vsync` parameter.
+    bool vsync_ = true;
     std::int64_t current_frame_index_ = 0;
     std::int64_t last_enqueue_frame_index_ = -1;
     bool alive_ = true;
@@ -1721,9 +2085,11 @@ class Window : public std::enable_shared_from_this<Window> {
 public:
     // `frames_on_the_fly` becomes the swapchain's image count (clamped to
     // whatever the surface capabilities actually grant); see vk_Window's
-    // docstring for why the two are one and the same here.
+    // docstring for why the two are one and the same here. `vsync` selects
+    // the vsync'd (Fifo, default) or uncapped (Mailbox/Immediate, falling
+    // back to Fifo if unsupported) present mode.
     Window(std::shared_ptr<Device> device, std::uint32_t width, std::uint32_t height, const std::string& title,
-        Format format, std::uint32_t frames_on_the_fly = 3);
+        Format format, std::uint32_t frames_on_the_fly = 3, bool vsync = true);
     Window() = delete;
     Window(const Window&) = delete;
     Window& operator=(const Window&) = delete;
@@ -1745,6 +2111,7 @@ public:
     void set_size(std::uint32_t width, std::uint32_t height) { window_->set_size(width, height); }
     [[nodiscard]] std::uint32_t width() const noexcept { return window_->width(); }
     [[nodiscard]] std::uint32_t height() const noexcept { return window_->height(); }
+    [[nodiscard]] std::uint32_t device_index() const { return window_->device_index(); }
 
     // ---- ImGui-backed GUI. label()/button() are direct, stateless,
     // immediate calls (call every frame; nothing to persist between
@@ -1783,6 +2150,172 @@ private:
 };
 
 
+enum class VertexAttribute {
+    POSITION,
+    NORMAL,
+    TEXCOORD,
+    TANGENT,
+    BITANGENT
+};
+
+// How a loader (see load_scene) decides whether two face-corners referring
+// to the same source data resolve to the same output vertex.
+enum class VertexResolutionMode {
+    // Weld by position only: face-corners sharing a position index become
+    // one output vertex, keeping whichever corner's normal/texcoord was
+    // encountered first (later corners' differing normal/texcoord, if any,
+    // are discarded).
+    ByPosition,
+    // Weld by the full (position, normal, texcoord) tuple: two face-corners
+    // share a vertex only if all of their attributes match. Default.
+    ByAllAttributes,
+    // No welding: every face-corner gets its own vertex, even if identical
+    // to another one.
+    Duplicate,
+};
+
+class Mesh {
+public:
+    Mesh(std::shared_ptr<Buffer> vertices, std::shared_ptr<Buffer> indices, std::vector<VertexAttribute> attributes)
+        : vertices_(std::move(vertices)), indices_(std::move(indices)), attributes_(std::move(attributes)) {}
+    Mesh() = delete;
+    Mesh(const Mesh&) = delete;
+    Mesh(Mesh&&) = delete;
+    Mesh& operator=(const Mesh&) = delete;
+    Mesh& operator=(Mesh&&) = delete;
+    virtual ~Mesh() = default;
+
+    [[nodiscard]] const std::shared_ptr<Buffer>& vertices() const noexcept { return vertices_; }
+    [[nodiscard]] const std::shared_ptr<Buffer>& indices() const noexcept { return indices_; }
+    [[nodiscard]] const std::vector<VertexAttribute>& attributes() const noexcept { return attributes_; }
+private:
+    std::shared_ptr<Buffer> vertices_;
+    std::shared_ptr<Buffer> indices_;
+    std::vector<VertexAttribute> attributes_;
+};
+
+// A single named material property. Deliberately a closed set of plain
+// value kinds (not a fixed schema of named fields) so any loader can stash
+// whatever it finds -- e.g. ("diffuse", vec3), ("shininess", 42.0f),
+// ("diffuse_map", "wood.png") -- without Material needing to know about
+// every possible property up front.
+using MaterialValue = std::variant<float, std::array<float, 3>, std::string>;
+
+class Material {
+public:
+    Material() = default;
+    Material(const Material&) = delete;
+    Material& operator=(const Material&) = delete;
+    Material(Material&&) = delete;
+    Material& operator=(Material&&) = delete;
+
+    void set(std::string name, MaterialValue value) { properties_[std::move(name)] = std::move(value); }
+    [[nodiscard]] const MaterialValue* find(const std::string& name) const noexcept {
+        auto it = properties_.find(name);
+        return it == properties_.end() ? nullptr : &it->second;
+    }
+    [[nodiscard]] const std::unordered_map<std::string, MaterialValue>& properties() const noexcept { return properties_; }
+private:
+    std::unordered_map<std::string, MaterialValue> properties_;
+};
+
+class SceneNode {
+public:
+    SceneNode(std::string name, std::shared_ptr<Material> material, std::shared_ptr<Mesh> mesh, std::shared_ptr<float[3][4]> transform)
+        : name_(std::move(name)), material_(std::move(material)), mesh_(std::move(mesh)), transform_(std::move(transform)) {}
+
+    [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] const std::shared_ptr<Material>& material() const noexcept { return material_; }
+    [[nodiscard]] const std::shared_ptr<Mesh>& mesh() const noexcept { return mesh_; }
+    // Null when the source format has no per-node transform concept (e.g. OBJ).
+    [[nodiscard]] const std::shared_ptr<float[3][4]>& transform() const noexcept { return transform_; }
+private:
+    std::string name_;
+    std::shared_ptr<Material> material_;
+    std::shared_ptr<Mesh> mesh_;
+    std::shared_ptr<float[3][4]> transform_;
+};
+
+class Scene {
+public:
+    Scene() = default;
+    Scene(const Scene&) = delete;
+    Scene& operator=(const Scene&) = delete;
+    Scene(Scene&&) = delete;
+    Scene& operator=(Scene&&) = delete;
+
+    void add_node(SceneNode node) { nodes_.push_back(std::move(node)); }
+    [[nodiscard]] const std::vector<SceneNode>& nodes() const noexcept { return nodes_; }
+private:
+    std::vector<SceneNode> nodes_;
+};
+
+// Loads a scene file into device-resident Meshes, dispatching on
+// `filename`'s extension. Only ".obj" (via tinyobjloader) is implemented;
+// any other extension throws std::runtime_error. `resolution_mode`
+// controls vertex welding (see VertexResolutionMode). A group/shape that
+// references more than one material produces one SceneNode per material
+// used within it (all sharing the group's name).
+std::shared_ptr<Scene> load_scene(
+    const std::shared_ptr<Device>& device,
+    const std::string& filename,
+    VertexResolutionMode resolution_mode = VertexResolutionMode::ByAllAttributes);
+
+
+/**
+ * Owns the vk::Sampler created by Device::create_sampler. Not exposed to
+ * users directly: they interact with it through Sampler.
+ */
+class vk_Sampler {
+public:
+    vk_Sampler(std::weak_ptr<Device> device, vk::Sampler sampler) noexcept;
+    vk_Sampler() = delete;
+    vk_Sampler(const vk_Sampler&) = delete;
+    vk_Sampler& operator=(const vk_Sampler&) = delete;
+    vk_Sampler(vk_Sampler&& other) noexcept = delete;
+    vk_Sampler& operator=(vk_Sampler&& other) noexcept = delete;
+    ~vk_Sampler() noexcept { dispose(); }
+    // Destroys the underlying vk::Sampler now, if not already done.
+    // Idempotent. Called proactively by Device::dispose() (see
+    // vk_Window::vk_dispose_with's docstring for why this can't simply be
+    // left to ~vk_Sampler() running whenever Python happens to drop the
+    // last reference), and by the destructor as a fallback.
+    void dispose() noexcept;
+    [[nodiscard]] vk::Sampler vk_handle() const noexcept { return sampler_; }
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const;
+private:
+    std::weak_ptr<Device> device_;
+    vk::Sampler sampler_;
+};
+
+/**
+ * User-facing handle to a texture sampler (filtering + wrap modes),
+ * obtained from Device::create_sampler. Used together with an Image via
+ * DescriptorSet::bind, either as a standalone DescriptorType::SAMPLER
+ * binding (paired with a separate DescriptorType::SAMPLED_IMAGE binding,
+ * e.g. GLSL `texture2D`/`sampler` combined manually into a `sampler2D` in
+ * the shader), or directly combined with an image in one
+ * DescriptorType::COMBINED_IMAGE_SAMPLER binding (GLSL `sampler2D`).
+ */
+class Sampler {
+public:
+    explicit Sampler(std::shared_ptr<vk_Sampler> sampler) noexcept : sampler_(std::move(sampler)) {}
+    Sampler() = delete;
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+    Sampler(Sampler&& other) noexcept = delete;
+    Sampler& operator=(Sampler&& other) noexcept = delete;
+    ~Sampler() noexcept = default;
+
+    // Underlying vk::Sampler. Used internally by DescriptorSet::bind, not
+    // exposed to Python.
+    [[nodiscard]] vk::Sampler vk_sampler() const noexcept { return sampler_->vk_handle(); }
+    [[nodiscard]] std::uint32_t device_index() const { return sampler_->device_index(); }
+private:
+    std::shared_ptr<vk_Sampler> sampler_;
+};
+
 /**
  * Owns the vk::DescriptorSet allocated by Pipeline::create_descriptor_set,
  * and resolves layout ids (from Pipeline::layout()) into their (set,
@@ -1801,9 +2334,15 @@ public:
 
     void vk_bind_buffer(LayoutHandle layout_id, const std::shared_ptr<Buffer>& buffer);
     void vk_bind_image(LayoutHandle layout_id, const std::shared_ptr<Image>& image);
+    // Binding's declared type must be SAMPLER.
+    void vk_bind_sampler(LayoutHandle layout_id, const std::shared_ptr<Sampler>& sampler);
+    // Binding's declared type must be COMBINED_IMAGE_SAMPLER.
+    void vk_bind_combined(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler);
     // Underlying vk::DescriptorSet. Used internally by
     // CommandBuffer::set_pipeline, not exposed to Python.
     [[nodiscard]] vk::DescriptorSet vk_handle() const noexcept { return descriptor_set_; }
+    // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
+    [[nodiscard]] std::uint32_t device_index() const;
 private:
     std::weak_ptr<Device> device_;
     std::shared_ptr<vk_Pipeline> pipeline_;
@@ -1829,16 +2368,50 @@ public:
     // binding's declared type must be STORAGE_BUFFER or UNIFORM_BUFFER.
     void bind(LayoutHandle layout_id, const std::shared_ptr<Buffer>& buffer) { descriptor_set_->vk_bind_buffer(layout_id, buffer); }
     // Writes `image` into the binding identified by `layout_id`. The
-    // binding's declared type must be STORAGE_IMAGE or SAMPLED_IMAGE (types
-    // requiring a sampler are not yet supported).
+    // binding's declared type must be STORAGE_IMAGE (read/write, no
+    // sampler) or SAMPLED_IMAGE (read-only, sampled in the shader via a
+    // separately-bound SAMPLER at another binding -- see the other
+    // overload for a single combined binding instead).
     void bind(LayoutHandle layout_id, const std::shared_ptr<Image>& image) { descriptor_set_->vk_bind_image(layout_id, image); }
+    // Writes `sampler` into the binding identified by `layout_id`. The
+    // binding's declared type must be SAMPLER (paired with a separate
+    // SAMPLED_IMAGE binding, e.g. GLSL `texture2D tex; sampler s;`).
+    void bind(LayoutHandle layout_id, const std::shared_ptr<Sampler>& sampler) { descriptor_set_->vk_bind_sampler(layout_id, sampler); }
+    // Writes `image`+`sampler` together into the binding identified by
+    // `layout_id`. The binding's declared type must be
+    // COMBINED_IMAGE_SAMPLER (GLSL `sampler2D`).
+    void bind(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
+        descriptor_set_->vk_bind_combined(layout_id, image, sampler);
+    }
 
     // Underlying vk_DescriptorSet. Used internally by
     // CommandBuffer::set_pipeline, not exposed to Python.
     [[nodiscard]] std::shared_ptr<vk_DescriptorSet> vk_descriptor_set() const noexcept { return descriptor_set_; }
+    [[nodiscard]] std::uint32_t device_index() const { return descriptor_set_->device_index(); }
 private:
     std::shared_ptr<vk_DescriptorSet> descriptor_set_;
 };
+
+// Read-only Vulkan physical device info, gathered without creating any
+// logical Device -- see query_device_infos(). Not exposed to Python as a
+// class: bindings.cpp converts each one into a plain dict.
+struct DeviceInfo {
+    std::uint32_t index;
+    std::string name;
+    std::string vendor;
+    std::uint32_t vendor_id;
+    std::uint32_t device_id;
+    std::string device_type;
+    std::string api_version;
+    std::uint32_t driver_version;
+    std::uint64_t vram_bytes;
+};
+
+// Enumerates every Vulkan-visible physical device without creating a
+// logical Device for any of them: a throwaway vk::Instance is created,
+// queried, and destroyed within this call alone. `index` in each result
+// is what Device::create_device()/create_device() expects.
+std::vector<DeviceInfo> query_device_infos();
 
 /**
  * Wraps a vk::Instance, a vk::Device and its associated resources, memory managers and engines.
@@ -1863,8 +2436,8 @@ public:
     [[nodiscard]] std::shared_ptr<Pipeline> create_pipeline(PipelineType type);
     // Creates a buffer to store an array of `elements` of specific scalar
     // type. Its element layout is that scalar type. A raw byte buffer is
-    // just this with type == ScalarType::UINT8.
-    [[nodiscard]] std::shared_ptr<Buffer> create_buffer(std::uint64_t elements, ScalarType type, MemoryLocation location);
+    // just this with type == Type::UINT8.
+    [[nodiscard]] std::shared_ptr<Buffer> create_buffer(std::uint64_t elements, Type type, MemoryLocation location);
     // Creates a buffer to store an array of `elements` texels with specific
     // format. Its element layout is an array of the format's own
     // per-channel scalar type.
@@ -1876,6 +2449,27 @@ public:
     [[nodiscard]] std::shared_ptr<Buffer> create_buffer(std::uint64_t elements, const std::shared_ptr<Layout>& layout, MemoryLocation location);
     // Creates the resource data for an image of specific dimensions and format
     [[nodiscard]] std::shared_ptr<Image> create_image(int width, int height, int depth, int mip_levels, int array_layers, Format format, MemoryLocation location);
+    // Creates a 2D depth (or depth/stencil) attachment image for use with
+    // Pipeline::attach_depth()/create_framebuffer() and
+    // CommandBuffer::set_depth_test(). `format` must be one of the
+    // Format::Depth* values (see is_depth_format()); unlike create_image(),
+    // its usage is depth/stencil-attachment + sampled (not color-attachment/
+    // storage, which are invalid for a depth format). Like every other
+    // Image, it's transitioned once to VK_IMAGE_LAYOUT_GENERAL at creation.
+    [[nodiscard]] std::shared_ptr<Image> create_depth_buffer_image(int width, int height, Format format = Format::Depth32_Float, MemoryLocation location = MemoryLocation::DEVICE);
+    // Creates a texture sampler (filtering + per-axis wrap modes), for use
+    // with an Image via DescriptorSet::bind (either a standalone SAMPLER
+    // binding, or combined with an image in one COMBINED_IMAGE_SAMPLER
+    // binding). CLAMP_TO_BORDER always uses an opaque black border color.
+    // Mip levels beyond an image's own are simply never sampled (minLod=0,
+    // maxLod effectively unbounded); there is no LOD bias/clamp control.
+    [[nodiscard]] std::shared_ptr<Sampler> create_sampler(
+        Filter mag_filter = Filter::LINEAR,
+        Filter min_filter = Filter::LINEAR,
+        MipmapMode mipmap_mode = MipmapMode::LINEAR,
+        WrapMode wrap_u = WrapMode::REPEAT,
+        WrapMode wrap_v = WrapMode::REPEAT,
+        WrapMode wrap_w = WrapMode::REPEAT);
     // Creates a Window: an GLFW-backed OS window plus its Vulkan swapchain
     // and presentation machinery. See Window's docstring for the render
     // loop this is meant to drive. The swapchain itself is always created
@@ -1883,9 +2477,12 @@ public:
     // supported); `format` instead controls image_target/buffer_target/
     // tensor_target, which may be any format -- presenting one of them
     // blits it into the BGRA8_UNorm swapchain image, converting formats
-    // along the way.
+    // along the way. `vsync` (default true) selects the present mode:
+    // true picks the always-supported, vsync'd Fifo; false tries Mailbox
+    // (uncapped, no tearing), falling back to Immediate (uncapped, can
+    // tear), falling back to Fifo if this surface supports neither.
     [[nodiscard]] std::shared_ptr<Window> create_window(std::uint32_t width, std::uint32_t height,
-        const std::string& title, Format format, std::uint32_t frames_on_the_fly = 3);
+        const std::string& title, Format format, std::uint32_t frames_on_the_fly = 3, bool vsync = true);
     // Creates a plain buffer sized to match `buffer`, in `location` (default HOST).
     // This is the correct Vulkan pattern to move data between CPU and GPU memory:
     // record a CommandBuffer::transfer between the staging buffer and `buffer`
@@ -1898,7 +2495,15 @@ public:
     // scalar type, tracked and disposed the same way as Buffer/Image, and
     // directly exportable via torch.from_dlpack() (Tensor implements
     // __dlpack__/__dlpack_device__).
-    [[nodiscard]] std::shared_ptr<Tensor> create_tensor(const std::vector<std::uint64_t>& shape, ScalarType type, MemoryLocation location);
+    [[nodiscard]] std::shared_ptr<Tensor> create_tensor(const std::vector<std::uint64_t>& shape, Type type, MemoryLocation location);
+
+    // Creates (sizes and allocates, but does not build -- see
+    // CommandBuffer::build_ads()) an acceleration structure: a bottom-level
+    // one (BLAS) for an ADSTriangles/ADSAABB declaration, or a top-level one
+    // (TLAS) for an ADSInstances declaration. Throws std::runtime_error if
+    // VK_KHR_acceleration_structure isn't supported/enabled on this device
+    // (see vk_acceleration_structure_supported()).
+    [[nodiscard]] std::shared_ptr<AccelerationStructure> create_ads(const ADSDeclaration& declaration);
 
     // Wraps an externally-owned Python object as device-usable memory.
     // `obj` may be:
@@ -1907,14 +2512,17 @@ public:
     //     with no copy, if it's contiguous and its memory already belongs
     //     to one of this Device's own memory managers (e.g. it came from
     //     torch.from_dlpack() on one of our own Buffers); otherwise a
-    //     temporary buffer is allocated at `location` and the data is
-    //     copied in/out per `mode`, using the loaded interop library for
-    //     CUDA-resident tensors or a strided/plain host copy otherwise.
-    //   - a Python buffer-protocol object (e.g. a numpy array): used
-    //     directly (its own pointer) with no copy if `location` is HOST;
-    //     otherwise copied into/out of a temporary DEVICE buffer per `mode`.
+    //     temporary buffer is allocated at `location`, and the returned
+    //     WrappedMemory lazily copies data in/out of it on demand (see
+    //     WrappedMemory::update_cpu()/update_gpu()), using the loaded
+    //     interop library for CUDA-resident tensors or a strided/plain
+    //     host copy otherwise.
+    //   - a Python buffer-protocol object (e.g. a numpy array): always
+    //     copied into/out of a temporary buffer at `location` on demand,
+    //     since a foreign host allocation has no Vulkan device address of
+    //     its own.
     // Throws std::runtime_error if `obj` is none of these.
-    [[nodiscard]] std::shared_ptr<WrappedMemory> wrap(pybind11::object obj, WrapMode mode, MemoryLocation location = MemoryLocation::DEVICE);
+    [[nodiscard]] std::shared_ptr<WrappedMemory> wrap(pybind11::object obj, MemoryLocation location = MemoryLocation::DEVICE);
 
     // Copies `total_bytes`/shape/strides FROM an external source (`src_data`,
     // host- or CUDA-resident per `source_is_cuda`) INTO `dst_external_ptr`
@@ -1930,7 +2538,7 @@ public:
     // Symmetric to vk_copy_in: copies `total_bytes` FROM `src_external_ptr`
     // (a contiguous buffer at `src_location`) INTO an external destination
     // (`dst_data`, host- or CUDA-resident per `dst_is_cuda`). Used
-    // internally by WrappedMemory's destructor, not exposed to Python.
+    // internally by WrappedMemory::update_cpu(), not exposed to Python.
     void vk_copy_out(
         std::uint64_t src_external_ptr, MemoryLocation src_location,
         void* dst_data, const std::int64_t* shape, const std::int64_t* strides, int ndim,
@@ -1938,7 +2546,27 @@ public:
 
     vk::Device vk_device() const noexcept { return device_; }
     vk::Instance vk_instance() const noexcept { return instance_; }
+    // Dynamically-loaded function pointer table used only for
+    // VK_KHR_acceleration_structure calls: unlike core/VK_KHR_swapchain
+    // functions (exported as trampolines by the Vulkan loader's own import
+    // library), acceleration structure entry points aren't guaranteed to be
+    // linkable that way, so they're resolved at runtime via
+    // vkGetInstanceProcAddr/vkGetDeviceProcAddr instead (see vk_init()).
+    // Used internally by Device::create_ads/CommandBuffer::build_ads/
+    // vk_AccelerationStructure, not exposed to Python.
+    [[nodiscard]] const vk::DispatchLoaderDynamic& vk_dynamic_dispatch() const noexcept { return dynamic_dispatch_; }
     [[nodiscard]] bool vk_swapchain_supported() const noexcept { return swapchain_supported_; }
+    // Whether the negotiated Vulkan API version is >= 1.3, where "extended
+    // dynamic state" (dynamic cull mode/front face/depth test/depth write/
+    // depth compare op) is core, unconditional functionality -- gates
+    // Pipeline::attach_depth() and CommandBuffer::set_cull_mode()/
+    // set_front_face()/set_depth_test().
+    [[nodiscard]] bool vk_extended_dynamic_state_supported() const noexcept { return extended_dynamic_state_supported_; }
+    // Whether VK_KHR_acceleration_structure (plus its VK_KHR_
+    // deferred_host_operations dependency) was supported and enabled; gates
+    // Device::create_ads() and the two acceleration-structure-related
+    // buffer usage flags (storage/build-input) added to every buffer.
+    [[nodiscard]] bool vk_acceleration_structure_supported() const noexcept { return acceleration_structure_supported_; }
 
     // Tracks `framebuffer` (a weak reference) so Device::dispose() can
     // proactively destroy it -- and the render pass/image views it
@@ -1964,6 +2592,23 @@ public:
     // Used internally by Device::create_window, not exposed to Python.
     void vk_register_window(const std::shared_ptr<vk_Window>& window) {
         windows_.push_back(window);
+    }
+
+    // Tracks `sampler` (a weak reference) so Device::dispose() can
+    // proactively destroy it before destroying the device/instance
+    // themselves (same rationale as vk_register_window's). Used internally
+    // by Device::create_sampler, not exposed to Python.
+    void vk_register_sampler(const std::shared_ptr<vk_Sampler>& sampler) {
+        samplers_.push_back(sampler);
+    }
+
+    // Tracks `ads` (a weak reference) so Device::dispose() can proactively
+    // destroy it -- and its dedicated backing buffer/memory -- before
+    // destroying the device/instance themselves (same rationale as
+    // windows_/samplers_ above). Used internally by Device::create_ads, not
+    // exposed to Python.
+    void vk_register_acceleration_structure(const std::shared_ptr<vk_AccelerationStructure>& ads) {
+        acceleration_structures_.push_back(ads);
     }
 
     // Vulkan timeline semaphore, exported (if VK_KHR_external_semaphore
@@ -2008,12 +2653,14 @@ private:
     // binds, blit_image) assumes uniformly, since this codebase does not
     // otherwise track per-image Vulkan layouts.
     void vk_transition_image_layout(vk::Image image, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
-        std::uint32_t mip_levels, std::uint32_t array_layers);
+        std::uint32_t mip_levels, std::uint32_t array_layers, vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor);
 
     uint32_t device_index_ = 0;
     vk::Instance instance_;
     vk::PhysicalDevice physical_;
     vk::Device device_;
+    // See vk_dynamic_dispatch()'s comment; populated in vk_init().
+    vk::DispatchLoaderDynamic dynamic_dispatch_;
     // Whether VK_KHR_external_semaphore plus the platform win32/fd
     // extension were both supported and enabled; gates whether
     // interop_semaphore_ is created at all in vk_init().
@@ -2021,6 +2668,12 @@ private:
     // Whether VK_KHR_swapchain was supported and enabled; gates
     // Device::create_window.
     bool swapchain_supported_ = false;
+    // Whether the negotiated Vulkan API version is >= 1.3; see
+    // vk_extended_dynamic_state_supported().
+    bool extended_dynamic_state_supported_ = false;
+    // Whether VK_KHR_acceleration_structure was supported and enabled; see
+    // vk_acceleration_structure_supported().
+    bool acceleration_structure_supported_ = false;
     vk::Semaphore interop_semaphore_;
     std::uint64_t interop_semaphore_value_ = 0;
     std::shared_ptr<MemoryManager> host_memory_manager_;
@@ -2033,6 +2686,8 @@ private:
     std::vector<std::weak_ptr<vk_ResourceData>> resources_; // created resources
     std::vector<std::weak_ptr<vk_Framebuffer>> framebuffers_; // created framebuffers
     std::vector<std::weak_ptr<vk_Window>> windows_; // created windows
+    std::vector<std::weak_ptr<vk_Sampler>> samplers_; // created samplers
+    std::vector<std::weak_ptr<vk_AccelerationStructure>> acceleration_structures_; // created acceleration structures
 };
 
 /**
@@ -2216,14 +2871,34 @@ public:
     [[nodiscard]] bool host_visible() const noexcept { return host_visible_; }
     // Pointer to the device address.
     [[nodiscard]] std::uint64_t device_ptr() const noexcept;
-    // Represents the pointer of the memory visible outside the device, i.e., CPU, CUDA, ROCm, etc.
+    // Represents the pointer of the memory visible outside the device, i.e.,
+    // CPU, CUDA, ROCm, etc. For a host_visible_ page this is just the
+    // (eagerly, cheaply) mapped host pointer. For a DEVICE page, this is a
+    // CUDA-interop-imported pointer, obtained lazily -- see
+    // ensure_external_ptr_imported() -- the first time this or dl_device()
+    // is actually called, not at page-allocation time.
     [[nodiscard]] std::uint64_t external_ptr() const noexcept;
 
     std::uint64_t external_to_device(std::uint64_t external_ptr) const noexcept;
     std::uint64_t device_to_external(std::uint64_t device_ptr) const noexcept;
 
-    [[nodiscard]] DLDevice dl_device() const noexcept { return dl_device_; }
+    // Whether this page is CPU- or CUDA/ROCm-accessible for DLPack export
+    // purposes. Like external_ptr(), triggers the lazy CUDA import for a
+    // DEVICE page (answering "is this CUDA-accessible" honestly requires
+    // actually attempting the import).
+    [[nodiscard]] DLDevice dl_device() const noexcept;
 private:
+    // Imports this page's memory into CUDA via try_import_memory_ the first
+    // time external_ptr()/dl_device() is called on a non-host_visible_
+    // page, memoized in external_ptr_/external_ptr_import_attempted_ so a
+    // failed/unsupported import isn't retried on every call. Deliberately
+    // NOT done eagerly in the constructor: try_import_memory_ silently
+    // initializes a CUDA context (with all its process-wide side effects,
+    // e.g. background driver threads) as a side effect, and
+    // Device::create_buffer(..., DEVICE) alone -- with no interop ever
+    // used -- must not pay that cost.
+    void ensure_external_ptr_imported() const noexcept;
+
     std::weak_ptr<Device> device_;
     uint32_t memory_type_index_ = 0;
     bool host_visible_ = false;
@@ -2232,8 +2907,8 @@ private:
     vk::DeviceMemory memory_{};
 
     std::uint64_t device_ptr_ = 0;
-    std::uint64_t external_ptr_ = 0;
+    mutable std::uint64_t external_ptr_ = 0;
+    mutable bool external_ptr_import_attempted_ = false;
     std::unique_ptr<MemoryAllocator> allocator_;
-    DLDevice dl_device_;
     ExternalImportFn try_import_memory_ = nullptr;
 };

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <iostream>
 #include <ostream>
+#include <string>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -403,6 +404,238 @@ static bool wait_for_semaphore(const CudaRuntimeApi& api, unsigned long long sem
     return api.wait_external_semaphores_async_fn(&sem, &params, 1, kCudaDefaultStream) == 0;
 }
 
+// ---- N-dimensional (>2D) strided copy: CUDA kernel path ----
+//
+// copy_strided()'s 1D/2D fast paths (below) cover a single flat memcpy or a
+// single pitched 2D memcpy. Anything left over -- genuinely strided across
+// more than two dimensions (e.g. an arbitrarily permuted/transposed view) --
+// is handled here with a single CUDA kernel launch instead of a host-side
+// loop over the outer dimension(s), so the whole copy is one async GPU
+// operation regardless of ndim.
+
+constexpr int kMaxStridedCopyDims = 8;
+
+// Mirrors, field-for-field, the device-side `StridedCopyParams` embedded in
+// kVkStridedCopyKernelSource below -- passed by value as a single
+// cuLaunchKernel parameter, so the layouts must match exactly (hence the
+// largest-alignment-first field order, so no compiler needs to insert
+// padding either side).
+struct StridedCopyParams {
+    long long shape[kMaxStridedCopyDims];
+    long long strides[kMaxStridedCopyDims];
+    unsigned long long itemsize;
+    unsigned long long total_elements;
+    int ndim;
+    int contiguous_is_dst;
+};
+
+constexpr const char* kVkStridedCopyKernelName = "vk_strided_copy_kernel";
+
+static const char* kVkStridedCopyKernelSource = R"CUDA(
+extern "C" {
+struct StridedCopyParams {
+    long long shape[8];
+    long long strides[8];
+    unsigned long long itemsize;
+    unsigned long long total_elements;
+    int ndim;
+    int contiguous_is_dst;
+};
+
+__global__ void vk_strided_copy_kernel(unsigned char* contiguous, unsigned char* strided, StridedCopyParams params) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (idx >= params.total_elements) return;
+
+    unsigned long long remaining = idx;
+    long long strided_elem_offset = 0;
+    for (int d = params.ndim - 1; d >= 0; --d) {
+        long long dim = params.shape[d];
+        long long coord = (long long)(remaining % (unsigned long long)dim);
+        remaining /= (unsigned long long)dim;
+        strided_elem_offset += coord * params.strides[d];
+    }
+    unsigned long long strided_byte_offset = (unsigned long long)strided_elem_offset * params.itemsize;
+    unsigned long long contiguous_byte_offset = idx * params.itemsize;
+
+    unsigned char* dst = params.contiguous_is_dst ? (contiguous + contiguous_byte_offset) : (strided + strided_byte_offset);
+    const unsigned char* src = params.contiguous_is_dst ? (strided + strided_byte_offset) : (contiguous + contiguous_byte_offset);
+    for (unsigned long long b = 0; b < params.itemsize; ++b) dst[b] = src[b];
+}
+}
+)CUDA";
+
+struct CudaDriverApi {
+    using CuInitFn = int (*)(unsigned int);
+    using CuModuleLoadDataExFn = int (*)(void**, const void*, unsigned int, const int*, void**);
+    using CuModuleGetFunctionFn = int (*)(void**, void*, const char*);
+    using CuLaunchKernelFn = int (*)(
+        void*, unsigned int, unsigned int, unsigned int,
+        unsigned int, unsigned int, unsigned int,
+        unsigned int, void*, void**, void**);
+    CuInitFn cu_init_fn = nullptr;
+    CuModuleLoadDataExFn cu_module_load_data_ex_fn = nullptr;
+    CuModuleGetFunctionFn cu_module_get_function_fn = nullptr;
+    CuLaunchKernelFn cu_launch_kernel_fn = nullptr;
+    bool ok() const {
+        return cu_init_fn && cu_module_load_data_ex_fn && cu_module_get_function_fn && cu_launch_kernel_fn;
+    }
+};
+
+static CudaDriverApi load_cuda_driver_api() {
+    CudaDriverApi api{};
+#if defined(_WIN32)
+    HMODULE cuda = LoadLibraryA("nvcuda.dll");
+    if (!cuda) return api;
+    api.cu_init_fn = (CudaDriverApi::CuInitFn)GetProcAddress(cuda, "cuInit");
+    api.cu_module_load_data_ex_fn = (CudaDriverApi::CuModuleLoadDataExFn)GetProcAddress(cuda, "cuModuleLoadDataEx");
+    api.cu_module_get_function_fn = (CudaDriverApi::CuModuleGetFunctionFn)GetProcAddress(cuda, "cuModuleGetFunction");
+    api.cu_launch_kernel_fn = (CudaDriverApi::CuLaunchKernelFn)GetProcAddress(cuda, "cuLaunchKernel");
+#else
+    void* cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!cuda) cuda = dlopen("libcuda.so", RTLD_NOW | RTLD_LOCAL);
+    if (!cuda) return api;
+    api.cu_init_fn = (CudaDriverApi::CuInitFn)dlsym(cuda, "cuInit");
+    api.cu_module_load_data_ex_fn = (CudaDriverApi::CuModuleLoadDataExFn)dlsym(cuda, "cuModuleLoadDataEx");
+    api.cu_module_get_function_fn = (CudaDriverApi::CuModuleGetFunctionFn)dlsym(cuda, "cuModuleGetFunction");
+    api.cu_launch_kernel_fn = (CudaDriverApi::CuLaunchKernelFn)dlsym(cuda, "cuLaunchKernel");
+#endif
+    return api;
+}
+
+struct NvrtcApi {
+    using CreateProgramFn = int (*)(void**, const char*, const char*, int, const char* const*, const char* const*);
+    using CompileProgramFn = int (*)(void*, int, const char* const*);
+    using GetPTXSizeFn = int (*)(void*, size_t*);
+    using GetPTXFn = int (*)(void*, char*);
+    using GetProgramLogSizeFn = int (*)(void*, size_t*);
+    using GetProgramLogFn = int (*)(void*, char*);
+    CreateProgramFn create_program_fn = nullptr;
+    CompileProgramFn compile_program_fn = nullptr;
+    GetPTXSizeFn get_ptx_size_fn = nullptr;
+    GetPTXFn get_ptx_fn = nullptr;
+    GetProgramLogSizeFn get_program_log_size_fn = nullptr;
+    GetProgramLogFn get_program_log_fn = nullptr;
+    bool ok() const { return create_program_fn && compile_program_fn && get_ptx_size_fn && get_ptx_fn; }
+};
+
+static NvrtcApi load_nvrtc_api() {
+    NvrtcApi api{};
+#if defined(_WIN32)
+    const char* candidates[] = { "nvrtc64_120_0.dll", "nvrtc64_112_0.dll", "nvrtc64_110_0.dll" };
+    HMODULE nvrtc = nullptr;
+    for (const char* name : candidates) {
+        nvrtc = LoadLibraryA(name);
+        if (nvrtc) break;
+    }
+    if (!nvrtc) return api;
+    api.create_program_fn = (NvrtcApi::CreateProgramFn)GetProcAddress(nvrtc, "nvrtcCreateProgram");
+    api.compile_program_fn = (NvrtcApi::CompileProgramFn)GetProcAddress(nvrtc, "nvrtcCompileProgram");
+    api.get_ptx_size_fn = (NvrtcApi::GetPTXSizeFn)GetProcAddress(nvrtc, "nvrtcGetPTXSize");
+    api.get_ptx_fn = (NvrtcApi::GetPTXFn)GetProcAddress(nvrtc, "nvrtcGetPTX");
+    api.get_program_log_size_fn = (NvrtcApi::GetProgramLogSizeFn)GetProcAddress(nvrtc, "nvrtcGetProgramLogSize");
+    api.get_program_log_fn = (NvrtcApi::GetProgramLogFn)GetProcAddress(nvrtc, "nvrtcGetProgramLog");
+#else
+    const char* candidates[] = { "libnvrtc.so", "libnvrtc.so.12", "libnvrtc.so.11.2" };
+    void* nvrtc = nullptr;
+    for (const char* name : candidates) {
+        nvrtc = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (nvrtc) break;
+    }
+    if (!nvrtc) return api;
+    api.create_program_fn = (NvrtcApi::CreateProgramFn)dlsym(nvrtc, "nvrtcCreateProgram");
+    api.compile_program_fn = (NvrtcApi::CompileProgramFn)dlsym(nvrtc, "nvrtcCompileProgram");
+    api.get_ptx_size_fn = (NvrtcApi::GetPTXSizeFn)dlsym(nvrtc, "nvrtcGetPTXSize");
+    api.get_ptx_fn = (NvrtcApi::GetPTXFn)dlsym(nvrtc, "nvrtcGetPTX");
+    api.get_program_log_size_fn = (NvrtcApi::GetProgramLogSizeFn)dlsym(nvrtc, "nvrtcGetProgramLogSize");
+    api.get_program_log_fn = (NvrtcApi::GetProgramLogFn)dlsym(nvrtc, "nvrtcGetProgramLog");
+#endif
+    return api;
+}
+
+// Compiles kVkStridedCopyKernelSource (once, cached for the process
+// lifetime -- magic-static init is thread-safe) and loads it via the driver
+// API, returning the CUfunction to launch (nullptr on any failure: no NVRTC/
+// driver available, or a compile error, logged to stderr).
+static void* get_strided_copy_kernel_function(const CudaDriverApi& driver) {
+    static void* cached_function = [&driver]() -> void* {
+        if (driver.cu_init_fn(0) != 0) return nullptr;
+
+        NvrtcApi nvrtc = load_nvrtc_api();
+        if (!nvrtc.ok()) return nullptr;
+
+        void* program = nullptr;
+        if (nvrtc.create_program_fn(&program, kVkStridedCopyKernelSource, kVkStridedCopyKernelName, 0, nullptr, nullptr) != 0) {
+            return nullptr;
+        }
+        const char* options[] = { "--gpu-architecture=compute_52" };
+        int compile_rc = nvrtc.compile_program_fn(program, 1, options);
+        if (compile_rc != 0) {
+            if (nvrtc.get_program_log_size_fn && nvrtc.get_program_log_fn) {
+                size_t log_size = 0;
+                nvrtc.get_program_log_size_fn(program, &log_size);
+                if (log_size > 1) {
+                    std::string log(log_size, '\0');
+                    nvrtc.get_program_log_fn(program, log.data());
+                    std::cerr << "[vk_cuda_interop] strided copy kernel compile failed:\n" << log << std::endl;
+                }
+            }
+            return nullptr;
+        }
+
+        size_t ptx_size = 0;
+        if (nvrtc.get_ptx_size_fn(program, &ptx_size) != 0 || ptx_size == 0) return nullptr;
+        std::string ptx(ptx_size, '\0');
+        if (nvrtc.get_ptx_fn(program, ptx.data()) != 0) return nullptr;
+
+        void* module = nullptr;
+        if (driver.cu_module_load_data_ex_fn(&module, ptx.c_str(), 0, nullptr, nullptr) != 0) return nullptr;
+
+        void* function = nullptr;
+        if (driver.cu_module_get_function_fn(&function, module, kVkStridedCopyKernelName) != 0) return nullptr;
+        return function;
+    }();
+    return cached_function;
+}
+
+// Single-kernel-launch fallback for a strided copy of more than two
+// dimensions (see copy_strided()): one thread per element, decomposing its
+// flat index against `shape`/`strides` to locate the strided side, so the
+// entire N-D copy is one async GPU operation instead of a host-side loop.
+static int copy_strided_kernel(
+    void* contiguous, void* data,
+    const long long* shape, const long long* strides, int ndim,
+    unsigned long long itemsize, bool contiguous_is_dst)
+{
+    if (ndim > kMaxStridedCopyDims) return -1;
+
+    CudaDriverApi driver = load_cuda_driver_api();
+    if (!driver.ok()) return -1;
+    void* function = get_strided_copy_kernel_function(driver);
+    if (!function) return -1;
+
+    StridedCopyParams params{};
+    unsigned long long total_elements = 1;
+    for (int d = 0; d < ndim; ++d) {
+        params.shape[d] = shape[d];
+        params.strides[d] = strides[d];
+        total_elements *= (unsigned long long)shape[d];
+    }
+    params.itemsize = itemsize;
+    params.total_elements = total_elements;
+    params.ndim = ndim;
+    params.contiguous_is_dst = contiguous_is_dst ? 1 : 0;
+
+    constexpr unsigned int kBlockSize = 256;
+    const unsigned int grid_size = (unsigned int)((total_elements + kBlockSize - 1) / kBlockSize);
+
+    auto* contiguous_bytes = (unsigned char*)contiguous;
+    auto* data_bytes = (unsigned char*)data;
+    void* kernel_params[] = { &contiguous_bytes, &data_bytes, &params };
+    return driver.cu_launch_kernel_fn(
+        function, grid_size, 1, 1, kBlockSize, 1, 1,
+        0, kCudaDefaultStream, kernel_params, nullptr);
+}
+
 // Copies between `contiguous` (a flat buffer of product(shape)*itemsize
 // bytes) and a strided view `data`/`shape`/`strides` (`ndim` dims).
 // `contiguous_is_dst` selects the direction. All copies are issued on the
@@ -415,10 +648,12 @@ static bool wait_for_semaphore(const CudaRuntimeApi& api, unsigned long long sem
 // true for every shape this project's own dlpack()/field() ever produce
 // (at most one strided "instance" dimension over an otherwise-contiguous
 // element), and for the common case of a plain, unpermuted
-// array-of-structs view from numpy/torch. General fallback (arbitrarily
-// permuted/transposed views): recurse one dimension at a time, which
-// still hits the fast path one level down as soon as the remaining
-// dimensions happen to be packed.
+// array-of-structs view from numpy/torch. 2D fallback (e.g. a transposed
+// matrix): one recursive call per outer index, bottoming out in the 1D fast
+// path above (still no host-side loop beyond this single level). Anything
+// left with more than two dimensions and no packed tail is handled by a
+// single CUDA kernel launch (copy_strided_kernel), not further host-side
+// recursion.
 static int copy_strided(
     const CudaRuntimeApi& api, void* contiguous, void* data,
     const long long* shape, const long long* strides, int ndim,
@@ -455,14 +690,21 @@ static int copy_strided(
         return api.memcpy2d_async_fn(dst, dpitch, src, spitch, (size_t)row_bytes, (size_t)shape[0], kCudaMemcpyDefault, kCudaDefaultStream);
     }
 
-    // Outer dimension only, one recursive call per index.
-    for (long long i = 0; i < shape[0]; ++i) {
-        char* next_data = (char*)data + (unsigned long long)i * (unsigned long long)strides[0] * itemsize;
-        char* next_contiguous = (char*)contiguous + (unsigned long long)i * row_elements * itemsize;
-        int rc = copy_strided(api, next_contiguous, next_data, shape + 1, strides + 1, ndim - 1, itemsize, contiguous_is_dst);
-        if (rc != 0) return rc;
+    if (ndim == 2) {
+        // Outer dimension only, one recursive call per index -- still just
+        // the existing 1D/2D-optimized machinery, one level down.
+        for (long long i = 0; i < shape[0]; ++i) {
+            char* next_data = (char*)data + (unsigned long long)i * (unsigned long long)strides[0] * itemsize;
+            char* next_contiguous = (char*)contiguous + (unsigned long long)i * row_elements * itemsize;
+            int rc = copy_strided(api, next_contiguous, next_data, shape + 1, strides + 1, ndim - 1, itemsize, contiguous_is_dst);
+            if (rc != 0) return rc;
+        }
+        return 0;
     }
-    return 0;
+
+    // More than two dimensions, no packed tail: one kernel launch for the
+    // whole copy instead of a host-side loop over the outer dimension(s).
+    return copy_strided_kernel(contiguous, data, shape, strides, ndim, itemsize, contiguous_is_dst);
 }
 
 // Copies a DLPack tensor (`tensor_data`/`shape`/`strides`/`ndim`, possibly

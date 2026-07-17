@@ -34,7 +34,9 @@ jobs:
         shell: pwsh
         run: |
           $ver = "1.3.275.0"
-          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
+          # "?Human=true" is required: LunarG's download endpoint 404s on
+          # direct HTTP clients (Invoke-WebRequest/curl) without it.
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe?Human=true"
           Invoke-WebRequest -Uri $url -OutFile VulkanSDK-Installer.exe
           Start-Process -FilePath .\VulkanSDK-Installer.exe -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait -NoNewWindow
           $sdkPath = "C:\VulkanSDK\$ver"

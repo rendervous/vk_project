@@ -2648,8 +2648,13 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
 #if defined(_WIN32)
     add_instance_extension_if_supported(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
 #else
-    add_instance_extension_if_supported(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
-    add_instance_extension_if_supported(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+    // Literal names instead of VK_KHR_XLIB_SURFACE_EXTENSION_NAME/
+    // VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME: those macros only exist once
+    // vulkan_xlib.h/vulkan_wayland.h are pulled in (behind
+    // VK_USE_PLATFORM_XLIB_KHR/_WAYLAND_KHR), which isn't guaranteed here
+    // (e.g. Wayland dev headers aren't installed in the manylinux build image).
+    add_instance_extension_if_supported("VK_KHR_xlib_surface");
+    add_instance_extension_if_supported("VK_KHR_wayland_surface");
 #endif
 
     vk::InstanceCreateInfo ci{};

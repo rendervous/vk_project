@@ -253,6 +253,15 @@ enum class ShaderStageType : int {
     TESS_CONTROL = 3,
     TESS_EVAL = 4,
     COMPUTE = 5,
+    // Ray tracing pipeline stages (PipelineType::RAYTRACING only). A
+    // RAYGEN/MISS shader is turned into its own shader group via
+    // Pipeline::append_raygen_group()/append_miss_group(); a CLOSEST_HIT/
+    // ANY_HIT shader is combined into a "triangles hit group" via
+    // Pipeline::append_hit_group().
+    RAYGEN = 6,
+    MISS = 7,
+    CLOSEST_HIT = 8,
+    ANY_HIT = 9,
 };
 
 enum class DescriptorType : int {
@@ -262,9 +271,8 @@ enum class DescriptorType : int {
     SAMPLED_IMAGE = 3,
     SAMPLER = 4,
     COMBINED_IMAGE_SAMPLER = 5,
-    // Not yet bindable via DescriptorSet::bind (no acceleration structure
-    // wrapper exists yet); declaring a binding of this type is allowed for
-    // forward-compatibility but writing to it will throw.
+    // A ray tracing acceleration structure (top-level, typically), bound
+    // via DescriptorSet::bind(layout_id, AccelerationStructure).
     ACCELERATION_STRUCTURE = 6,
 };
 
@@ -342,6 +350,31 @@ public:
     [[nodiscard]] int vk_slot() const noexcept { return slot_; }
 private:
     int slot_;
+};
+
+// Opaque handle returned by Pipeline::stage() for a ray tracing stage
+// (RAYGEN/MISS/CLOSEST_HIT/ANY_HIT), identifying that shader module for use
+// with Pipeline::append_raygen_group()/append_miss_group()/append_hit_group().
+// Not constructible from Python.
+class ShaderHandle {
+public:
+    explicit ShaderHandle(int index) noexcept : index_(index) {}
+    [[nodiscard]] int vk_index() const noexcept { return index_; }
+private:
+    int index_;
+};
+
+// Opaque handle returned by Pipeline::append_raygen_group()/
+// append_miss_group()/append_hit_group(), identifying one shader group of a
+// PipelineType::RAYTRACING pipeline. Not constructible from Python: purely
+// a build-time acknowledgement (the shader binding table is built
+// automatically, in creation order, at Pipeline::close()).
+class ShaderGroupHandle {
+public:
+    explicit ShaderGroupHandle(int index) noexcept : index_(index) {}
+    [[nodiscard]] int vk_index() const noexcept { return index_; }
+private:
+    int index_;
 };
 
 enum class TypeKind : int {
@@ -430,6 +463,18 @@ struct vk_DescriptorBinding {
 struct vk_AttachmentDesc {
     int slot;
     Format format;
+};
+
+// One shader group declared via Pipeline::append_raygen_group()/
+// append_miss_group()/append_hit_group(), for a PipelineType::RAYTRACING
+// pipeline. `general`/`closest_hit`/`any_hit` are indices into vk_Pipeline's
+// own stages_ (VK_SHADER_UNUSED_KHR, i.e. -1 here, when not applicable to
+// this group's kind).
+struct vk_ShaderGroup {
+    bool is_hit_group; // false: general (raygen/miss); true: triangles hit group
+    int general = -1;
+    int closest_hit = -1;
+    int any_hit = -1;
 };
 
 /*  ============== FUNCTIONS ============== */
@@ -605,6 +650,8 @@ public:
     // aligned_size is the per-element byte stride used by slice()/element();
     // kind determines how vk_dlpack() exports this buffer's shape/dtype.
     [[nodiscard]] const std::shared_ptr<Layout>& element_layout() const noexcept { return layout_; }
+    // Number of elements this buffer holds: size() / element_layout()->aligned_size.
+    [[nodiscard]] std::uint64_t count() const noexcept { return size() / layout_->aligned_size; }
 
     // Reinterprets this buffer's bytes (same underlying offset/size) as a
     // flat array of `scalar` elements.
@@ -912,23 +959,27 @@ private:
 
 // Declares the geometry for a bottom-level acceleration structure (BLAS)
 // built from a triangle mesh. `vertices` must be a DEVICE-resident buffer
-// of tightly-packed FLOAT32 vec3 positions (e.g. Layouts::position()) with
-// at least `vertex_count` elements. `indices`, if given, must be a DEVICE-
-// resident buffer whose element_layout() is a scalar UINT16 or UINT32 (non-
-// indexed triangles are used otherwise); `primitive_count` is the triangle
-// count either way (indices->size() / 3 elements, or vertex_count / 3 for
-// non-indexed).
+// of tightly-packed FLOAT32 vec3 positions (e.g. Layouts::position());
+// `vertex_count` defaults to vertices->count(). `indices`, if given, must
+// be a DEVICE-resident buffer whose element_layout() is a scalar UINT16 or
+// UINT32 (non-indexed triangles are used otherwise); `primitive_count`
+// defaults to (indices ? indices : vertices)->count() / 3. `transform`, if
+// given, is a static per-geometry 3x4 row-major transform (a
+// VkTransformMatrixKHR-shaped buffer, e.g. Layouts::instance()'s
+// "transform" field layout) applied at build time; no transform (identity)
+// if null.
 struct ADSTriangles {
     std::shared_ptr<Buffer> vertices;
     std::uint32_t vertex_count = 0;
     std::shared_ptr<Buffer> indices;
     std::uint32_t primitive_count = 0;
+    std::shared_ptr<Buffer> transform;
     bool opaque = true;
 };
 
 // Declares the geometry for a bottom-level acceleration structure (BLAS)
 // built from procedural AABBs. `aabbs` must be a DEVICE-resident buffer of
-// Layouts::aabb()-shaped entries, with at least `count` elements.
+// Layouts::aabb()-shaped entries; `count` defaults to aabbs->count().
 struct ADSAABB {
     std::shared_ptr<Buffer> aabbs;
     std::uint32_t count = 0;
@@ -937,8 +988,8 @@ struct ADSAABB {
 
 // Declares a top-level acceleration structure (TLAS) built from instances
 // of other, already-built bottom-level acceleration structures. `instances`
-// must be a DEVICE-resident buffer of Layouts::instance()-shaped entries,
-// with at least `count` elements.
+// must be a DEVICE-resident buffer of Layouts::instance()-shaped entries;
+// `count` defaults to instances->count().
 struct ADSInstances {
     std::shared_ptr<Buffer> instances;
     std::uint32_t count = 0;
@@ -1190,6 +1241,13 @@ public:
     // engine.
     void build_ads(const std::shared_ptr<AccelerationStructure>& ads, const ADSDeclaration& declaration);
 
+    // Records a ray tracing dispatch (vkCmdTraceRaysKHR) of `width` x
+    // `height` x `depth` rays, using the shader binding table built by the
+    // bound pipeline's close() (see Pipeline::append_raygen_group()/
+    // append_miss_group()/append_hit_group()). Requires a
+    // PipelineType::RAYTRACING pipeline to be bound (set_pipeline()).
+    void trace_rays(std::uint32_t width, std::uint32_t height, std::uint32_t depth = 1);
+
     // ends recording (and any still-active render pass) and submits the command buffer for execution on its engine.
     void close();
     // the command buffer is not going to be used for submission anymore. It is safe to destroy or reuse.
@@ -1387,25 +1445,23 @@ private:
 /**
  * Compiled SPIR-V bytecode for a single shader stage, obtained from
  * precompiled binary words, a file (raw ".spv" binary, or GLSL source
- * compiled at load time), or GLSL source text compiled on the spot by
- * shelling out to glslangValidator (must be on PATH, or found via
- * $VULKAN_SDK/Bin). There is no build- or link-time Vulkan SDK dependency
- * for this -- only this runtime one, and only when compiling from GLSL.
+ * compiled at load time), or GLSL source text compiled on the spot
+ * in-process via glslang (statically linked into this extension). There is
+ * no build- or runtime dependency on a separately installed shader compiler.
  */
 class ShaderSource {
 public:
     static ShaderSource from_spirv(std::vector<std::uint32_t> code, const std::string& entry_point = "main");
-    // `include_dirs` are passed to glslangValidator as `-I<dir>`, only
-    // consulted when `path` doesn't end in ".spv" (i.e. is compiled as GLSL).
+    // `include_dirs` are searched, in order, for `#include "..."` targets,
+    // only consulted when `path` doesn't end in ".spv" (i.e. is compiled as GLSL).
     static ShaderSource from_file(
         const std::string& path,
         ShaderStageType stage,
         const std::string& entry_point = "main",
         const std::vector<std::string>& include_dirs = {});
     // `entry_point` is the name of the entry function as written in
-    // `source` (glslangValidator's --source-entrypoint); the compiled
-    // SPIR-V's own entry point is always named the same. `include_dirs`
-    // are passed to glslangValidator as `-I<dir>`.
+    // `source`; the compiled SPIR-V's own entry point is always named the
+    // same. `include_dirs` are searched, in order, for `#include "..."` targets.
     static ShaderSource from_glsl(
         const std::string& source,
         ShaderStageType stage,
@@ -1438,7 +1494,11 @@ public:
     vk_Pipeline& operator=(vk_Pipeline&& other) noexcept = delete;
     ~vk_Pipeline() noexcept;
 
-    void vk_stage(ShaderStageType type, const ShaderSource& source);
+    // Returns the index of the newly appended stage within stages_ -- only
+    // meaningful for a ray tracing stage (RAYGEN/MISS/CLOSEST_HIT/ANY_HIT),
+    // to later reference it from append_raygen_group()/append_miss_group()/
+    // append_hit_group().
+    int vk_stage(ShaderStageType type, const ShaderSource& source);
     int vk_layout(int set, int binding, DescriptorType description, int count);
     void vk_vertex_layout(int start_location, const Layout& layout);
     int vk_attach(int slot, Format format);
@@ -1456,6 +1516,23 @@ public:
     // number of workgroups covering a requested thread count. Compute
     // pipelines only; defaults to (1, 1, 1) if never called.
     void vk_set_local_size(std::uint32_t x, std::uint32_t y, std::uint32_t z);
+    // Ray tracing pipelines only. `shader_index` (a ShaderHandle from
+    // stage(RAYGEN, ...)/stage(MISS, ...)) becomes its own shader group;
+    // returns the group's SBT index within its own category (raygen groups
+    // and miss groups are each numbered independently, starting at 0, in
+    // creation order) -- exactly one raygen group is required.
+    int vk_append_raygen_group(int shader_index);
+    int vk_append_miss_group(int shader_index);
+    // Ray tracing pipelines only. Combines up to one CLOSEST_HIT and one
+    // ANY_HIT shader (-1 for unused) into a triangles hit group; returns
+    // its SBT index among hit groups, in creation order.
+    int vk_append_hit_group(int closest_hit_index, int any_hit_index);
+    // Ray tracing pipelines only. Maximum nested traceRayEXT() recursion
+    // depth to build the pipeline for (VkRayTracingPipelineCreateInfoKHR::
+    // maxPipelineRayRecursionDepth). Must be called before close(); defaults
+    // to 1 (a raygen shader may trace, but a hit/miss shader may not trace
+    // again) if never called.
+    void vk_stack_size(int depth);
     void vk_close();
 
     [[nodiscard]] vk::DescriptorSet vk_allocate_descriptor_set(int set);
@@ -1473,6 +1550,13 @@ public:
     [[nodiscard]] std::uint32_t vk_local_size_z() const noexcept { return local_size_z_; }
     [[nodiscard]] bool is_closed() const noexcept { return closed_; }
     [[nodiscard]] PipelineType type() const noexcept { return type_; }
+
+    // Shader binding table regions built by close() (RAYTRACING only), for
+    // CommandBuffer::trace_rays(). Used internally, not exposed to Python.
+    [[nodiscard]] const vk::StridedDeviceAddressRegionKHR& vk_raygen_region() const noexcept { return raygen_region_; }
+    [[nodiscard]] const vk::StridedDeviceAddressRegionKHR& vk_miss_region() const noexcept { return miss_region_; }
+    [[nodiscard]] const vk::StridedDeviceAddressRegionKHR& vk_hit_region() const noexcept { return hit_region_; }
+    [[nodiscard]] const vk::StridedDeviceAddressRegionKHR& vk_callable_region() const noexcept { return callable_region_; }
 
 private:
     struct StageInfo {
@@ -1503,11 +1587,32 @@ private:
     std::vector<vk_AttachmentDesc> attachments_;
     std::optional<Format> depth_attachment_format_;
 
+    // Ray tracing pipelines only: one vk_ShaderGroup per append_raygen_group/
+    // append_miss_group/append_hit_group call, in each category's own
+    // creation order -- concatenated as [raygen..., miss..., hit...] to
+    // build VkRayTracingPipelineCreateInfoKHR::pGroups at close(), and to
+    // retrieve shader group handles (vkGetRayTracingShaderGroupHandlesKHR)
+    // in that same, matching order for the shader binding table.
+    std::vector<vk_ShaderGroup> raygen_groups_;
+    std::vector<vk_ShaderGroup> miss_groups_;
+    std::vector<vk_ShaderGroup> hit_groups_;
+    std::uint32_t max_ray_recursion_depth_ = 1;
+
     std::vector<vk::DescriptorSetLayout> descriptor_set_layouts_;
     vk::PipelineLayout pipeline_layout_;
     vk::RenderPass render_pass_;
     vk::Pipeline pipeline_;
     vk::DescriptorPool descriptor_pool_;
+
+    // Shader binding table (RAYTRACING only): one buffer backing all three
+    // regions (raygen/miss/hit), built once at close() from the shader
+    // group handles the driver returns.
+    vk::Buffer sbt_buffer_;
+    vk::DeviceMemory sbt_memory_;
+    vk::StridedDeviceAddressRegionKHR raygen_region_{};
+    vk::StridedDeviceAddressRegionKHR miss_region_{};
+    vk::StridedDeviceAddressRegionKHR hit_region_{};
+    vk::StridedDeviceAddressRegionKHR callable_region_{};
 };
 
 class Framebuffer;
@@ -1530,8 +1635,13 @@ public:
     ~Pipeline() noexcept = default;
 
     // Attaches a compiled shader to one stage of this pipeline. Must be
-    // called before close().
-    void stage(ShaderStageType type, const ShaderSource& source) { pipeline_->vk_stage(type, source); }
+    // called before close(). Returns a handle identifying this shader
+    // module, meaningful only for a ray tracing stage (RAYGEN/MISS/
+    // CLOSEST_HIT/ANY_HIT) -- pass it to append_raygen_group()/
+    // append_miss_group()/append_hit_group().
+    ShaderHandle stage(ShaderStageType type, const ShaderSource& source) {
+        return ShaderHandle(pipeline_->vk_stage(type, source));
+    }
 
     // Declares one binding of the descriptor set layout for `set`. Returns
     // an opaque handle to later reference this binding from
@@ -1571,6 +1681,29 @@ public:
         pipeline_->vk_set_local_size(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), static_cast<std::uint32_t>(z));
     }
 
+    // Turns a RAYGEN shader (from stage()) into its own shader group.
+    // Exactly one is required. Ray tracing pipelines only. Must be called
+    // before close().
+    ShaderGroupHandle append_raygen_group(ShaderHandle shader) {
+        return ShaderGroupHandle(pipeline_->vk_append_raygen_group(shader.vk_index()));
+    }
+    // Turns a MISS shader (from stage()) into its own shader group. Ray
+    // tracing pipelines only. Must be called before close().
+    ShaderGroupHandle append_miss_group(ShaderHandle shader) {
+        return ShaderGroupHandle(pipeline_->vk_append_miss_group(shader.vk_index()));
+    }
+    // Combines up to one CLOSEST_HIT and/or one ANY_HIT shader (from
+    // stage()) into a triangles hit group. Ray tracing pipelines only.
+    // Must be called before close().
+    ShaderGroupHandle append_hit_group(std::optional<ShaderHandle> closest_hit = std::nullopt, std::optional<ShaderHandle> any_hit = std::nullopt) {
+        return ShaderGroupHandle(pipeline_->vk_append_hit_group(
+            closest_hit ? closest_hit->vk_index() : -1,
+            any_hit ? any_hit->vk_index() : -1));
+    }
+    // Maximum nested traceRayEXT() recursion depth (default 1 if never
+    // called). Ray tracing pipelines only. Must be called before close().
+    void stack_size(int depth) { pipeline_->vk_stack_size(depth); }
+
     // Finalizes this pipeline: builds the descriptor set layouts, pipeline
     // layout, (for graphics pipelines) render pass and vertex input state,
     // and the underlying vk::Pipeline. No further stage()/layout()/
@@ -1589,7 +1722,12 @@ public:
 
     // Allocates a new descriptor set matching the layout declared for `set`
     // via layout(). Pipeline must be closed first.
-    [[nodiscard]] std::shared_ptr<DescriptorSet> create_descriptor_set(int set = 0);
+    [[nodiscard]] std::shared_ptr<DescriptorSet> descriptor_set(int set = 0);
+    // Allocates `count` independent descriptor sets matching the layout
+    // declared for `set` -- e.g. one per object to draw/dispatch with its
+    // own bindings, sharing the same Pipeline layout. Pipeline must be
+    // closed first.
+    [[nodiscard]] std::vector<std::shared_ptr<DescriptorSet>> descriptor_set_collection(int set = 0, int count = 1);
 
     [[nodiscard]] bool is_closed() const noexcept { return pipeline_->is_closed(); }
 
@@ -2317,7 +2455,7 @@ private:
 };
 
 /**
- * Owns the vk::DescriptorSet allocated by Pipeline::create_descriptor_set,
+ * Owns the vk::DescriptorSet allocated by Pipeline::descriptor_set,
  * and resolves layout ids (from Pipeline::layout()) into their (set,
  * binding, type) for DescriptorSet::bind. Not exposed to users directly:
  * they interact with it through DescriptorSet.
@@ -2338,6 +2476,8 @@ public:
     void vk_bind_sampler(LayoutHandle layout_id, const std::shared_ptr<Sampler>& sampler);
     // Binding's declared type must be COMBINED_IMAGE_SAMPLER.
     void vk_bind_combined(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler);
+    // Binding's declared type must be ACCELERATION_STRUCTURE.
+    void vk_bind_ads(LayoutHandle layout_id, const std::shared_ptr<AccelerationStructure>& ads);
     // Underlying vk::DescriptorSet. Used internally by
     // CommandBuffer::set_pipeline, not exposed to Python.
     [[nodiscard]] vk::DescriptorSet vk_handle() const noexcept { return descriptor_set_; }
@@ -2352,7 +2492,7 @@ private:
 
 /**
  * User-facing handle to a descriptor set matching one Pipeline's declared
- * layout for a given `set` index. Obtained from Pipeline::create_descriptor_set.
+ * layout for a given `set` index. Obtained from Pipeline::descriptor_set.
  */
 class DescriptorSet {
 public:
@@ -2382,6 +2522,11 @@ public:
     // COMBINED_IMAGE_SAMPLER (GLSL `sampler2D`).
     void bind(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
         descriptor_set_->vk_bind_combined(layout_id, image, sampler);
+    }
+    // Writes `ads` into the binding identified by `layout_id`. The
+    // binding's declared type must be ACCELERATION_STRUCTURE.
+    void bind(LayoutHandle layout_id, const std::shared_ptr<AccelerationStructure>& ads) {
+        descriptor_set_->vk_bind_ads(layout_id, ads);
     }
 
     // Underlying vk_DescriptorSet. Used internally by
@@ -2567,6 +2712,18 @@ public:
     // Device::create_ads() and the two acceleration-structure-related
     // buffer usage flags (storage/build-input) added to every buffer.
     [[nodiscard]] bool vk_acceleration_structure_supported() const noexcept { return acceleration_structure_supported_; }
+    // Whether VK_KHR_ray_tracing_pipeline was supported and enabled; gates
+    // Pipeline::close() for a PipelineType::RAYTRACING pipeline. Requires
+    // vk_acceleration_structure_supported() as well (a ray tracing pipeline
+    // is only useful together with a TLAS to trace against).
+    [[nodiscard]] bool vk_ray_tracing_pipeline_supported() const noexcept { return ray_tracing_pipeline_supported_; }
+    // Shader group handle size/alignment and shader binding table base
+    // alignment (VkPhysicalDeviceRayTracingPipelinePropertiesKHR), needed to
+    // lay out the shader binding table buffer. Only meaningful when
+    // vk_ray_tracing_pipeline_supported() is true.
+    [[nodiscard]] std::uint32_t vk_shader_group_handle_size() const noexcept { return shader_group_handle_size_; }
+    [[nodiscard]] std::uint32_t vk_shader_group_handle_alignment() const noexcept { return shader_group_handle_alignment_; }
+    [[nodiscard]] std::uint32_t vk_shader_group_base_alignment() const noexcept { return shader_group_base_alignment_; }
 
     // Tracks `framebuffer` (a weak reference) so Device::dispose() can
     // proactively destroy it -- and the render pass/image views it
@@ -2674,6 +2831,14 @@ private:
     // Whether VK_KHR_acceleration_structure was supported and enabled; see
     // vk_acceleration_structure_supported().
     bool acceleration_structure_supported_ = false;
+    // Whether VK_KHR_ray_tracing_pipeline was supported and enabled; see
+    // vk_ray_tracing_pipeline_supported().
+    bool ray_tracing_pipeline_supported_ = false;
+    // See vk_shader_group_handle_size()/vk_shader_group_handle_alignment()/
+    // vk_shader_group_base_alignment().
+    std::uint32_t shader_group_handle_size_ = 0;
+    std::uint32_t shader_group_handle_alignment_ = 0;
+    std::uint32_t shader_group_base_alignment_ = 0;
     vk::Semaphore interop_semaphore_;
     std::uint64_t interop_semaphore_value_ = 0;
     std::shared_ptr<MemoryManager> host_memory_manager_;

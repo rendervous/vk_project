@@ -1,5 +1,6 @@
 #include "device.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,10 @@ namespace py = pybind11;
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
+
+#include <glslang/Public/ShaderLang.h>
+#include <glslang/Public/ResourceLimits.h>
+#include <SPIRV/GlslangToSpv.h>
 
 namespace {
 
@@ -259,43 +264,85 @@ vk::ShaderStageFlagBits to_vk_shader_stage(ShaderStageType type) {
         case ShaderStageType::TESS_CONTROL: return vk::ShaderStageFlagBits::eTessellationControl;
         case ShaderStageType::TESS_EVAL: return vk::ShaderStageFlagBits::eTessellationEvaluation;
         case ShaderStageType::COMPUTE: return vk::ShaderStageFlagBits::eCompute;
+        case ShaderStageType::RAYGEN: return vk::ShaderStageFlagBits::eRaygenKHR;
+        case ShaderStageType::MISS: return vk::ShaderStageFlagBits::eMissKHR;
+        case ShaderStageType::CLOSEST_HIT: return vk::ShaderStageFlagBits::eClosestHitKHR;
+        case ShaderStageType::ANY_HIT: return vk::ShaderStageFlagBits::eAnyHitKHR;
         default: throw std::runtime_error("Unsupported shader stage type");
     }
 }
 
-// Stage name understood by glslangValidator's `-S` flag.
-const char* to_glslang_stage_name(ShaderStageType type) {
+// EShLanguage understood by glslang's TShader constructor -- the in-process
+// equivalent of glslangValidator's `-S` flag.
+EShLanguage to_glslang_stage(ShaderStageType type) {
     switch (type) {
-        case ShaderStageType::VERTEX: return "vert";
-        case ShaderStageType::FRAGMENT: return "frag";
-        case ShaderStageType::GEOMETRY: return "geom";
-        case ShaderStageType::TESS_CONTROL: return "tesc";
-        case ShaderStageType::TESS_EVAL: return "tese";
-        case ShaderStageType::COMPUTE: return "comp";
+        case ShaderStageType::VERTEX: return EShLangVertex;
+        case ShaderStageType::FRAGMENT: return EShLangFragment;
+        case ShaderStageType::GEOMETRY: return EShLangGeometry;
+        case ShaderStageType::TESS_CONTROL: return EShLangTessControl;
+        case ShaderStageType::TESS_EVAL: return EShLangTessEvaluation;
+        case ShaderStageType::COMPUTE: return EShLangCompute;
+        case ShaderStageType::RAYGEN: return EShLangRayGen;
+        case ShaderStageType::MISS: return EShLangMiss;
+        case ShaderStageType::CLOSEST_HIT: return EShLangClosestHit;
+        case ShaderStageType::ANY_HIT: return EShLangAnyHit;
         default: throw std::runtime_error("Unsupported shader stage type");
     }
 }
 
-// Locates the glslangValidator executable: relies on it being on PATH by
-// default (this project has no build- or link-time dependency on the Vulkan
-// SDK for shader compilation), falling back to $VULKAN_SDK/Bin as a
-// convenience if that environment variable happens to be set and PATH
-// wasn't configured.
-std::string glslang_validator_path() {
-#if defined(_WIN32)
-    constexpr const char* exe_name = "glslangValidator.exe";
-#else
-    constexpr const char* exe_name = "glslangValidator";
-#endif
-    if (const char* sdk = std::getenv("VULKAN_SDK")) {
-        std::filesystem::path candidate = std::filesystem::path(sdk) / "Bin" / exe_name;
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec)) {
-            return candidate.string();
+// Ray tracing shaders require SPIR-V 1.4+ (Vulkan 1.2's target environment);
+// every other stage keeps compiling exactly as before (unspecified/default
+// target-env), to avoid changing already-working shader compiles.
+bool is_ray_tracing_stage(ShaderStageType type) {
+    return type == ShaderStageType::RAYGEN || type == ShaderStageType::MISS
+        || type == ShaderStageType::CLOSEST_HIT || type == ShaderStageType::ANY_HIT;
+}
+
+// Ensures glslang's global process state is set up exactly once, no matter
+// how many times ShaderSource::from_glsl is called.
+void ensure_glslang_initialized() {
+    static const bool initialized = glslang::InitializeProcess();
+    (void)initialized;
+}
+
+// Resolves `#include "..."` directives against `include_dirs`, in order --
+// the in-process equivalent of glslangValidator's `-I<dir>` flag. Not
+// thread-safe against concurrent from_glsl calls (matches the previous
+// subprocess-based implementation's own one-at-a-time assumption).
+class IncludeDirsIncluder : public glslang::TShader::Includer {
+public:
+    explicit IncludeDirsIncluder(const std::vector<std::string>& dirs) : dirs_(dirs) {}
+
+    IncludeResult* includeLocal(const char* header_name, const char*, size_t) override {
+        return resolve(header_name);
+    }
+    IncludeResult* includeSystem(const char* header_name, const char*, size_t) override {
+        return resolve(header_name);
+    }
+    void releaseInclude(IncludeResult* result) override {
+        if (result) {
+            delete[] static_cast<char*>(result->userData);
+            delete result;
         }
     }
-    return exe_name;
-}
+
+private:
+    IncludeResult* resolve(const char* header_name) {
+        for (const auto& dir : dirs_) {
+            std::filesystem::path candidate = std::filesystem::path(dir) / header_name;
+            std::ifstream file(candidate, std::ios::binary | std::ios::ate);
+            if (!file) continue;
+            const std::streamsize length = file.tellg();
+            file.seekg(0);
+            char* data = new char[static_cast<std::size_t>(length)];
+            file.read(data, length);
+            return new IncludeResult(candidate.string(), data, static_cast<std::size_t>(length), data);
+        }
+        return nullptr;
+    }
+
+    const std::vector<std::string>& dirs_;
+};
 
 struct DLDataType {
     std::uint8_t code;
@@ -1440,8 +1487,8 @@ void CommandBuffer::set_pipeline(const std::shared_ptr<Pipeline>& pipeline) {
     if (vk_pipeline->type() == PipelineType::RASTERIZATION && !render_pass_active_) {
         throw std::runtime_error("CommandBuffer::set_pipeline: a RASTERIZATION pipeline requires an active render pass (call set_framebuffer first)");
     }
-    const vk::PipelineBindPoint bind_point = vk_pipeline->type() == PipelineType::COMPUTE
-        ? vk::PipelineBindPoint::eCompute
+    const vk::PipelineBindPoint bind_point = vk_pipeline->type() == PipelineType::COMPUTE ? vk::PipelineBindPoint::eCompute
+        : vk_pipeline->type() == PipelineType::RAYTRACING ? vk::PipelineBindPoint::eRayTracingKHR
         : vk::PipelineBindPoint::eGraphics;
     command_buffer_->command_buffer.bindPipeline(bind_point, vk_pipeline->vk_handle());
     // Appended, not overwritten: a command buffer may bind several
@@ -1460,8 +1507,8 @@ void CommandBuffer::bind(int initial_set, const std::vector<std::shared_ptr<Desc
     }
     if (descriptor_sets.empty()) return;
     auto vk_pipeline = bound_pipelines_.back()->vk_pipeline();
-    const vk::PipelineBindPoint bind_point = vk_pipeline->type() == PipelineType::COMPUTE
-        ? vk::PipelineBindPoint::eCompute
+    const vk::PipelineBindPoint bind_point = vk_pipeline->type() == PipelineType::COMPUTE ? vk::PipelineBindPoint::eCompute
+        : vk_pipeline->type() == PipelineType::RAYTRACING ? vk::PipelineBindPoint::eRayTracingKHR
         : vk::PipelineBindPoint::eGraphics;
     std::vector<vk::DescriptorSet> sets;
     sets.reserve(descriptor_sets.size());
@@ -1542,9 +1589,17 @@ void CommandBuffer::set_viewport(float x, float y, float width, float height) {
         throw std::runtime_error("Cannot set a viewport on a closed command buffer");
     }
     vk::Viewport viewport{ x, y, width, height, 0.0f, 1.0f };
+    // A negative width/height (the standard Y-flip trick: y = height,
+    // height = -height) is a dynamic-viewport-only feature -- VkRect2D's
+    // extent is always non-negative, so a naive cast would wrap around to
+    // a huge unsigned value (and clip away the entire framebuffer). Shift
+    // the scissor's offset by the negative extent instead, so it still
+    // covers exactly the same region the viewport does.
+    const float scissor_x = width < 0.0f ? x + width : x;
+    const float scissor_y = height < 0.0f ? y + height : y;
     vk::Rect2D scissor{
-        vk::Offset2D{ static_cast<std::int32_t>(x), static_cast<std::int32_t>(y) },
-        vk::Extent2D{ static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height) }
+        vk::Offset2D{ static_cast<std::int32_t>(scissor_x), static_cast<std::int32_t>(scissor_y) },
+        vk::Extent2D{ static_cast<std::uint32_t>(std::abs(width)), static_cast<std::uint32_t>(std::abs(height)) }
     };
     command_buffer_->command_buffer.setViewport(0, viewport);
     command_buffer_->command_buffer.setScissor(0, scissor);
@@ -1608,8 +1663,19 @@ void CommandBuffer::blit_image(const std::shared_ptr<Image>& src, const std::sha
     if (render_pass_active_) {
         throw std::runtime_error("CommandBuffer::blit_image: cannot blit while a render pass is active (set_framebuffer with a different framebuffer, or close(), ends it)");
     }
-    const vk::Extent3D src_extent = src->vk_image_info().extent;
-    const vk::Extent3D dst_extent = dst->vk_image_info().extent;
+    // vk_image_info().extent is always the base (mip 0) extent, regardless
+    // of which mip level(s) this Image (possibly a slice()) actually
+    // covers -- shift it down by vk_mip_start() to get the real extent of
+    // the mip level being blitted from/into (standard mip-chain halving,
+    // floored at 1).
+    const auto mip_extent = [](vk::Extent3D base, int mip_level) {
+        const auto shift = [mip_level](std::uint32_t dim) {
+            return std::max<std::uint32_t>(1, dim >> mip_level);
+        };
+        return vk::Extent3D{ shift(base.width), shift(base.height), shift(base.depth) };
+    };
+    const vk::Extent3D src_extent = mip_extent(src->vk_image_info().extent, src->vk_mip_start());
+    const vk::Extent3D dst_extent = mip_extent(dst->vk_image_info().extent, dst->vk_mip_start());
 
     vk::ImageBlit region{};
     region.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
@@ -1694,6 +1760,22 @@ void CommandBuffer::dispatch_indexed_primitives(std::uint32_t indices, std::uint
         throw std::runtime_error("CommandBuffer::dispatch_indexed_primitives: no active render pass (call set_framebuffer first)");
     }
     command_buffer_->command_buffer.drawIndexed(indices, 1, index_start, vertex_offset, 0);
+}
+
+void CommandBuffer::trace_rays(std::uint32_t width, std::uint32_t height, std::uint32_t depth) {
+    if (is_closed()) {
+        throw std::runtime_error("Cannot dispatch on a closed command buffer");
+    }
+    if (bound_pipelines_.empty()) {
+        throw std::runtime_error("CommandBuffer::trace_rays: no pipeline is currently bound (call set_pipeline first)");
+    }
+    const auto& vk_pipeline = bound_pipelines_.back()->vk_pipeline();
+    if (vk_pipeline->type() != PipelineType::RAYTRACING) {
+        throw std::runtime_error("CommandBuffer::trace_rays: bound pipeline is not a RAYTRACING pipeline");
+    }
+    command_buffer_->command_buffer.traceRaysKHR(
+        vk_pipeline->vk_raygen_region(), vk_pipeline->vk_miss_region(), vk_pipeline->vk_hit_region(), vk_pipeline->vk_callable_region(),
+        width, height, depth, device_->vk_dynamic_dispatch());
 }
 
 void CommandBuffer::release() {
@@ -2719,6 +2801,12 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     acceleration_structure_supported_ =
         supports_extension(supported_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
         supports_extension(supported_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    // Gates Pipeline::close() for a RAYTRACING pipeline; a ray tracing
+    // pipeline is only useful together with a TLAS to trace against, so
+    // this also requires acceleration_structure_supported_.
+    const bool ray_tracing_pipeline_extension_supported =
+        acceleration_structure_supported_ &&
+        supports_extension(supported_extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
 
     vk::PhysicalDeviceProperties2 properties2{};
     vk::PhysicalDeviceVulkan12Properties vulkan12_properties{};
@@ -2749,6 +2837,17 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     ray_tracing_pipeline_features.pNext = &cooperative_matrix_features;
     cooperative_matrix_features.pNext = &atomic_float_features;
     physical_.getFeatures2(&features2);
+
+    // See features2/getFeatures2() above: these same, now hardware-queried
+    // structs are fed straight into vkCreateDevice's pNext chain further
+    // down, so whatever's true here is exactly what gets enabled.
+    ray_tracing_pipeline_supported_ =
+        ray_tracing_pipeline_extension_supported && ray_tracing_pipeline_features.rayTracingPipeline;
+    if (ray_tracing_pipeline_supported_) {
+        shader_group_handle_size_ = ray_tracing_pipeline_properties.shaderGroupHandleSize;
+        shader_group_handle_alignment_ = ray_tracing_pipeline_properties.shaderGroupHandleAlignment;
+        shader_group_base_alignment_ = ray_tracing_pipeline_properties.shaderGroupBaseAlignment;
+    }
 
     constexpr float priority = 1.0f;
     const auto queue_families = physical_.getQueueFamilyProperties();
@@ -2908,78 +3007,48 @@ ShaderSource ShaderSource::from_glsl(
     ShaderStageType stage,
     const std::string& entry_point,
     const std::vector<std::string>& include_dirs) {
-    namespace fs = std::filesystem;
+    // Compiles in-process via glslang (statically linked), rather than
+    // shelling out to the standalone glslangValidator tool -- so this
+    // project (and anything built against it, e.g. `pip install vulky`) has
+    // no runtime dependency on a separately installed shader compiler.
+    ensure_glslang_initialized();
 
-    // Shells out to glslangValidator rather than linking shaderc, so this
-    // project has no build- or link-time dependency on the Vulkan SDK --
-    // only a runtime dependency on glslangValidator being available. The
-    // source is piped through the child's stdin (no temp input file needed);
-    // the compiled SPIR-V and any diagnostics always land in the same two
-    // fixed-name temp files (calls are expected to happen one at a time, not
-    // concurrently from multiple threads).
-    const fs::path dir = fs::temp_directory_path();
-    const fs::path output_path = dir / "temp_shader_compilation_output.temp.spv";
-    const fs::path log_path = dir / "temp_shader_compilation_output.temp.log";
+    const EShLanguage lang = to_glslang_stage(stage);
+    glslang::TShader shader(lang);
 
-    std::string command =
-        "\"" + glslang_validator_path() + "\" --stdin -V -S " + to_glslang_stage_name(stage) +
-        " --source-entrypoint " + entry_point + " -e " + entry_point;
-    for (const auto& include_dir : include_dirs) {
-        command += " -I\"" + include_dir + "\"";
-    }
-    command += " -o \"" + output_path.string() + "\" > \"" + log_path.string() + "\" 2>&1";
-#if defined(_WIN32)
-    // Both system() and _popen() on Windows run the command through
-    // `cmd.exe /c`, which has a well known quirk: a command line whose
-    // first token is itself quoted (as ours is, to handle spaces in the
-    // executable path) gets mis-parsed ("The filename, directory name, or
-    // volume label syntax is incorrect.") unless the entire command is
-    // wrapped in one more, outer pair of quotes.
-    command = "\"" + command + "\"";
-    FILE* pipe = _popen(command.c_str(), "wb");
-#else
-    FILE* pipe = popen(command.c_str(), "w");
-#endif
-    if (!pipe) {
-        throw std::runtime_error("ShaderSource::from_glsl: failed to launch glslangValidator");
-    }
-    std::fwrite(source_text.data(), 1, source_text.size(), pipe);
-#if defined(_WIN32)
-    const int exit_code = _pclose(pipe);
-#else
-    const int exit_code = pclose(pipe);
-#endif
+    const char* source_cstr = source_text.c_str();
+    shader.setStrings(&source_cstr, 1);
+    shader.setEntryPoint(entry_point.c_str());
+    shader.setSourceEntryPoint(entry_point.c_str());
 
-    std::string log;
-    {
-        std::ifstream log_file(log_path, std::ios::binary);
-        if (log_file) {
-            std::ostringstream oss;
-            oss << log_file.rdbuf();
-            log = oss.str();
-        }
-    }
-    std::error_code ec;
-    fs::remove(log_path, ec);
+    // Ray tracing (GL_EXT_ray_tracing) needs SPIR-V 1.4+, which only a
+    // Vulkan 1.2+ target environment produces.
+    const glslang::EShTargetClientVersion vulkan_version =
+        is_ray_tracing_stage(stage) ? glslang::EShTargetVulkan_1_2 : glslang::EShTargetVulkan_1_0;
+    const glslang::EShTargetLanguageVersion spirv_version =
+        is_ray_tracing_stage(stage) ? glslang::EShTargetSpv_1_4 : glslang::EShTargetSpv_1_0;
 
-    if (exit_code != 0) {
-        fs::remove(output_path, ec);
+    shader.setEnvInput(glslang::EShSourceGlsl, lang, glslang::EShClientVulkan, 100);
+    shader.setEnvClient(glslang::EShClientVulkan, vulkan_version);
+    shader.setEnvTarget(glslang::EShTargetSpv, spirv_version);
+
+    IncludeDirsIncluder includer(include_dirs);
+    constexpr EShMessages messages = static_cast<EShMessages>(EShMsgSpvRules | EShMsgVulkanRules);
+
+    if (!shader.parse(GetDefaultResources(), 100, ENoProfile, false, false, messages, includer)) {
         throw std::runtime_error(
-            "ShaderSource::from_glsl: glslangValidator failed (is it installed and on PATH?):\n" + log);
+            "ShaderSource::from_glsl: compilation failed:\n" + std::string(shader.getInfoLog()));
+    }
+
+    glslang::TProgram program;
+    program.addShader(&shader);
+    if (!program.link(messages)) {
+        throw std::runtime_error("ShaderSource::from_glsl: linking failed:\n" + std::string(program.getInfoLog()));
     }
 
     std::vector<std::uint32_t> code;
-    {
-        std::ifstream output_file(output_path, std::ios::binary | std::ios::ate);
-        if (!output_file) {
-            throw std::runtime_error("ShaderSource::from_glsl: glslangValidator did not produce an output file");
-        }
-        const std::streamsize length = output_file.tellg();
-        output_file.seekg(0);
-        code.resize(static_cast<std::size_t>(length) / 4);
-        output_file.read(reinterpret_cast<char*>(code.data()), length);
-    }
-    fs::remove(output_path, ec);
+    glslang::SpvOptions spv_options;
+    glslang::GlslangToSpv(*program.getIntermediate(lang), code, &spv_options);
 
     return from_spirv(std::move(code), entry_point);
 }
@@ -3028,9 +3097,11 @@ vk_Pipeline::~vk_Pipeline() noexcept {
     for (auto& set_layout : descriptor_set_layouts_) {
         if (set_layout) dev.destroyDescriptorSetLayout(set_layout);
     }
+    if (sbt_buffer_) dev.destroyBuffer(sbt_buffer_);
+    if (sbt_memory_) dev.freeMemory(sbt_memory_);
 }
 
-void vk_Pipeline::vk_stage(ShaderStageType type, const ShaderSource& source) {
+int vk_Pipeline::vk_stage(ShaderStageType type, const ShaderSource& source) {
     if (closed_) throw std::runtime_error("Pipeline::stage: pipeline is already closed");
     auto device = device_.lock();
     if (!device) throw std::runtime_error("Pipeline::stage: device has been disposed");
@@ -3039,6 +3110,48 @@ void vk_Pipeline::vk_stage(ShaderStageType type, const ShaderSource& source) {
     info.pCode = source.vk_code().data();
     vk::ShaderModule module = device->logical_device().createShaderModule(info);
     stages_.push_back({ type, module, source.vk_entry_point() });
+    return static_cast<int>(stages_.size()) - 1;
+}
+
+int vk_Pipeline::vk_append_raygen_group(int shader_index) {
+    if (closed_) throw std::runtime_error("Pipeline::append_raygen_group: pipeline is already closed");
+    if (shader_index < 0 || shader_index >= static_cast<int>(stages_.size()) || stages_[static_cast<std::size_t>(shader_index)].type != ShaderStageType::RAYGEN) {
+        throw std::runtime_error("Pipeline::append_raygen_group: shader is not a RAYGEN stage() result");
+    }
+    raygen_groups_.push_back({ false, shader_index, -1, -1 });
+    return static_cast<int>(raygen_groups_.size()) - 1;
+}
+
+int vk_Pipeline::vk_append_miss_group(int shader_index) {
+    if (closed_) throw std::runtime_error("Pipeline::append_miss_group: pipeline is already closed");
+    if (shader_index < 0 || shader_index >= static_cast<int>(stages_.size()) || stages_[static_cast<std::size_t>(shader_index)].type != ShaderStageType::MISS) {
+        throw std::runtime_error("Pipeline::append_miss_group: shader is not a MISS stage() result");
+    }
+    miss_groups_.push_back({ false, shader_index, -1, -1 });
+    return static_cast<int>(miss_groups_.size()) - 1;
+}
+
+int vk_Pipeline::vk_append_hit_group(int closest_hit_index, int any_hit_index) {
+    if (closed_) throw std::runtime_error("Pipeline::append_hit_group: pipeline is already closed");
+    if (closest_hit_index < 0 && any_hit_index < 0) {
+        throw std::runtime_error("Pipeline::append_hit_group: at least one of closest_hit/any_hit is required");
+    }
+    if (closest_hit_index >= 0 &&
+        (closest_hit_index >= static_cast<int>(stages_.size()) || stages_[static_cast<std::size_t>(closest_hit_index)].type != ShaderStageType::CLOSEST_HIT)) {
+        throw std::runtime_error("Pipeline::append_hit_group: closest_hit is not a CLOSEST_HIT stage() result");
+    }
+    if (any_hit_index >= 0 &&
+        (any_hit_index >= static_cast<int>(stages_.size()) || stages_[static_cast<std::size_t>(any_hit_index)].type != ShaderStageType::ANY_HIT)) {
+        throw std::runtime_error("Pipeline::append_hit_group: any_hit is not an ANY_HIT stage() result");
+    }
+    hit_groups_.push_back({ true, -1, closest_hit_index, any_hit_index });
+    return static_cast<int>(hit_groups_.size()) - 1;
+}
+
+void vk_Pipeline::vk_stack_size(int depth) {
+    if (closed_) throw std::runtime_error("Pipeline::stack_size: pipeline is already closed");
+    if (depth < 1) throw std::runtime_error("Pipeline::stack_size: depth must be at least 1");
+    max_ray_recursion_depth_ = static_cast<std::uint32_t>(depth);
 }
 
 int vk_Pipeline::vk_layout(int set, int binding, DescriptorType description, int count) {
@@ -3342,7 +3455,110 @@ void vk_Pipeline::vk_close() {
         if (result.result != vk::Result::eSuccess) throw std::runtime_error("Pipeline::close: failed to create graphics pipeline");
         pipeline_ = result.value;
     } else {
-        throw std::runtime_error("Pipeline::close: RAYTRACING pipelines are not yet supported");
+        if (!device->vk_ray_tracing_pipeline_supported()) {
+            throw std::runtime_error("Pipeline::close: VK_KHR_ray_tracing_pipeline is not supported/enabled on this device");
+        }
+        if (raygen_groups_.size() != 1) {
+            throw std::runtime_error("Pipeline::close: a RAYTRACING pipeline requires exactly one raygen group (append_raygen_group)");
+        }
+
+        std::vector<vk::RayTracingShaderGroupCreateInfoKHR> group_infos;
+        group_infos.reserve(raygen_groups_.size() + miss_groups_.size() + hit_groups_.size());
+        auto push_group = [&](const vk_ShaderGroup& g) {
+            vk::RayTracingShaderGroupCreateInfoKHR gi{};
+            gi.type = g.is_hit_group ? vk::RayTracingShaderGroupTypeKHR::eTrianglesHitGroup : vk::RayTracingShaderGroupTypeKHR::eGeneral;
+            gi.generalShader = g.general >= 0 ? static_cast<std::uint32_t>(g.general) : VK_SHADER_UNUSED_KHR;
+            gi.closestHitShader = g.closest_hit >= 0 ? static_cast<std::uint32_t>(g.closest_hit) : VK_SHADER_UNUSED_KHR;
+            gi.anyHitShader = g.any_hit >= 0 ? static_cast<std::uint32_t>(g.any_hit) : VK_SHADER_UNUSED_KHR;
+            gi.intersectionShader = VK_SHADER_UNUSED_KHR;
+            group_infos.push_back(gi);
+        };
+        for (const auto& g : raygen_groups_) push_group(g);
+        for (const auto& g : miss_groups_) push_group(g);
+        for (const auto& g : hit_groups_) push_group(g);
+
+        vk::RayTracingPipelineCreateInfoKHR rt_info{};
+        rt_info.stageCount = static_cast<std::uint32_t>(stage_infos.size());
+        rt_info.pStages = stage_infos.data();
+        rt_info.groupCount = static_cast<std::uint32_t>(group_infos.size());
+        rt_info.pGroups = group_infos.data();
+        rt_info.maxPipelineRayRecursionDepth = max_ray_recursion_depth_;
+        rt_info.layout = pipeline_layout_;
+
+        auto result = dev.createRayTracingPipelinesKHR(
+            vk::DeferredOperationKHR{}, vk::PipelineCache{}, { rt_info }, nullptr, device->vk_dynamic_dispatch());
+        if (result.result != vk::Result::eSuccess) throw std::runtime_error("Pipeline::close: failed to create ray tracing pipeline");
+        pipeline_ = result.value[0];
+
+        // Shader binding table: one dedicated buffer holding every shader
+        // group's handle, laid out as [raygen (exactly 1) | miss... | hit...],
+        // each category's own region starting at a shaderGroupBaseAlignment-
+        // aligned offset (see round_up(), defined above for compute_layout),
+        // and each entry within a region strided at shaderGroupHandleAlignment.
+        const std::uint32_t handle_size = device->vk_shader_group_handle_size();
+        const std::uint32_t handle_size_aligned =
+            static_cast<std::uint32_t>(round_up(handle_size, device->vk_shader_group_handle_alignment()));
+        const std::uint64_t base_alignment = device->vk_shader_group_base_alignment();
+
+        const std::uint32_t raygen_count = static_cast<std::uint32_t>(raygen_groups_.size());
+        const std::uint32_t miss_count = static_cast<std::uint32_t>(miss_groups_.size());
+        const std::uint32_t hit_count = static_cast<std::uint32_t>(hit_groups_.size());
+        const std::uint32_t total_count = raygen_count + miss_count + hit_count;
+
+        std::vector<std::uint8_t> handles = dev.getRayTracingShaderGroupHandlesKHR<std::uint8_t>(
+            pipeline_, 0, total_count, static_cast<std::size_t>(total_count) * handle_size, device->vk_dynamic_dispatch());
+
+        const std::uint64_t raygen_offset = 0;
+        const std::uint64_t raygen_size = handle_size_aligned; // exactly one entry, size == stride
+        const std::uint64_t miss_offset = round_up(raygen_offset + raygen_size, base_alignment);
+        const std::uint64_t miss_size = static_cast<std::uint64_t>(handle_size_aligned) * miss_count;
+        const std::uint64_t hit_offset = round_up(miss_offset + miss_size, base_alignment);
+        const std::uint64_t hit_size = static_cast<std::uint64_t>(handle_size_aligned) * hit_count;
+        const std::uint64_t sbt_size = round_up(hit_offset + hit_size, base_alignment);
+
+        vk::BufferCreateInfo sbt_info{};
+        sbt_info.size = std::max<std::uint64_t>(sbt_size, 1);
+        sbt_info.usage = vk::BufferUsageFlagBits::eShaderBindingTableKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+        sbt_info.sharingMode = vk::SharingMode::eExclusive;
+        sbt_buffer_ = dev.createBuffer(sbt_info);
+
+        const vk::MemoryRequirements sbt_requirements = dev.getBufferMemoryRequirements(sbt_buffer_);
+        bool found_sbt_type = false;
+        const std::uint32_t sbt_memory_type = find_memory_type_index(
+            device->physical_device().getMemoryProperties(),
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+            &found_sbt_type);
+        if (!found_sbt_type) throw std::runtime_error("Pipeline::close: no host-visible memory type found for the shader binding table");
+
+        vk::MemoryAllocateFlagsInfo sbt_alloc_flags{};
+        sbt_alloc_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+        vk::MemoryAllocateInfo sbt_alloc_info(sbt_requirements.size, sbt_memory_type);
+        sbt_alloc_info.pNext = &sbt_alloc_flags;
+        sbt_memory_ = dev.allocateMemory(sbt_alloc_info);
+        dev.bindBufferMemory(sbt_buffer_, sbt_memory_, 0);
+
+        void* mapped = dev.mapMemory(sbt_memory_, 0, sbt_requirements.size);
+        std::memset(mapped, 0, static_cast<std::size_t>(sbt_requirements.size));
+        const auto write_handle = [&](std::uint64_t dst_offset, std::uint32_t group_index) {
+            std::memcpy(static_cast<std::uint8_t*>(mapped) + dst_offset,
+                handles.data() + static_cast<std::size_t>(group_index) * handle_size, handle_size);
+        };
+        write_handle(raygen_offset, 0);
+        for (std::uint32_t i = 0; i < miss_count; ++i) write_handle(miss_offset + i * handle_size_aligned, raygen_count + i);
+        for (std::uint32_t i = 0; i < hit_count; ++i) write_handle(hit_offset + i * handle_size_aligned, raygen_count + miss_count + i);
+        dev.unmapMemory(sbt_memory_);
+
+        const std::uint64_t sbt_address = static_cast<std::uint64_t>(dev.getBufferAddress(vk::BufferDeviceAddressInfo(sbt_buffer_)));
+        raygen_region_.deviceAddress = sbt_address + raygen_offset;
+        raygen_region_.stride = handle_size_aligned;
+        raygen_region_.size = raygen_size;
+        miss_region_.deviceAddress = miss_count > 0 ? sbt_address + miss_offset : 0;
+        miss_region_.stride = handle_size_aligned;
+        miss_region_.size = miss_size;
+        hit_region_.deviceAddress = hit_count > 0 ? sbt_address + hit_offset : 0;
+        hit_region_.stride = handle_size_aligned;
+        hit_region_.size = hit_size;
     }
 
     for (const auto& stage : stages_) dev.destroyShaderModule(stage.module);
@@ -3352,12 +3568,12 @@ void vk_Pipeline::vk_close() {
 }
 
 vk::DescriptorSet vk_Pipeline::vk_allocate_descriptor_set(int set) {
-    if (!closed_) throw std::runtime_error("Pipeline::create_descriptor_set: pipeline must be closed first");
+    if (!closed_) throw std::runtime_error("Pipeline::descriptor_set: pipeline must be closed first");
     if (set < 0 || set >= static_cast<int>(descriptor_set_layouts_.size())) {
-        throw std::runtime_error("Pipeline::create_descriptor_set: invalid set index");
+        throw std::runtime_error("Pipeline::descriptor_set: invalid set index");
     }
     auto device = device_.lock();
-    if (!device) throw std::runtime_error("Pipeline::create_descriptor_set: device has been disposed");
+    if (!device) throw std::runtime_error("Pipeline::descriptor_set: device has been disposed");
     vk::DescriptorSetAllocateInfo alloc_info{};
     alloc_info.descriptorPool = descriptor_pool_;
     alloc_info.descriptorSetCount = 1;
@@ -3442,10 +3658,20 @@ std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(
     return std::make_shared<Framebuffer>(std::move(vk_fb));
 }
 
-std::shared_ptr<DescriptorSet> Pipeline::create_descriptor_set(int set) {
+std::shared_ptr<DescriptorSet> Pipeline::descriptor_set(int set) {
     vk::DescriptorSet ds = pipeline_->vk_allocate_descriptor_set(set);
     auto vk_ds = std::make_shared<vk_DescriptorSet>(device_, pipeline_, set, ds);
     return std::make_shared<DescriptorSet>(std::move(vk_ds));
+}
+
+std::vector<std::shared_ptr<DescriptorSet>> Pipeline::descriptor_set_collection(int set, int count) {
+    if (count <= 0) throw std::runtime_error("Pipeline::descriptor_set_collection: count must be at least 1");
+    std::vector<std::shared_ptr<DescriptorSet>> result;
+    result.reserve(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        result.push_back(descriptor_set(set));
+    }
+    return result;
 }
 
 std::uint32_t Pipeline::device_index() const noexcept {
@@ -4535,6 +4761,30 @@ void vk_DescriptorSet::vk_bind_combined(LayoutHandle layout_id, const std::share
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
+void vk_DescriptorSet::vk_bind_ads(LayoutHandle layout_id, const std::shared_ptr<AccelerationStructure>& ads) {
+    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+    if (binding.type != DescriptorType::ACCELERATION_STRUCTURE) {
+        throw std::runtime_error("DescriptorSet::bind: this binding is not an ACCELERATION_STRUCTURE");
+    }
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    vk::AccelerationStructureKHR handle = ads->vk_ads()->vk_handle();
+    vk::WriteDescriptorSetAccelerationStructureKHR ads_info{};
+    ads_info.accelerationStructureCount = 1;
+    ads_info.pAccelerationStructures = &handle;
+
+    vk::WriteDescriptorSet write{};
+    write.pNext = &ads_info;
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.descriptorCount = 1;
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
 std::shared_ptr<vk_ResourceData> Device::vk_allocate_buffer_data(std::uint64_t size, MemoryLocation location) {
     auto& manager = location == MemoryLocation::HOST ? host_memory_manager_ : device_memory_manager_;
     auto memory = manager->allocate(size, 256);
@@ -4828,6 +5078,9 @@ AdsGeometryInfo vk_build_ads_geometry_info(const ADSDeclaration& declaration) {
             } else {
                 triangles.indexType = vk::IndexType::eNoneKHR;
             }
+            // A null device address means "no static transform" (identity)
+            // per the Vulkan spec -- decl.transform is optional.
+            triangles.transformData.deviceAddress = decl.transform ? decl.transform->device_ptr() : 0;
             result.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
             result.primitive_count = decl.primitive_count;
             result.geometry = vk::AccelerationStructureGeometryKHR(vk::GeometryTypeKHR::eTriangles, triangles, flags);
@@ -4948,6 +5201,21 @@ void CommandBuffer::build_ads(const std::shared_ptr<AccelerationStructure>& ads,
     const vk::AccelerationStructureBuildRangeInfoKHR* p_range_info = &range_info;
 
     command_buffer_->command_buffer.buildAccelerationStructuresKHR(build_info, p_range_info, device_->vk_dynamic_dispatch());
+
+    // Without this, a later build_ads() in the same command buffer (e.g. a
+    // TLAS referencing this BLAS) or a trace_rays() reading it has no
+    // guarantee this build's writes (or an earlier transfer() populating
+    // its input buffers) are visible yet -- vkCmdBuildAccelerationStructuresKHR
+    // is just another GPU command, with no automatic ordering against
+    // others beyond submission order. Conservative but simple: every
+    // build_ads() call is followed by a barrier covering both hazards.
+    vk::MemoryBarrier ads_barrier{};
+    ads_barrier.srcAccessMask = vk::AccessFlagBits::eAccelerationStructureWriteKHR | vk::AccessFlagBits::eTransferWrite;
+    ads_barrier.dstAccessMask = vk::AccessFlagBits::eAccelerationStructureReadKHR | vk::AccessFlagBits::eAccelerationStructureWriteKHR;
+    command_buffer_->command_buffer.pipelineBarrier(
+        vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits::eRayTracingShaderKHR,
+        vk::DependencyFlags{}, 1, &ads_barrier, 0, nullptr, 0, nullptr);
 
     bound_acceleration_structures_.push_back(ads);
     bound_scratch_buffers_.push_back(scratch_buffer);

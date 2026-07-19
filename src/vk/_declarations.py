@@ -138,43 +138,46 @@ def layout_instance() -> Layout:
 
 def ads_triangles(
     vertices: Buffer,
-    vertex_count: int,
     indices: Optional[Buffer] = None,
-    primitive_count: int = 0,
+    transform: Optional[Buffer] = None,
     opaque: bool = True,
 ) -> ADSTriangles:
     """Declares the geometry for a bottom-level acceleration structure
     (BLAS) built from a triangle mesh, for ads()/CommandBuffer.build_ads().
 
     `vertices` must be a DEVICE-resident buffer of tightly-packed FLOAT32
-    vec3 positions (e.g. layout_position()) with at least `vertex_count`
-    elements. `indices`, if given, must be a DEVICE-resident buffer whose
-    element_layout is a scalar UINT16 or UINT32 (e.g. layout_index16()/
-    layout_index32()) -- non-indexed triangles are used otherwise;
-    `primitive_count` is the triangle count either way.
+    vec3 positions (e.g. layout_position()); its vertex count is
+    `vertices.count`. `indices`, if given, must be a DEVICE-resident buffer
+    whose element_layout is a scalar UINT16 or UINT32 (e.g. layout_index16()/
+    layout_index32()) -- non-indexed triangles are used otherwise; the
+    triangle count is `(indices or vertices).count // 3` either way.
+    `transform`, if given, is a static per-geometry 3x4 row-major transform
+    (a VkTransformMatrixKHR-shaped buffer -- e.g. layout_instance()'s
+    "transform" field layout) applied at build time; no transform
+    (identity) if omitted.
     """
-    return ADSTriangles(vertices, vertex_count, indices, primitive_count, opaque)
+    return ADSTriangles(vertices, indices, transform, opaque)
 
 
-def ads_aabb(aabbs: Buffer, count: int, opaque: bool = True) -> ADSAABB:
+def ads_aabb(aabbs: Buffer, opaque: bool = True) -> ADSAABB:
     """Declares the geometry for a bottom-level acceleration structure
     (BLAS) built from procedural AABBs, for ads()/CommandBuffer.build_ads().
 
     `aabbs` must be a DEVICE-resident buffer of layout_aabb()-shaped
-    entries, with at least `count` elements.
+    entries; its count is `aabbs.count`.
     """
-    return ADSAABB(aabbs, count, opaque)
+    return ADSAABB(aabbs, opaque)
 
 
-def ads_instances(instances: Buffer, count: int) -> ADSInstances:
+def ads_instances(instances: Buffer) -> ADSInstances:
     """Declares a top-level acceleration structure (TLAS) built from
     instances of other, already-built bottom-level acceleration
     structures, for ads()/CommandBuffer.build_ads().
 
     `instances` must be a DEVICE-resident buffer of layout_instance()-
-    shaped entries, with at least `count` elements.
+    shaped entries; its instance count is `instances.count`.
     """
-    return ADSInstances(instances, count)
+    return ADSInstances(instances)
 
 
 # ---- Material: a dynamic, open-ended property bag ------------------------

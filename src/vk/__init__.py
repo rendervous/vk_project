@@ -19,6 +19,10 @@ package's public namespace, since typical code never needs to name them
 directly.
 """
 
+from ._driver_setup import ensure_vulkan_driver as _ensure_vulkan_driver
+_ensure_vulkan_driver()
+del _ensure_vulkan_driver
+
 from . import math3d
 from . import _interop  # noqa: F401  (side effect only: adds Buffer/Tensor.torch()/.numpy()/.jax()/...)
 from . import _named_access  # noqa: F401  (side effect only: name=... bindings, and Buffer.write/read("a.b.0") paths)
@@ -102,6 +106,7 @@ from ._declarations import (
     shader_from_glsl,
     shader_from_spirv,
 )
+from ._datasets import download_examples_data
 
 __version__ = "0.0.1"
 __all__ = [
@@ -161,6 +166,7 @@ __all__ = [
     "transfer",
     "compute",
     "graphics",
+    "download_examples_data",
     # Misc
     "math3d",
     "mat4",

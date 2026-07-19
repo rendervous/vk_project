@@ -102,6 +102,28 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tinyobjloader)
 
+# -----------------------------------------------------------------------------
+# glslang (fetched and built from source, statically linked; compiles GLSL to
+# SPIR-V in-process instead of shelling out to the standalone glslangValidator
+# tool -- so `pip install vulky` needs no separately installed shader
+# compiler, e.g. no `apt-get install glslang-tools`)
+# -----------------------------------------------------------------------------
+
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)             # skip the SPIRV-Tools optimizer dependency, not needed
+set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)            # GLSL only
+set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+        glslang
+        GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+        GIT_TAG vulkan-sdk-1.3.275.0
+        GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(glslang)
+
 set(IMGUI_SOURCES
         ${imgui_SOURCE_DIR}/imgui.cpp
         ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -193,6 +215,9 @@ target_link_libraries(vk
         Vulkan::Vulkan
         glfw
         tinyobjloader
+        glslang
+        SPIRV
+        glslang-default-resource-limits
 )
 
 target_include_directories(vk

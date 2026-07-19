@@ -35,6 +35,13 @@ local Jupyter notebook via `build_notebooks.bat` (requires `jupytext`).
 | 01 - Vulkan Devices | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial01_devices.ipynb) |
 | 02 - Vectors and Matrices | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial02_vectors_and_matrices.ipynb) |
 | 03 - Basic Compute | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial03_basic_compute.ipynb) |
+| 04 - Basic Rasterization | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial04_basic_rasterization.ipynb) |
+| 05 - Vertex Buffers | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial05_vertex_buffers.ipynb) |
+| 06 - OBJ Viewer | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial06_obj_viewer.ipynb) |
+| 07 - Texture Mapping | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial07_texture_mapping.ipynb) |
+| 08 - Basic Raytracing | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial08_basic_raytracing.ipynb) |
+| 09 - Shadow Cast | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial09_shadow_cast.ipynb) |
+| 10 - Whitted Raytracing | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rendervous/vk_project/blob/master/tutorials/tutorial10_whitted_raytracing.ipynb) |
 
 The notebooks themselves (`tutorials/*.ipynb`) must be committed/pushed to
 the repository for the Colab links to resolve.

@@ -33,7 +33,8 @@ _descriptor_set_names = weakref.WeakKeyDictionary()  # DescriptorSet -> {name: L
 
 _orig_pipeline_layout = Pipeline.layout
 _orig_pipeline_attach = Pipeline.attach
-_orig_create_descriptor_set = Pipeline.create_descriptor_set
+_orig_descriptor_set = Pipeline.descriptor_set
+_orig_descriptor_set_collection = Pipeline.descriptor_set_collection
 _orig_create_framebuffer = Pipeline.create_framebuffer
 _orig_descriptor_set_bind = DescriptorSet.bind
 
@@ -63,12 +64,21 @@ def _attach(self, slot, format=None, **kwargs):
     return handle
 
 
-def _create_descriptor_set(self, set=0):
-    ds = _orig_create_descriptor_set(self, set)
+def _descriptor_set(self, set=0):
+    ds = _orig_descriptor_set(self, set)
     names = _layout_names.get(self)
     if names:
         _descriptor_set_names[ds] = names
     return ds
+
+
+def _descriptor_set_collection(self, set=0, count=1):
+    collection = _orig_descriptor_set_collection(self, set, count)
+    names = _layout_names.get(self)
+    if names:
+        for ds in collection:
+            _descriptor_set_names[ds] = names
+    return collection
 
 
 def _create_framebuffer(self, attachments=None, depth_image=None, **kwargs):
@@ -100,7 +110,8 @@ def _descriptor_set_bind(self, layout_id=None, *args, **kwargs):
 
 Pipeline.layout = _layout
 Pipeline.attach = _attach
-Pipeline.create_descriptor_set = _create_descriptor_set
+Pipeline.descriptor_set = _descriptor_set
+Pipeline.descriptor_set_collection = _descriptor_set_collection
 Pipeline.create_framebuffer = _create_framebuffer
 DescriptorSet.bind = _descriptor_set_bind
 

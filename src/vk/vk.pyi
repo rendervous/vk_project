@@ -343,6 +343,18 @@ class ShaderStageType(enum.Enum):
     """Tessellation evaluation shader stage."""
     COMPUTE = 5
     """Compute shader stage."""
+    RAYGEN = 6
+    """Ray generation stage (:attr:`PipelineType.RAYTRACING` only); turned
+    into its own shader group via :meth:`Pipeline.append_raygen_group`."""
+    MISS = 7
+    """Miss stage (:attr:`PipelineType.RAYTRACING` only); turned into its
+    own shader group via :meth:`Pipeline.append_miss_group`."""
+    CLOSEST_HIT = 8
+    """Closest-hit stage (:attr:`PipelineType.RAYTRACING` only); combined
+    into a hit group via :meth:`Pipeline.append_hit_group`."""
+    ANY_HIT = 9
+    """Any-hit stage (:attr:`PipelineType.RAYTRACING` only); combined into
+    a hit group via :meth:`Pipeline.append_hit_group`."""
 
 
 class DescriptorType(enum.Enum):
@@ -365,7 +377,8 @@ class DescriptorType(enum.Enum):
     COMBINED_IMAGE_SAMPLER = 5
     """An image and sampler bound together in one binding (GLSL ``sampler2D``)."""
     ACCELERATION_STRUCTURE = 6
-    """A ray tracing acceleration structure. Not yet bindable via
+    """A ray tracing acceleration structure (typically a TLAS, from
+    :func:`ads`/:func:`ads_instances`), bound via
     :meth:`DescriptorSet.bind`.
     """
 
@@ -467,6 +480,29 @@ class AttachHandle:
 
     Not constructible from Python: only meaningful when passed back to
     :meth:`Pipeline.create_framebuffer` on the same :class:`Pipeline`.
+    """
+
+
+class ShaderHandle:
+    """Opaque handle returned by :meth:`Pipeline.stage` for a ray tracing
+    stage (``RAYGEN``/``MISS``/``CLOSEST_HIT``/``ANY_HIT``), identifying
+    that shader module.
+
+    Not constructible from Python: only meaningful when passed back to
+    :meth:`Pipeline.append_raygen_group`/:meth:`Pipeline.append_miss_group`/
+    :meth:`Pipeline.append_hit_group` on the same :class:`Pipeline`.
+    """
+
+
+class ShaderGroupHandle:
+    """Opaque handle returned by :meth:`Pipeline.append_raygen_group`/
+    :meth:`Pipeline.append_miss_group`/:meth:`Pipeline.append_hit_group`,
+    identifying one shader group of a :attr:`PipelineType.RAYTRACING`
+    pipeline.
+
+    Not constructible from Python: purely a build-time acknowledgement --
+    the shader binding table is built automatically, in creation order, by
+    :meth:`Pipeline.close`.
     """
 
 
@@ -745,17 +781,20 @@ class ADSTriangles:
     def __init__(
         self,
         vertices: Buffer,
-        vertex_count: int,
         indices: Buffer | None = None,
-        primitive_count: int = 0,
+        transform: Buffer | None = None,
         opaque: bool = True,
     ) -> None:
         """`vertices` must be a DEVICE-resident buffer of tightly-packed
-        FLOAT32 vec3 positions (e.g. ``Layouts.position()``) with at least
-        `vertex_count` elements. `indices`, if given, must be a DEVICE-
-        resident buffer whose element_layout is a scalar UINT16 or UINT32
-        (non-indexed triangles are used otherwise); `primitive_count` is
-        the triangle count either way.
+        FLOAT32 vec3 positions (e.g. ``Layouts.position()``); `vertex_count`
+        defaults to ``vertices.count``. `indices`, if given, must be a
+        DEVICE-resident buffer whose element_layout is a scalar UINT16 or
+        UINT32 (non-indexed triangles are used otherwise); `primitive_count`
+        defaults to ``(indices or vertices).count // 3``. `transform`, if
+        given, is a static per-geometry 3x4 row-major transform (a
+        VkTransformMatrixKHR-shaped buffer, e.g. ``Layouts.instance()``'s
+        "transform" field layout) applied at build time; no transform
+        (identity) if omitted.
         """
         ...
 
@@ -763,6 +802,7 @@ class ADSTriangles:
     vertex_count: int
     indices: Buffer | None
     primitive_count: int
+    transform: Buffer | None
     opaque: bool
 
 
@@ -771,9 +811,10 @@ class ADSAABB:
     (BLAS) built from procedural AABBs.
     """
 
-    def __init__(self, aabbs: Buffer, count: int, opaque: bool = True) -> None:
+    def __init__(self, aabbs: Buffer, opaque: bool = True) -> None:
         """`aabbs` must be a DEVICE-resident buffer of
-        ``Layouts.aabb()``-shaped entries, with at least `count` elements.
+        ``Layouts.aabb()``-shaped entries; `count` defaults to
+        ``aabbs.count``.
         """
         ...
 
@@ -788,10 +829,10 @@ class ADSInstances:
     structures.
     """
 
-    def __init__(self, instances: Buffer, count: int) -> None:
+    def __init__(self, instances: Buffer) -> None:
         """`instances` must be a DEVICE-resident buffer of
-        ``Layouts.instance()``-shaped entries, with at least `count`
-        elements.
+        ``Layouts.instance()``-shaped entries; `count` defaults to
+        ``instances.count``.
         """
         ...
 
@@ -856,6 +897,11 @@ class Buffer:
     @property
     def size(self) -> int:
         """Size of this buffer, in bytes."""
+        ...
+
+    @property
+    def count(self) -> int:
+        """Number of elements this buffer holds: ``size // element_layout.aligned_size``."""
         ...
 
     @property
@@ -1636,7 +1682,9 @@ class CommandBuffer:
 
         Both images are assumed to already be in
         ``VK_IMAGE_LAYOUT_GENERAL`` -- the layout every :class:`Image` is
-        transitioned to once, at creation time (see :class:`Image`). Must
+        transitioned to once, at creation time (see :class:`Image`).
+        Requires a graphics-capable engine (``vkCmdBlitImage`` isn't
+        guaranteed to be supported on a plain transfer/compute queue). Must
         be called while the command buffer is still recording, i.e.
         before :meth:`close`, and cannot be called while a render pass is
         active (between a :meth:`set_framebuffer` call and the next
@@ -1725,6 +1773,24 @@ class CommandBuffer:
         (like every buffer/acceleration structure referenced here) for as
         long as this command buffer is, including while submitted and
         pending on the GPU. Requires a COMPUTE-capable engine.
+
+        Followed by a memory barrier covering both acceleration-structure
+        build and transfer hazards, so a later :meth:`build_ads` (e.g. a
+        TLAS referencing this BLAS) or :meth:`trace_rays` in the same
+        command buffer safely sees this build's (and any preceding
+        :meth:`transfer`'s) writes.
+        """
+        ...
+
+    def trace_rays(self, width: int, height: int, depth: int = 1) -> None:
+        """Records a ray tracing dispatch (``vkCmdTraceRaysKHR``) of
+        ``width`` x ``height`` x ``depth`` rays, using the shader binding
+        table built by the bound pipeline's :meth:`Pipeline.close` (see
+        :meth:`Pipeline.append_raygen_group`/:meth:`Pipeline.append_miss_group`/
+        :meth:`Pipeline.append_hit_group`).
+
+        Requires a :attr:`PipelineType.RAYTRACING` pipeline to be bound
+        (:meth:`set_pipeline`).
         """
         ...
 
@@ -2262,7 +2328,7 @@ class Window:
 
 class DescriptorSet:
     """A descriptor set matching one :class:`Pipeline`'s declared layout for
-    a given ``set`` index, obtained from :meth:`Pipeline.create_descriptor_set`.
+    a given ``set`` index, obtained from :meth:`Pipeline.descriptor_set`.
     """
 
     @overload
@@ -2316,6 +2382,17 @@ class DescriptorSet:
         ...
 
     @overload
+    def bind(self, layout_id: LayoutHandle, resource: "AccelerationStructure") -> None:
+        """Writes `resource` into the binding identified by ``layout_id``.
+
+        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
+        :param resource: An :class:`AccelerationStructure` (typically a
+            TLAS, from :func:`ads`/:func:`ads_instances`), for a binding
+            declared with :attr:`DescriptorType.ACCELERATION_STRUCTURE`.
+        """
+        ...
+
+    @overload
     def bind(self, **bindings: object) -> None:
         """Binds one or more resources by the ``name`` given to the
         matching :meth:`Pipeline.layout` call(s) instead of its
@@ -2340,17 +2417,21 @@ class Pipeline:
 
     Built up via :meth:`stage`, :meth:`layout`, :meth:`vertex_layout` and
     :meth:`attach`, then finalized with :meth:`close`; afterwards,
-    :meth:`create_descriptor_set` and (for graphics pipelines)
+    :meth:`descriptor_set` and (for graphics pipelines)
     :meth:`create_framebuffer` become usable.
     """
 
-    def stage(self, type: ShaderStageType, source: ShaderSource) -> None:
+    def stage(self, type: ShaderStageType, source: ShaderSource) -> ShaderHandle:
         """Attaches a compiled shader to one stage of this pipeline.
 
         Must be called before :meth:`close`.
 
         :param type: Shader stage this source implements.
         :param source: Compiled shader bytecode.
+        :return: A handle identifying this shader module -- meaningful only
+            for a ray tracing stage (``RAYGEN``/``MISS``/``CLOSEST_HIT``/
+            ``ANY_HIT``), to pass to :meth:`append_raygen_group`/
+            :meth:`append_miss_group`/:meth:`append_hit_group`.
         """
         ...
 
@@ -2436,6 +2517,42 @@ class Pipeline:
         """
         ...
 
+    def append_raygen_group(self, shader: ShaderHandle) -> ShaderGroupHandle:
+        """Turns a ``RAYGEN`` shader (from :meth:`stage`) into its own
+        shader group. Exactly one is required.
+
+        Ray tracing pipelines only. Must be called before :meth:`close`.
+        """
+        ...
+
+    def append_miss_group(self, shader: ShaderHandle) -> ShaderGroupHandle:
+        """Turns a ``MISS`` shader (from :meth:`stage`) into its own
+        shader group.
+
+        Ray tracing pipelines only. Must be called before :meth:`close`.
+        """
+        ...
+
+    def append_hit_group(
+        self, closest_hit: "ShaderHandle | None" = None, any_hit: "ShaderHandle | None" = None
+    ) -> ShaderGroupHandle:
+        """Combines up to one ``CLOSEST_HIT`` and/or one ``ANY_HIT`` shader
+        (from :meth:`stage`) into a triangles hit group. At least one of
+        ``closest_hit``/``any_hit`` is required.
+
+        Ray tracing pipelines only. Must be called before :meth:`close`.
+        """
+        ...
+
+    def stack_size(self, depth: int) -> None:
+        """Maximum nested ``traceRayEXT()`` recursion depth to build the
+        pipeline for. Defaults to 1 (a raygen shader may trace, but a
+        hit/miss shader may not trace again) if never called.
+
+        Ray tracing pipelines only. Must be called before :meth:`close`.
+        """
+        ...
+
     def close(self) -> None:
         """Finalizes this pipeline: builds the descriptor set layouts,
         pipeline layout, (for graphics pipelines) render pass and vertex
@@ -2467,7 +2584,7 @@ class Pipeline:
         """
         ...
 
-    def create_descriptor_set(self, set: int = 0) -> DescriptorSet:
+    def descriptor_set(self, set: int = 0) -> DescriptorSet:
         """Allocates a new descriptor set matching the layout declared for
         ``set`` via :meth:`layout`.
 
@@ -2476,6 +2593,22 @@ class Pipeline:
         :param set: Descriptor set index, as passed to :meth:`layout`.
         :return: A new :class:`DescriptorSet`, whose :meth:`DescriptorSet.bind`
             accepts this pipeline's ``name=...`` bindings, if any.
+        """
+        ...
+
+    def descriptor_set_collection(self, set: int = 0, count: int = 1) -> list[DescriptorSet]:
+        """Allocates ``count`` independent descriptor sets matching the
+        layout declared for ``set`` -- one per object to draw/dispatch
+        with its own bindings (e.g. a different transform buffer each),
+        sharing the same pipeline layout.
+
+        Pipeline must be closed first.
+
+        :param set: Descriptor set index, as passed to :meth:`layout`.
+        :param count: Number of independent descriptor sets to allocate.
+        :return: A list of ``count`` new :class:`DescriptorSet`, each whose
+            :meth:`DescriptorSet.bind` accepts this pipeline's ``name=...``
+            bindings, if any.
         """
         ...
 
@@ -2738,10 +2871,17 @@ class Device:
 
         Build it up via :meth:`Pipeline.stage`, :meth:`Pipeline.layout`,
         :meth:`Pipeline.vertex_layout` and :meth:`Pipeline.attach`, then
-        finalize it with :meth:`Pipeline.close`.
+        finalize it with :meth:`Pipeline.close`. For
+        :attr:`PipelineType.RAYTRACING`, use :meth:`Pipeline.stage` with a
+        ``RAYGEN``/``MISS``/``CLOSEST_HIT``/``ANY_HIT`` stage, group them
+        via :meth:`Pipeline.append_raygen_group`/:meth:`Pipeline.append_miss_group`/
+        :meth:`Pipeline.append_hit_group`, then :meth:`Pipeline.close` (which
+        also builds the shader binding table) and dispatch via
+        :meth:`CommandBuffer.trace_rays`. Requires hardware/driver support
+        for VK_KHR_ray_tracing_pipeline; raises on :meth:`Pipeline.close`
+        otherwise.
 
-        :param type: Kind of pipeline to create. :attr:`PipelineType.RAYTRACING`
-            is not yet supported and will raise on :meth:`Pipeline.close`.
+        :param type: Kind of pipeline to create.
         :return: A new, not-yet-closed :class:`Pipeline`.
         """
         ...

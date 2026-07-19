@@ -144,7 +144,11 @@ PYBIND11_MODULE(vk, m) {
 		.value("GEOMETRY", ShaderStageType::GEOMETRY)
 		.value("TESS_CONTROL", ShaderStageType::TESS_CONTROL)
 		.value("TESS_EVAL", ShaderStageType::TESS_EVAL)
-		.value("COMPUTE", ShaderStageType::COMPUTE);
+		.value("COMPUTE", ShaderStageType::COMPUTE)
+		.value("RAYGEN", ShaderStageType::RAYGEN)
+		.value("MISS", ShaderStageType::MISS)
+		.value("CLOSEST_HIT", ShaderStageType::CLOSEST_HIT)
+		.value("ANY_HIT", ShaderStageType::ANY_HIT);
 
 	py::enum_<DescriptorType>(m, "DescriptorType")
 		.value("STORAGE_BUFFER", DescriptorType::STORAGE_BUFFER)
@@ -305,6 +309,7 @@ PYBIND11_MODULE(vk, m) {
 		.def("element", &Buffer::element, py::arg("index"))
 		.def_property_readonly("element_layout", &Buffer::element_layout)
 		.def_property_readonly("size", &Buffer::size)
+		.def_property_readonly("count", &Buffer::count)
 		.def_property_readonly("device_ptr", &Buffer::device_ptr)
 		.def_property_readonly("device_index", &Buffer::device_index);
 
@@ -355,35 +360,37 @@ PYBIND11_MODULE(vk, m) {
 
 	py::class_<ADSTriangles>(m, "ADSTriangles")
 		.def(
-			py::init([](std::shared_ptr<Buffer> vertices, std::uint32_t vertex_count,
-				std::shared_ptr<Buffer> indices, std::uint32_t primitive_count, bool opaque) {
+			py::init([](std::shared_ptr<Buffer> vertices, std::shared_ptr<Buffer> indices,
+				std::shared_ptr<Buffer> transform, bool opaque) {
 				ADSTriangles t;
+				t.vertex_count = static_cast<std::uint32_t>(vertices->count());
+				t.primitive_count = static_cast<std::uint32_t>((indices ? indices : vertices)->count() / 3);
 				t.vertices = std::move(vertices);
-				t.vertex_count = vertex_count;
 				t.indices = std::move(indices);
-				t.primitive_count = primitive_count;
+				t.transform = std::move(transform);
 				t.opaque = opaque;
 				return t;
 			}),
-			py::arg("vertices"), py::arg("vertex_count"), py::arg("indices") = nullptr,
-			py::arg("primitive_count") = 0, py::arg("opaque") = true
+			py::arg("vertices"), py::arg("indices") = nullptr,
+			py::arg("transform") = nullptr, py::arg("opaque") = true
 		)
 		.def_readwrite("vertices", &ADSTriangles::vertices)
 		.def_readwrite("vertex_count", &ADSTriangles::vertex_count)
 		.def_readwrite("indices", &ADSTriangles::indices)
 		.def_readwrite("primitive_count", &ADSTriangles::primitive_count)
+		.def_readwrite("transform", &ADSTriangles::transform)
 		.def_readwrite("opaque", &ADSTriangles::opaque);
 
 	py::class_<ADSAABB>(m, "ADSAABB")
 		.def(
-			py::init([](std::shared_ptr<Buffer> aabbs, std::uint32_t count, bool opaque) {
+			py::init([](std::shared_ptr<Buffer> aabbs, bool opaque) {
 				ADSAABB a;
+				a.count = static_cast<std::uint32_t>(aabbs->count());
 				a.aabbs = std::move(aabbs);
-				a.count = count;
 				a.opaque = opaque;
 				return a;
 			}),
-			py::arg("aabbs"), py::arg("count"), py::arg("opaque") = true
+			py::arg("aabbs"), py::arg("opaque") = true
 		)
 		.def_readwrite("aabbs", &ADSAABB::aabbs)
 		.def_readwrite("count", &ADSAABB::count)
@@ -391,13 +398,13 @@ PYBIND11_MODULE(vk, m) {
 
 	py::class_<ADSInstances>(m, "ADSInstances")
 		.def(
-			py::init([](std::shared_ptr<Buffer> instances, std::uint32_t count) {
+			py::init([](std::shared_ptr<Buffer> instances) {
 				ADSInstances i;
+				i.count = static_cast<std::uint32_t>(instances->count());
 				i.instances = std::move(instances);
-				i.count = count;
 				return i;
 			}),
-			py::arg("instances"), py::arg("count")
+			py::arg("instances")
 		)
 		.def_readwrite("instances", &ADSInstances::instances)
 		.def_readwrite("count", &ADSInstances::count);
@@ -589,6 +596,13 @@ PYBIND11_MODULE(vk, m) {
 			py::arg("ads"),
 			py::arg("declaration")
 		)
+		.def(
+			"trace_rays",
+			&CommandBuffer::trace_rays,
+			py::arg("width"),
+			py::arg("height"),
+			py::arg("depth") = 1
+		)
 		.def_property_readonly("is_submitted", &CommandBuffer::is_submitted)
 		.def_property_readonly("is_executable", &CommandBuffer::is_executable)
 		.def_property_readonly("is_closed", &CommandBuffer::is_closed)
@@ -708,6 +722,10 @@ PYBIND11_MODULE(vk, m) {
 	// DescriptorSet::bind()/Pipeline::create_framebuffer().
 	py::class_<LayoutHandle>(m, "LayoutHandle");
 	py::class_<AttachHandle>(m, "AttachHandle");
+	// Likewise, only obtainable from Pipeline::stage() (a ray tracing stage)
+	// and Pipeline::append_raygen_group()/append_miss_group()/append_hit_group().
+	py::class_<ShaderHandle>(m, "ShaderHandle");
+	py::class_<ShaderGroupHandle>(m, "ShaderGroupHandle");
 
 	py::class_<DescriptorSet, std::shared_ptr<DescriptorSet>>(m, "DescriptorSet")
 		.def(
@@ -735,6 +753,12 @@ PYBIND11_MODULE(vk, m) {
 			py::arg("image"),
 			py::arg("sampler")
 		)
+		.def(
+			"bind",
+			py::overload_cast<LayoutHandle, const std::shared_ptr<AccelerationStructure>&>(&DescriptorSet::bind),
+			py::arg("layout_id"),
+			py::arg("ads")
+		)
 		.def_property_readonly("device_index", &DescriptorSet::device_index);
 
 	py::class_<Pipeline, std::shared_ptr<Pipeline>>(m, "Pipeline")
@@ -751,6 +775,23 @@ PYBIND11_MODULE(vk, m) {
 		.def("attach", &Pipeline::attach, py::arg("slot"), py::arg("format"))
 		.def("attach_depth", &Pipeline::attach_depth, py::arg("format"))
 		.def("local_size", &Pipeline::local_size, py::arg("x"), py::arg("y") = 1, py::arg("z") = 1)
+		.def(
+			"append_raygen_group",
+			&Pipeline::append_raygen_group,
+			py::arg("shader")
+		)
+		.def(
+			"append_miss_group",
+			&Pipeline::append_miss_group,
+			py::arg("shader")
+		)
+		.def(
+			"append_hit_group",
+			&Pipeline::append_hit_group,
+			py::arg("closest_hit") = py::none(),
+			py::arg("any_hit") = py::none()
+		)
+		.def("stack_size", &Pipeline::stack_size, py::arg("depth"))
 		.def("close", &Pipeline::close)
 		.def(
 			"create_framebuffer",
@@ -760,9 +801,16 @@ PYBIND11_MODULE(vk, m) {
 			py::return_value_policy::move
 		)
 		.def(
-			"create_descriptor_set",
-			&Pipeline::create_descriptor_set,
+			"descriptor_set",
+			&Pipeline::descriptor_set,
 			py::arg("set") = 0,
+			py::return_value_policy::move
+		)
+		.def(
+			"descriptor_set_collection",
+			&Pipeline::descriptor_set_collection,
+			py::arg("set") = 0,
+			py::arg("count") = 1,
 			py::return_value_policy::move
 		)
 		.def_property_readonly("is_closed", &Pipeline::is_closed)

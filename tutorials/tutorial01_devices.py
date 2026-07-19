@@ -1,10 +1,7 @@
 # %%
-try:  # install all dependencies in colab
+try:  # install vulky in colab -- it installs any missing Vulkan driver itself
     import google.colab
     import subprocess
-    subprocess.run(["sudo", "apt-get", "update", "-y"], check=True)
-    subprocess.run(["sudo", "apt-get", "install", "-y", "libnvidia-gl-555", "vulkan-tools",
-                     "glslang-tools", "vulkan-validationlayers-dev"], check=True)
     subprocess.run(["pip", "install", "vulky"], check=True)
 except ImportError:
     print("Executing locally")

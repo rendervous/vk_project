@@ -11,10 +11,13 @@ device has no queue family supporting both).
 """
 
 import os
-from typing import Optional, Union, overload
+from typing import Any, Optional, Union, overload
 
 from .vk import (
     AccelerationStructure,
+    ADSAABB,
+    ADSInstances,
+    ADSTriangles,
     Buffer,
     CommandBuffer,
     Device,
@@ -28,11 +31,13 @@ from .vk import (
     MemoryLocation,
     MipmapMode,
     Pipeline,
+    PipelineType,
     Sampler,
     Scene,
     SubmissionTask,
     Tensor,
     Type,
+    TypeKind,
     VertexResolutionMode,
     Window,
     WrapMode,
@@ -50,6 +55,21 @@ def _to_type_descriptor_layout(spec: TypeSpec) -> Layout:
     """
     from .vk import compute_layout as _vk_compute_layout
     return _vk_compute_layout(_to_type_descriptor(spec), LayoutRule.Scalar)
+
+
+def _dynamic_tail_layout(layout: Layout) -> Optional[Layout]:
+    """Returns the element Layout of `layout`'s trailing unsized/runtime
+    array -- `layout` itself an ARRAY with count == 0, or a STRUCT whose
+    last field is one (the classic SSBO "fixed header + flexible array
+    member" shape) -- or None if `layout` doesn't end in one.
+    """
+    if layout.kind == TypeKind.ARRAY and layout.count == 0:
+        return layout.element_layout
+    if layout.kind == TypeKind.STRUCT and layout.fields:
+        last_field_layout = layout.fields[-1].layout
+        if last_field_layout.kind == TypeKind.ARRAY and last_field_layout.count == 0:
+            return last_field_layout.element_layout
+    return None
 
 __devices__: dict = {}  # Created Device, keyed by physical device index.
 __active_device__: Optional[Device] = None  # Currently active device.
@@ -284,7 +304,7 @@ def graphics(engine_index: int = 0):
 
 # ---- Shallow wrappers for every Device method, operating on __current_device() ----
 
-def tensor(shape: list, scalar_type: Type, location: MemoryLocation = MemoryLocation.DEVICE) -> Tensor:
+def tensor(shape: list[int], scalar_type: Type, location: MemoryLocation = MemoryLocation.DEVICE) -> Tensor:
     """Creates a Tensor on the current device, via Device.create_tensor().
     Unlike buffer() (whose shape/dtype for DLPack export is derived from
     its element_layout), the resulting Tensor's shape is exactly `shape`
@@ -326,12 +346,22 @@ def buffer(elements: int, layout: Layout, location: MemoryLocation = MemoryLocat
 
 
 @overload
-def buffer(type: "TypeSpec", location: MemoryLocation = MemoryLocation.DEVICE) -> Buffer:
+def buffer(
+    type: "TypeSpec",
+    location: MemoryLocation = MemoryLocation.DEVICE,
+    dynamic_size: int = 1,
+) -> Buffer:
     """Creates a Buffer holding a single instance of `type` (a bare
     ``Type``, an ``[count, element]``/``{name: field, ...}`` type spec, or
     an already-computed Layout) on the current device -- a convenience
     equivalent to ``buffer(1, type if isinstance(type, Layout) else
     compute_layout(type, LayoutRule.Scalar), location)``.
+
+    If `type`'s Layout ends in an unsized/runtime array (an ``[0,
+    element]`` spec, or a struct whose last field is one -- the classic
+    SSBO "fixed header + flexible array member" shape), `dynamic_size` is
+    the number of elements actually reserved for that trailing array
+    (default 1); ignored otherwise.
     """
     ...
 
@@ -350,9 +380,12 @@ def buffer(*args, **kwargs) -> Buffer:
     - ``buffer(elements, layout, location=DEVICE)``: `elements` instances
       of `layout` (an already-computed Layout); element_layout is
       `layout` itself, byte size exactly ``elements * layout.aligned_size``.
-    - ``buffer(type, location=DEVICE)``: a single instance (elements=1
-      implied) of `type` -- a bare Type, an ``[count, element]``/
-      ``{name: field, ...}`` type spec, or an already-computed Layout.
+    - ``buffer(type, location=DEVICE, dynamic_size=1)``: a single instance
+      (elements=1 implied) of `type` -- a bare Type, an ``[count,
+      element]``/``{name: field, ...}`` type spec, or an already-computed
+      Layout. If `type`'s Layout ends in an unsized/runtime array,
+      `dynamic_size` reserves that many elements for it (ignored
+      otherwise).
 
     `location` defaults to DEVICE in every form (Device.create_buffer()
     itself has no default for it).
@@ -361,6 +394,12 @@ def buffer(*args, **kwargs) -> Buffer:
         type_or_layout = args[0]
         layout = type_or_layout if isinstance(type_or_layout, Layout) else _to_type_descriptor_layout(type_or_layout)
         location = args[1] if len(args) > 1 else kwargs.get("location", MemoryLocation.DEVICE)
+        dynamic_size = args[2] if len(args) > 2 else kwargs.get("dynamic_size", 1)
+        tail_layout = _dynamic_tail_layout(layout)
+        if tail_layout is not None:
+            total_bytes = layout.aligned_size + dynamic_size * tail_layout.aligned_size
+            raw = __current_device().create_buffer(total_bytes, Type.UINT8, location)
+            return raw.cast(layout)
         return __current_device().create_buffer(1, layout, location)
     if "location" not in kwargs and len(args) < 3:
         kwargs["location"] = MemoryLocation.DEVICE
@@ -389,7 +428,7 @@ def image(
 
 
 def depth_buffer_image(
-    width, height, format: Format = Format.Depth32_Float, location: MemoryLocation = MemoryLocation.DEVICE
+    width: int, height: int, format: Format = Format.Depth32_Float, location: MemoryLocation = MemoryLocation.DEVICE
 ) -> Image:
     """Creates a 2D depth (or depth/stencil) attachment Image on the
     current device, via Device.create_depth_buffer_image(), for use with
@@ -421,7 +460,7 @@ def sampler(
     return __current_device().create_sampler(mag_filter, min_filter, mipmap_mode, wrap_u, wrap_v, wrap_w)
 
 
-def ads(declaration) -> AccelerationStructure:
+def ads(declaration: Union[ADSTriangles, ADSAABB, ADSInstances]) -> AccelerationStructure:
     """Creates (sizes and allocates, but does not build) an acceleration
     structure on the current device, via Device.create_ads(): a
     bottom-level one (BLAS) if `declaration` is an ads_triangles()/
@@ -432,7 +471,9 @@ def ads(declaration) -> AccelerationStructure:
     return __current_device().create_ads(declaration)
 
 
-def window(width, height, title: str, format: Format, frames_on_the_fly: int = 3, vsync: bool = True) -> Window:
+def window(
+    width: int, height: int, title: str, format: Format, frames_on_the_fly: int = 3, vsync: bool = True
+) -> Window:
     """Creates a Window (an OS window, via GLFW, plus its Vulkan swapchain
     and presentation machinery) on the current device, via
     Device.create_window(). The resulting Window's swapchain (and its
@@ -493,7 +534,7 @@ def staging(*args, **kwargs) -> Buffer:
     return __current_device().create_staging(*args, **kwargs)
 
 
-def pipeline(type) -> Pipeline:
+def pipeline(type: PipelineType) -> Pipeline:
     """Creates a new, empty Pipeline of the given type on the current
     device, via Device.create_pipeline(). The resulting Pipeline has no
     shader stages/descriptor layout/vertex layout/attachments yet -- build
@@ -504,7 +545,7 @@ def pipeline(type) -> Pipeline:
     return __current_device().create_pipeline(type)
 
 
-def wrap(obj, location: MemoryLocation = MemoryLocation.DEVICE) -> WrappedMemory:
+def wrap(obj: Any, location: MemoryLocation = MemoryLocation.DEVICE) -> WrappedMemory:
     """Wraps an external object as a WrappedMemory exposing a Vulkan
     buffer device address, on the current device, via Device.wrap().
     The resulting WrappedMemory copies `obj`'s data lazily, on demand, or
@@ -569,10 +610,10 @@ def relax() -> None:
     __active_engine__.clear()
 
 
-__device_infos_cache__: Optional[list] = None  # Memoized result of device_infos(); physical devices don't change mid-process.
+__device_infos_cache__: Optional[list[dict]] = None  # Memoized result of device_infos(); physical devices don't change mid-process.
 
 
-def device_infos() -> list:
+def device_infos() -> list[dict]:
     """Lists every Vulkan-visible physical device (queried once, then
     cached for the rest of the process -- physical devices don't come and
     go while this process runs). Each entry is a dict with keys "index"
@@ -604,7 +645,7 @@ def command_buffer() -> CommandBuffer:
     return __current_engine().create_command_buffer()
 
 
-def submit(command_buffers) -> SubmissionTask:
+def submit(command_buffers: list[CommandBuffer]) -> SubmissionTask:
     """Submits one or more closed command buffers for execution on the
     current engine, via Engine.submit().
     """

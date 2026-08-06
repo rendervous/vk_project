@@ -648,6 +648,16 @@ class Layout:
         ...
 
     @property
+    def rule(self) -> LayoutRule:
+        """The :class:`LayoutRule` this layout (and, recursively, every
+        nested :attr:`element_layout`/field layout) was computed under --
+        e.g. to tell a :attr:`LayoutRule.Std140`-computed uniform-block
+        layout apart from a :attr:`LayoutRule.Scalar`-computed one accepted
+        by ``Device.create_buffer(elements, layout, ...)``.
+        """
+        ...
+
+    @property
     def kind(self) -> TypeKind:
         """Shape of the type this layout was computed for."""
         ...
@@ -721,6 +731,24 @@ class Layout:
         ``.layout`` (itself a :class:`Layout`), or into an array/matrix
         field via ``.layout.element_layout``. Raises ``RuntimeError`` if
         this layout isn't a struct, or no field named ``name`` exists.
+        """
+        ...
+
+    def element(self, index: int) -> LayoutField:
+        """Symmetric to :meth:`field`, for an array (or matrix-shaped
+        single value) layout: the field-shaped view of element/column
+        ``index`` -- ``offset == index * stride``, ``layout ==
+        element_layout``. ``root`` is filled in the same way a struct
+        field's is, so the result works with :meth:`Buffer.field`/
+        :meth:`Buffer.read`/:meth:`Buffer.write` exactly like a struct
+        field does, and struct-field/array-index navigation composes
+        either order (e.g. ``layout.field("a").layout.element(2)`` or
+        ``layout.element(2).layout.field("a")``).
+
+        :param index: Element (or matrix column) index.
+        :raises RuntimeError: If this layout isn't an array or a
+            matrix-shaped single value, or (for a sized array/matrix)
+            ``index`` is out of range.
         """
         ...
 
@@ -881,6 +909,46 @@ def compute_layout(type: TypeDescriptor, rule: LayoutRule) -> Layout:
     :param type: Type to compute the layout of.
     :param rule: Layout convention to apply.
     :return: The computed :class:`Layout`.
+    """
+    ...
+
+
+def type_size(type: Type) -> int:
+    """Total byte size of one value of `type` (scalar, vector or matrix),
+    tightly packed (unlike :func:`compute_layout`'s result, never
+    alignment-padded). Pure host-side arithmetic; does not require a
+    :class:`Device`.
+
+    :raises RuntimeError: If `type` is :attr:`Type.UNDEFINED`.
+    """
+    ...
+
+
+def is_scalar(type: Type) -> bool:
+    """True iff `type` is a plain scalar (not a vector or matrix)."""
+    ...
+
+
+def is_vector(type: Type) -> bool:
+    """True iff `type` is a vector (e.g. :attr:`Type.VEC3`)."""
+    ...
+
+
+def is_matrix(type: Type) -> bool:
+    """True iff `type` is a matrix (e.g. :attr:`Type.MAT4`)."""
+    ...
+
+
+def type_component_type(type: Type) -> Type:
+    """`type`'s own base scalar component (itself, for a scalar; e.g.
+    :attr:`Type.FLOAT32` for both :attr:`Type.VEC3` and :attr:`Type.MAT4`).
+    """
+    ...
+
+
+def type_component_count(type: Type) -> int:
+    """Total number of scalar components of `type` (rows * columns; 1 for
+    a scalar, e.g. 3 for :attr:`Type.VEC3`, 16 for :attr:`Type.MAT4`).
     """
     ...
 
@@ -1384,6 +1452,72 @@ class WrappedMemory:
     @property
     def scalar_type(self) -> Type:
         """Scalar element type of the wrapped object."""
+        ...
+
+    @property
+    def is_direct(self) -> bool:
+        """True when ``device_ptr`` aliases the wrapped object's own memory
+        directly (a :class:`Buffer`/:class:`Tensor`, or memory that already
+        belongs to this device): there is only one copy of the data, so
+        every dirty/update method is a no-op. False when a temporary buffer
+        stands in for the GPU side instead.
+        """
+        ...
+
+    def __dlpack__(self, stream: None = None) -> object:
+        """Exports ``device_ptr`` itself (not the originally wrapped Python
+        object) as a DLPack capsule -- the Python DLPack protocol's
+        tensor-export method. Shape/dtype come from :attr:`shape`/
+        :attr:`scalar_type`.
+
+        :param stream: Accepted for protocol compatibility and ignored.
+        :return: A DLPack capsule wrapping this wrap's own memory.
+        :raises RuntimeError: If ``device_ptr`` has no host/CUDA-visible
+            pointer (not host-visible and no CUDA interop available), or
+            the owning device no longer exists.
+        """
+        ...
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        """Returns the ``(device_type, device_id)`` pair backing
+        ``device_ptr`` (the Python DLPack protocol's device-query method).
+        """
+        ...
+
+    def as_torch(self) -> object:
+        """Returns ``device_ptr``'s own memory as a ``torch.Tensor``, via
+        ``torch.from_dlpack``. Lazily imports ``torch`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def as_numpy(self) -> object:
+        """Returns ``device_ptr``'s own memory as a ``numpy.ndarray``, via
+        ``numpy.from_dlpack``. Lazily imports ``numpy`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def as_jax(self) -> object:
+        """Returns ``device_ptr``'s own memory as a ``jax.Array``, via
+        ``jax.dlpack.from_dlpack``. Lazily imports ``jax`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def as_cupy(self) -> object:
+        """Returns ``device_ptr``'s own memory as a ``cupy.ndarray``, via
+        ``cupy.from_dlpack``. Lazily imports ``cupy`` (not a hard
+        dependency); raises ``ImportError`` if it isn't installed.
+        """
+        ...
+
+    def as_tensorflow(self) -> object:
+        """Returns ``device_ptr``'s own memory as a ``tf.Tensor``, via
+        ``tensorflow.experimental.dlpack.from_dlpack``. Lazily imports
+        ``tensorflow`` (not a hard dependency); raises ``ImportError`` if
+        it isn't installed.
+        """
         ...
 
 
@@ -2149,77 +2283,54 @@ class Stats:
         ...
 
 
-class Checkbox:
-    """A persistent checkbox widget, obtained from :meth:`Window.checkbox`.
+class BoolState:
+    """Holds one classical-ImGui-style checkbox value across frames.
 
-    Must be drawn via :meth:`draw` once per frame (between
-    :meth:`Window.begin_frame` and :meth:`Frame.present`) to appear at
-    all -- ImGui is immediate-mode, so a widget that isn't (re)drawn this
-    frame simply isn't shown. Read/write :attr:`value` whenever;
-    :meth:`draw` updates it in place if the user toggles it.
+    Pass the same instance to :meth:`Window.checkbox` every frame --
+    exactly the C++ ``bool changed = ImGui::Checkbox(label, &value)``
+    idiom, just with ``value``/``changed`` bundled into one object so
+    both can be queried afterward instead of only the return value.
+    :attr:`changed` reflects only the most recent call.
     """
 
-    def draw(self) -> bool:
-        """Draws this frame. :return: Whether the value changed this frame."""
-        ...
-
+    def __init__(self, value: bool = False) -> None: ...
     @property
     def value(self) -> bool: ...
     @value.setter
     def value(self, value: bool) -> None: ...
+    @property
+    def changed(self) -> bool: ...
 
 
-class SliderFloat:
-    """A persistent float slider widget, obtained from
-    :meth:`Window.slider_float`. See :class:`Checkbox` for the draw()/value
-    usage pattern.
+class FloatState:
+    """Holds one classical-ImGui-style float slider value across frames.
+    See :class:`BoolState` for the usage pattern; pass to
+    :meth:`Window.slider_float`.
     """
 
-    def draw(self) -> bool:
-        """Draws this frame. :return: Whether the value changed this frame."""
-        ...
-
+    def __init__(self, value: float = 0.0) -> None: ...
     @property
     def value(self) -> float: ...
     @value.setter
     def value(self, value: float) -> None: ...
+    @property
+    def changed(self) -> bool: ...
 
 
-class SliderInt:
-    """A persistent integer slider widget, obtained from
-    :meth:`Window.slider_int`. See :class:`Checkbox` for the draw()/value
-    usage pattern.
+class IntState:
+    """Holds one classical-ImGui-style int slider/combobox-selection value
+    across frames. See :class:`BoolState` for the usage pattern; pass to
+    :meth:`Window.slider_int` or :meth:`Window.combobox` (where
+    :attr:`value` is the selected index into the combobox's items).
     """
 
-    def draw(self) -> bool:
-        """Draws this frame. :return: Whether the value changed this frame."""
-        ...
-
+    def __init__(self, value: int = 0) -> None: ...
     @property
     def value(self) -> int: ...
     @value.setter
     def value(self, value: int) -> None: ...
-
-
-class Combobox:
-    """A persistent combobox widget, obtained from :meth:`Window.combobox`.
-    See :class:`Checkbox` for the draw()/value usage pattern.
-    """
-
-    def draw(self) -> bool:
-        """Draws this frame. :return: Whether the selection changed this frame."""
-        ...
-
     @property
-    def selected_index(self) -> int: ...
-    @selected_index.setter
-    def selected_index(self, index: int) -> None: ...
-    @property
-    def selected_item(self) -> str:
-        """``items[selected_index]``."""
-        ...
-    @property
-    def items(self) -> list[str]: ...
+    def changed(self) -> bool: ...
 
 
 class Window:
@@ -2301,27 +2412,32 @@ class Window:
         """
         ...
 
-    def checkbox(self, label: str, value: bool = False) -> Checkbox:
-        """Creates a persistent :class:`Checkbox` widget. Call this once;
-        call the returned widget's ``draw()`` every frame afterwards.
+    def checkbox(self, label: str, state: BoolState) -> None:
+        """Draws a checkbox labeled `label`, classical-ImGui style: call
+        every frame with the same :class:`BoolState`, which is updated in
+        place (``state.value``/``state.changed``) if the user toggles it.
         """
         ...
 
-    def slider_float(self, label: str, min: float, max: float, value: float) -> SliderFloat:
-        """Creates a persistent :class:`SliderFloat` widget. Call this
-        once; call the returned widget's ``draw()`` every frame afterwards.
+    def slider_float(self, label: str, state: FloatState, min: float, max: float) -> None:
+        """Draws a float slider labeled `label` over ``[min, max]``,
+        classical-ImGui style: call every frame with the same
+        :class:`FloatState`, updated in place if the user drags it.
         """
         ...
 
-    def slider_int(self, label: str, min: int, max: int, value: int) -> SliderInt:
-        """Creates a persistent :class:`SliderInt` widget. Call this once;
-        call the returned widget's ``draw()`` every frame afterwards.
+    def slider_int(self, label: str, state: IntState, min: int, max: int) -> None:
+        """Draws an int slider labeled `label` over ``[min, max]``,
+        classical-ImGui style: call every frame with the same
+        :class:`IntState`, updated in place if the user drags it.
         """
         ...
 
-    def combobox(self, label: str, items: list[str], selected_index: int = 0) -> Combobox:
-        """Creates a persistent :class:`Combobox` widget. Call this once;
-        call the returned widget's ``draw()`` every frame afterwards.
+    def combobox(self, label: str, items: list[str], state: IntState) -> None:
+        """Draws a combobox labeled `label` listing `items`, classical-
+        ImGui style: call every frame with the same :class:`IntState`
+        (``state.value`` is the selected index into `items`), updated in
+        place if the user picks a different item.
         """
         ...
 
@@ -2634,8 +2750,8 @@ class Device:
     def __init__(self) -> None:
         """Creates an uninitialized device.
 
-        Prefer :func:`create_device` or :meth:`Device.create_device`
-        over constructing a device directly.
+        Prefer :func:`vk.device` (or, at this low level,
+        :meth:`Device.create_device`) over constructing a device directly.
         """
         ...
 
@@ -2646,7 +2762,7 @@ class Device:
     @property
     def index(self) -> int:
         """Index of the physical Vulkan device this was created from
-        (the same value passed to :meth:`create_device`/:func:`create_device`).
+        (the same value passed to :meth:`Device.create_device`/:func:`vk.device`).
         """
         ...
 
@@ -3002,7 +3118,7 @@ def device_infos() -> list[dict]:
     is created, queried, and destroyed within this call alone.
 
     Each entry is a dict with keys ``"index"`` (the value to pass to
-    :meth:`Device.create_device`/:func:`create_device` for that GPU),
+    :meth:`Device.create_device`/:func:`vk.device` for that GPU),
     ``"name"``, ``"vendor"`` (a friendly name, e.g. ``"NVIDIA"``, or a
     ``"0x...."`` hex string for an unrecognized vendor), ``"vendor_id"``,
     ``"device_id"``, ``"device_type"`` (one of ``"discrete_gpu"``/
@@ -3012,6 +3128,6 @@ def device_infos() -> list[dict]:
     device-local memory heap size, in bytes).
 
     :return: One dict per Vulkan-visible physical device, in the same
-        order/indexing as :meth:`Device.create_device` expects.
+        order/indexing as :meth:`Device.create_device`/:func:`vk.device` expects.
     """
     ...

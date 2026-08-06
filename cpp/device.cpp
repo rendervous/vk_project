@@ -368,6 +368,12 @@ struct DLManagedTensor {
 
 struct TensorOwner {
     std::shared_ptr<MemorySlice> memory;
+    // WrappedMemory::vk_dlpack() only: keeps its own temporary buffer (if
+    // any) alive for as long as the exported tensor is, in place of `memory`
+    // (a WrappedMemory has no MemorySlice of its own to hold). Null for a
+    // direct mapping, where the original wrapped object already owns the
+    // memory and outlives it independently.
+    std::shared_ptr<Buffer> owned_buffer;
     std::unique_ptr<std::int64_t[]> shape;
     std::unique_ptr<std::int64_t[]> strides;
 };
@@ -921,6 +927,34 @@ TypeTraits type_traits(Type type) {
     }
 }
 
+int type_size(Type type) {
+    const TypeTraits traits = type_traits(type);
+    return scalar_type_size(traits.component_type) * traits.rows * traits.columns;
+}
+
+bool is_scalar(Type type) noexcept {
+    const TypeTraits traits = type_traits(type);
+    return traits.rows == 1 && traits.columns == 1;
+}
+
+bool is_vector(Type type) noexcept {
+    const TypeTraits traits = type_traits(type);
+    return traits.columns == 1 && traits.rows > 1;
+}
+
+bool is_matrix(Type type) noexcept {
+    return type_traits(type).columns > 1;
+}
+
+Type type_component_type(Type type) noexcept {
+    return type_traits(type).component_type;
+}
+
+int type_component_count(Type type) noexcept {
+    const TypeTraits traits = type_traits(type);
+    return traits.rows * traits.columns;
+}
+
 TypeDescriptor TypeDescriptor::single(Type type) {
     TypeDescriptor td;
     td.payload_ = SingleDesc{ type };
@@ -962,6 +996,7 @@ namespace {
     // layouts during construction: the outermost call always runs last and
     // overwrites everything to point at the true root.
     void assign_root(const std::shared_ptr<Layout>& layout, const std::weak_ptr<Layout>& root) {
+        layout->root_ = root;
         if (layout->kind == TypeKind::STRUCT) {
             for (auto& field : layout->fields) {
                 field.root = root;
@@ -975,6 +1010,7 @@ namespace {
 
 std::shared_ptr<Layout> compute_layout(const TypeDescriptor& type, LayoutRule rule) {
     auto layout = std::make_shared<Layout>();
+    layout->rule = rule;
     std::visit([&](auto&& desc) {
         using T = std::decay_t<decltype(desc)>;
         if constexpr (std::is_same_v<T, SingleDesc>) {
@@ -1049,6 +1085,16 @@ const LayoutField& Layout::field(const std::string& name) const {
         if (f.name == name) return f;
     }
     throw std::runtime_error("Layout::field: no field named '" + name + "'");
+}
+
+LayoutField Layout::element(std::uint64_t index) const {
+    if (!element_layout) {
+        throw std::runtime_error("Layout::element: this layout is not an array or matrix");
+    }
+    if (count != 0 && index >= count) {
+        throw std::runtime_error("Layout::element: index out of range");
+    }
+    return LayoutField{ "[" + std::to_string(index) + "]", index * stride, element_layout, root_ };
 }
 
 const std::shared_ptr<Layout>& Layouts::index16() {
@@ -3991,42 +4037,9 @@ bool vk_Window::vk_imgui_combobox(const std::string& label, const std::vector<st
     return changed;
 }
 
-std::uint64_t vk_next_widget_id(const std::weak_ptr<vk_Window>& window) {
-    auto w = window.lock();
-    return w ? w->vk_next_widget_id() : 0;
-}
-
 double Stats::fps() const {
     auto w = window_.lock();
     return w ? w->vk_fps() : 0.0;
-}
-
-bool Checkbox::draw() {
-    auto w = window_.lock();
-    if (!w) return false;
-    const std::string id_label = label_ + "##cb" + std::to_string(id_);
-    return w->vk_imgui_checkbox(id_label, value_);
-}
-
-bool SliderFloat::draw() {
-    auto w = window_.lock();
-    if (!w) return false;
-    const std::string id_label = label_ + "##sf" + std::to_string(id_);
-    return w->vk_imgui_slider_float(id_label, value_, min_, max_);
-}
-
-bool SliderInt::draw() {
-    auto w = window_.lock();
-    if (!w) return false;
-    const std::string id_label = label_ + "##si" + std::to_string(id_);
-    return w->vk_imgui_slider_int(id_label, value_, min_, max_);
-}
-
-bool Combobox::draw() {
-    auto w = window_.lock();
-    if (!w) return false;
-    const std::string id_label = label_ + "##cx" + std::to_string(id_);
-    return w->vk_imgui_combobox(id_label, items_, selected_index_);
 }
 
 vk_Window::~vk_Window() noexcept {
@@ -5440,6 +5453,14 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, MemoryLocation
     throw std::runtime_error("Device::wrap: value must be a Buffer, a DLPack-compatible object, or a Python buffer object");
 }
 
+std::pair<std::uint64_t, DLDevice> Device::vk_resolve_external(std::uint64_t device_ptr) const noexcept {
+    auto host_result = host_memory_manager_->resolve_external(device_ptr);
+    if (host_result.first != 0) {
+        return host_result;
+    }
+    return device_memory_manager_->resolve_external(device_ptr);
+}
+
 WrappedMemory::WrappedMemory(
     std::weak_ptr<Device> device,
     std::uint64_t device_ptr,
@@ -5518,6 +5539,55 @@ void WrappedMemory::update_cpu() {
         device->vk_copy_out(owned_buffer_->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*dst_is_cuda=*/false);
     }
     cpu_version_ = gpu_version_;
+}
+
+DLDevice WrappedMemory::vk_dlpack_device() const {
+    auto device = device_.lock();
+    if (!device) {
+        throw std::runtime_error("WrappedMemory::vk_dlpack_device: owning Device no longer exists");
+    }
+    auto [external_ptr, dl_device] = device->vk_resolve_external(device_ptr_);
+    if (external_ptr == 0) {
+        throw std::runtime_error("WrappedMemory::vk_dlpack_device: underlying memory has no host/CUDA-visible pointer");
+    }
+    return dl_device;
+}
+
+pybind11::object WrappedMemory::vk_dlpack() const {
+    auto device = device_.lock();
+    if (!device) {
+        throw std::runtime_error("WrappedMemory::vk_dlpack: owning Device no longer exists");
+    }
+    auto [external_ptr, dl_device] = device->vk_resolve_external(device_ptr_);
+    if (external_ptr == 0) {
+        throw std::runtime_error("WrappedMemory::vk_dlpack: underlying memory has no host/CUDA-visible pointer");
+    }
+
+    const int dimension = static_cast<int>(shape_.size());
+
+    auto* owner = new TensorOwner();
+    owner->owned_buffer = owned_buffer_;
+    owner->shape = std::make_unique<std::int64_t[]>(dimension);
+    owner->strides = std::make_unique<std::int64_t[]>(dimension);
+    std::int64_t running_stride = 1;
+    for (int i = dimension - 1; i >= 0; --i) {
+        owner->shape[i] = static_cast<std::int64_t>(shape_[static_cast<std::size_t>(i)]);
+        owner->strides[i] = running_stride;
+        running_stride *= owner->shape[i];
+    }
+
+    auto* managed = new DLManagedTensor{};
+    managed->dl_tensor.data = reinterpret_cast<void*>(static_cast<std::uintptr_t>(external_ptr));
+    managed->dl_tensor.device = dl_device;
+    managed->dl_tensor.ndim = dimension;
+    managed->dl_tensor.dtype = dlpack_dtype(scalar_type_);
+    managed->dl_tensor.shape = owner->shape.get();
+    managed->dl_tensor.strides = owner->strides.get();
+    managed->dl_tensor.byte_offset = 0;
+    managed->manager_ctx = owner;
+    managed->deleter = dlmanaged_tensor_deleter;
+
+    return export_dltensor_py(managed);
 }
 
 WrappedMemory::~WrappedMemory() noexcept = default;
@@ -5785,6 +5855,16 @@ std::uint64_t MemoryManager::device_to_external(std::uint64_t device_ptr) const 
         }
     }
     return 0;
+}
+
+std::pair<std::uint64_t, DLDevice> MemoryManager::resolve_external(std::uint64_t device_ptr) const noexcept {
+    for (auto& page : pages_) {
+        auto external_ptr = page->device_to_external(device_ptr);
+        if (external_ptr != 0) {
+            return { external_ptr, page->dl_device() };
+        }
+    }
+    return { 0, DLDevice{0, 0} };
 }
 
 std::uint64_t MemoryManager::vk_interop_semaphore_handle() const {

@@ -10,6 +10,7 @@
 #include <array>
 #include <optional>
 #include <chrono>
+#include <utility>
 
 namespace pybind11 { class object; }
 
@@ -58,10 +59,6 @@ class vk_Window;
 class Window;
 class Frame;
 class Stats;
-class Checkbox;
-class SliderFloat;
-class SliderInt;
-class Combobox;
 
 /*  ============== ENUMS ============== */
 
@@ -490,6 +487,22 @@ struct TypeTraits {
 };
 TypeTraits type_traits(Type type);
 
+// Total byte size of one value of `type` (scalar, vector or matrix),
+// tightly packed (rows * columns * scalar_type_size(component_type)) --
+// unlike scalar_type_size(), valid for every Type, not just scalars.
+// Throws std::runtime_error for Type::UNDEFINED.
+int type_size(Type type);
+// True iff `type` is a plain scalar (rows == columns == 1).
+bool is_scalar(Type type) noexcept;
+// True iff `type` is a vector (columns == 1, rows > 1).
+bool is_vector(Type type) noexcept;
+// True iff `type` is a matrix (columns > 1).
+bool is_matrix(Type type) noexcept;
+// `type`'s own base scalar component (itself, for a scalar).
+Type type_component_type(Type type) noexcept;
+// Total number of scalar components (rows * columns; 1 for a scalar).
+int type_component_count(Type type) noexcept;
+
 // Computes the byte size/alignment layout of `type` under `rule` (std140,
 // std430 or scalar block layout rules). Pure host-side arithmetic, does not
 // require a Device.
@@ -532,6 +545,11 @@ public:
     // the byte stride between consecutive elements. Used both to size
     // ARRAY/matrix strides and by Device::create_buffer(layout, ..., count > 1).
     std::uint64_t aligned_size = 0;
+    // The LayoutRule this Layout (and, recursively, every nested
+    // element_layout/field layout) was computed under -- e.g. to tell a
+    // std140-computed uniform-block Layout apart from a Scalar-computed
+    // one accepted by Device::create_buffer(elements, layout, ...).
+    LayoutRule rule = LayoutRule::Scalar;
     TypeKind kind = TypeKind::SINGLE;
     // SINGLE only: the exact scalar/vector/matrix Type this Layout was
     // computed for (UNDEFINED for ARRAY/STRUCT).
@@ -560,6 +578,25 @@ public:
     // std::runtime_error if this layout isn't a STRUCT, or no field named
     // `name` exists.
     [[nodiscard]] const LayoutField& field(const std::string& name) const;
+
+    // Symmetric to field(), for an ARRAY (or matrix-shaped SINGLE) layout:
+    // the LayoutField-shaped view of element/column `index` -- offset ==
+    // index * stride, layout == element_layout, root propagated the same
+    // way struct fields' LayoutField::root is (see assign_root()), so
+    // Buffer::field()/read()/write() accept the result the same way they
+    // accept a struct field, and struct-field/array-index navigation
+    // composes uniformly either order (e.g. `.field("a").layout->element(2)`
+    // or `.element(2).layout->field("a")`). Returned by value, unlike
+    // field(): there's no fixed set of elements to hold a reference into.
+    // Throws std::runtime_error if this layout isn't ARRAY/matrix-shaped
+    // SINGLE, or (for a sized array/matrix, i.e. count != 0) `index >= count`.
+    [[nodiscard]] LayoutField element(std::uint64_t index) const;
+
+    // The outermost Layout compute_layout() was called for (itself, if
+    // this Layout already is one) -- assigned by assign_root(), mirroring
+    // LayoutField::root; used by element() to fill in the LayoutField it
+    // returns. Not exposed to Python (LayoutField::root already is).
+    std::weak_ptr<Layout> root_;
 };
 
 /**
@@ -856,12 +893,21 @@ public:
     [[nodiscard]] std::uint64_t device_ptr() const noexcept { return device_ptr_; }
     [[nodiscard]] const std::vector<std::uint64_t>& shape() const noexcept { return shape_; }
     [[nodiscard]] Type scalar_type() const noexcept { return scalar_type_; }
-private:
     // True when device_ptr_ aliases the wrapped object's own memory
     // directly: there is only one copy of the data, so dirty/update calls
     // have nothing to do.
     [[nodiscard]] bool is_direct() const noexcept { return source_kind_ == SourceKind::NONE; }
 
+    // DLPack export of device_ptr_ itself (not the original wrapped Python
+    // object): resolves it back to its host/CUDA-visible pointer via
+    // Device::vk_resolve_external(), so e.g. a shader's writes through
+    // device_ptr are visible without going through update_cpu()/the
+    // original object at all. Throws std::runtime_error if `device_ptr_`
+    // isn't backed by a host/CUDA-visible pointer (host_visible() false and
+    // no CUDA interop available) or the owning Device no longer exists.
+    [[nodiscard]] pybind11::object vk_dlpack() const;
+    [[nodiscard]] DLDevice vk_dlpack_device() const;
+private:
     std::weak_ptr<Device> device_;
     std::uint64_t device_ptr_;
     std::vector<std::uint64_t> shape_;
@@ -1910,7 +1956,6 @@ public:
     // call below must happen between vk_begin_frame() and
     // vk_present_frame() (i.e. ImGui::NewFrame() has been called but
     // ImGui::Render() hasn't yet).
-    [[nodiscard]] std::uint64_t vk_next_widget_id() noexcept { return next_widget_id_++; }
     [[nodiscard]] double vk_fps() const noexcept { return fps_; }
     void vk_imgui_text(const std::string& text);
     [[nodiscard]] bool vk_imgui_button(const std::string& text);
@@ -2013,7 +2058,6 @@ private:
     vk::RenderPass imgui_render_pass_;
     std::vector<vk::Framebuffer> imgui_framebuffers_; // size == slots_.size()
     std::vector<vk::CommandBuffer> imgui_command_buffers_; // size == sync_groups_.size()
-    std::uint64_t next_widget_id_ = 0; // disambiguates same-label widgets via ImGui's "label##id" convention
     std::chrono::steady_clock::time_point last_frame_time_point_;
     double fps_ = 0.0;
 };
@@ -2033,88 +2077,25 @@ private:
     std::weak_ptr<vk_Window> window_;
 };
 
-// Disambiguates same-label widgets via ImGui's "label##id" ID convention
-// (the part after "##" affects identity but is never displayed). Shared
-// by every widget class below. Returns 0 if `window` has expired --
-// harmless (just risks an ID collision on an already-unusable widget).
-std::uint64_t vk_next_widget_id(const std::weak_ptr<vk_Window>& window);
-
 /**
- * A persistent checkbox widget (see Window::checkbox). Must be drawn via
- * draw() once per frame (between Window::begin_frame() and
- * Frame::present()) for it to appear at all -- ImGui is immediate-mode,
- * so a widget that isn't (re)drawn this frame simply isn't shown.
+ * Holds one classical-ImGui-style widget value across frames: pass the
+ * same State by reference to Window::checkbox()/slider_float()/
+ * slider_int()/combobox() every frame (exactly the `bool changed =
+ * ImGui::Checkbox(label, &value)` C++ idiom -- the widget call itself
+ * mutates `value` and sets `changed` in place), then query `.value`/
+ * `.changed` afterward. `changed` reflects only the most recent call.
  */
-class Checkbox {
+template <typename T>
+class State {
 public:
-    Checkbox(std::weak_ptr<vk_Window> window, std::string label, bool value) noexcept
-        : window_(window), label_(std::move(label)), value_(value), id_(vk_next_widget_id(window)) {}
-    Checkbox() = delete;
-    // Draws this frame; returns whether the value changed this frame.
-    bool draw();
-    [[nodiscard]] bool value() const noexcept { return value_; }
-    void set_value(bool value) noexcept { value_ = value; }
-private:
-    std::weak_ptr<vk_Window> window_;
-    std::string label_;
-    bool value_;
-    std::uint64_t id_;
+    State() = default;
+    explicit State(T value) noexcept : value(value) {}
+    T value{};
+    bool changed = false;
 };
-
-/** A persistent float slider widget (see Window::slider_float). */
-class SliderFloat {
-public:
-    SliderFloat(std::weak_ptr<vk_Window> window, std::string label, float min, float max, float value) noexcept
-        : window_(window), label_(std::move(label)), min_(min), max_(max), value_(value), id_(vk_next_widget_id(window)) {}
-    SliderFloat() = delete;
-    bool draw();
-    [[nodiscard]] float value() const noexcept { return value_; }
-    void set_value(float value) noexcept { value_ = value; }
-private:
-    std::weak_ptr<vk_Window> window_;
-    std::string label_;
-    float min_;
-    float max_;
-    float value_;
-    std::uint64_t id_;
-};
-
-/** A persistent integer slider widget (see Window::slider_int). */
-class SliderInt {
-public:
-    SliderInt(std::weak_ptr<vk_Window> window, std::string label, int min, int max, int value) noexcept
-        : window_(window), label_(std::move(label)), min_(min), max_(max), value_(value), id_(vk_next_widget_id(window)) {}
-    SliderInt() = delete;
-    bool draw();
-    [[nodiscard]] int value() const noexcept { return value_; }
-    void set_value(int value) noexcept { value_ = value; }
-private:
-    std::weak_ptr<vk_Window> window_;
-    std::string label_;
-    int min_;
-    int max_;
-    int value_;
-    std::uint64_t id_;
-};
-
-/** A persistent combobox widget (see Window::combobox). */
-class Combobox {
-public:
-    Combobox(std::weak_ptr<vk_Window> window, std::string label, std::vector<std::string> items, int selected_index) noexcept
-        : window_(window), label_(std::move(label)), items_(std::move(items)), selected_index_(selected_index), id_(vk_next_widget_id(window)) {}
-    Combobox() = delete;
-    bool draw();
-    [[nodiscard]] int selected_index() const noexcept { return selected_index_; }
-    void set_selected_index(int index) noexcept { selected_index_ = index; }
-    [[nodiscard]] const std::string& selected_item() const { return items_.at(static_cast<std::size_t>(selected_index_)); }
-    [[nodiscard]] const std::vector<std::string>& items() const noexcept { return items_; }
-private:
-    std::weak_ptr<vk_Window> window_;
-    std::string label_;
-    std::vector<std::string> items_;
-    int selected_index_;
-    std::uint64_t id_;
-};
+using BoolState = State<bool>;
+using FloatState = State<float>;
+using IntState = State<int>;
 
 /**
  * Usage:
@@ -2251,30 +2232,31 @@ public:
     [[nodiscard]] std::uint32_t height() const noexcept { return window_->height(); }
     [[nodiscard]] std::uint32_t device_index() const { return window_->device_index(); }
 
-    // ---- ImGui-backed GUI. label()/button() are direct, stateless,
-    // immediate calls (call every frame; nothing to persist between
-    // frames). checkbox()/slider_float()/slider_int()/combobox() instead
-    // return a persistent widget object (create once, call its draw()
-    // every frame, read/write its value whenever) since those need to
-    // remember their current value across frames -- see their classes'
-    // docstrings. All must be called between begin_frame() and the
-    // matching Frame::present().
+    // ---- ImGui-backed GUI: classical immediate-mode calls, every one
+    // made fresh every frame (nothing returned is persistent). checkbox()/
+    // slider_float()/slider_int()/combobox() take their current value in
+    // (and write it back out) via a caller-owned State -- exactly the
+    // C++ `bool changed = ImGui::Checkbox(label, &value)` idiom, just
+    // with `value`+`changed` bundled into one object so both can be
+    // queried afterward instead of only the return value. All must be
+    // called between begin_frame() and the matching Frame::present().
     [[nodiscard]] std::shared_ptr<Stats> stats() const { return std::make_shared<Stats>(window_); }
     void label(const std::string& text) { window_->vk_imgui_text(text); }
     void label(const std::string& text, double value) { window_->vk_imgui_text(text + std::to_string(value)); }
     void label(const std::string& text, const std::string& value) { window_->vk_imgui_text(text + value); }
     [[nodiscard]] bool button(const std::string& text) { return window_->vk_imgui_button(text); }
-    [[nodiscard]] std::shared_ptr<Checkbox> checkbox(const std::string& label, bool value = false) {
-        return std::make_shared<Checkbox>(window_, label, value);
+    void checkbox(const std::string& label, BoolState& state) {
+        state.changed = window_->vk_imgui_checkbox(label, state.value);
     }
-    [[nodiscard]] std::shared_ptr<SliderFloat> slider_float(const std::string& label, float min, float max, float value) {
-        return std::make_shared<SliderFloat>(window_, label, min, max, value);
+    void slider_float(const std::string& label, FloatState& state, float min, float max) {
+        state.changed = window_->vk_imgui_slider_float(label, state.value, min, max);
     }
-    [[nodiscard]] std::shared_ptr<SliderInt> slider_int(const std::string& label, int min, int max, int value) {
-        return std::make_shared<SliderInt>(window_, label, min, max, value);
+    void slider_int(const std::string& label, IntState& state, int min, int max) {
+        state.changed = window_->vk_imgui_slider_int(label, state.value, min, max);
     }
-    [[nodiscard]] std::shared_ptr<Combobox> combobox(const std::string& label, std::vector<std::string> items, int selected_index = 0) {
-        return std::make_shared<Combobox>(window_, label, std::move(items), selected_index);
+    // `state.value` is the selected index into `items`.
+    void combobox(const std::string& label, const std::vector<std::string>& items, IntState& state) {
+        state.changed = window_->vk_imgui_combobox(label, items, state.value);
     }
 
     // Underlying vk_Window. Used internally by Device::create_window (to
@@ -2555,7 +2537,8 @@ struct DeviceInfo {
 // Enumerates every Vulkan-visible physical device without creating a
 // logical Device for any of them: a throwaway vk::Instance is created,
 // queried, and destroyed within this call alone. `index` in each result
-// is what Device::create_device()/create_device() expects.
+// is what Device::create_device() (or, at the Python level, vk.device())
+// expects.
 std::vector<DeviceInfo> query_device_infos();
 
 /**
@@ -2668,6 +2651,13 @@ public:
     //     its own.
     // Throws std::runtime_error if `obj` is none of these.
     [[nodiscard]] std::shared_ptr<WrappedMemory> wrap(pybind11::object obj, MemoryLocation location = MemoryLocation::DEVICE);
+
+    // Resolves `device_ptr` (e.g. WrappedMemory::device_ptr()) back to its
+    // host/CUDA-visible pointer and DLDevice, trying host_memory_manager_
+    // then device_memory_manager_. external_ptr in the result is 0 if
+    // `device_ptr` isn't one of this device's own allocations. Used by
+    // WrappedMemory::vk_dlpack()/vk_dlpack_device().
+    [[nodiscard]] std::pair<std::uint64_t, DLDevice> vk_resolve_external(std::uint64_t device_ptr) const noexcept;
 
     // Copies `total_bytes`/shape/strides FROM an external source (`src_data`,
     // host- or CUDA-resident per `source_is_cuda`) INTO `dst_external_ptr`
@@ -2957,6 +2947,14 @@ public:
 
     [[nodiscard]] std::uint64_t external_to_device(std::uint64_t external_ptr) const noexcept;
     [[nodiscard]] std::uint64_t device_to_external(std::uint64_t device_ptr) const noexcept;
+
+    // Resolves `device_ptr` back to its external (host/CUDA) pointer and
+    // DLDevice, via whichever page owns it. external_ptr is 0 in the
+    // result if `device_ptr` isn't one of this manager's own allocations.
+    // Used by Device::vk_resolve_external() (in turn by
+    // WrappedMemory::vk_dlpack()) since, unlike Buffer/Tensor, a
+    // WrappedMemory has no MemorySlice of its own to ask for this directly.
+    [[nodiscard]] std::pair<std::uint64_t, DLDevice> resolve_external(std::uint64_t device_ptr) const noexcept;
 
     // Copies a (possibly strided, possibly host- or CUDA-resident) tensor
     // into/out of a contiguous external pointer, via the loaded interop

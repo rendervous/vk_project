@@ -339,9 +339,22 @@ PYBIND11_MODULE(vk, m) {
 		.def("make_gpu_dirty", &WrappedMemory::make_gpu_dirty)
 		.def("update_cpu", &WrappedMemory::update_cpu)
 		.def("update_gpu", &WrappedMemory::update_gpu)
+		.def(
+			"__dlpack__",
+			[](const WrappedMemory& self, py::object /*stream*/) { return self.vk_dlpack(); },
+			py::arg("stream") = py::none()
+		)
+		.def(
+			"__dlpack_device__",
+			[](const WrappedMemory& self) {
+				DLDevice d = self.vk_dlpack_device();
+				return py::make_tuple(d.device_type, d.device_id);
+			}
+		)
 		.def_property_readonly("device_ptr", &WrappedMemory::device_ptr)
 		.def_property_readonly("shape", &WrappedMemory::shape)
-		.def_property_readonly("scalar_type", &WrappedMemory::scalar_type);
+		.def_property_readonly("scalar_type", &WrappedMemory::scalar_type)
+		.def_property_readonly("is_direct", &WrappedMemory::is_direct);
 
 	py::class_<Image, std::shared_ptr<Image>>(m, "Image")
 		.def("cast_format", &Image::cast_format, py::arg("format"))
@@ -475,6 +488,7 @@ PYBIND11_MODULE(vk, m) {
 		.def_readonly("size", &Layout::size)
 		.def_readonly("alignment", &Layout::alignment)
 		.def_readonly("aligned_size", &Layout::aligned_size)
+		.def_readonly("rule", &Layout::rule)
 		.def_readonly("kind", &Layout::kind)
 		.def_readonly("type", &Layout::type)
 		.def_readonly("component_type", &Layout::component_type)
@@ -482,7 +496,8 @@ PYBIND11_MODULE(vk, m) {
 		.def_readonly("element_layout", &Layout::element_layout)
 		.def_readonly("stride", &Layout::stride)
 		.def_readonly("count", &Layout::count)
-		.def("field", &Layout::field, py::arg("name"), py::return_value_policy::reference_internal);
+		.def("field", &Layout::field, py::arg("name"), py::return_value_policy::reference_internal)
+		.def("element", &Layout::element, py::arg("index"));
 
 	py::class_<Layouts>(m, "Layouts")
 		.def_static("index16", &Layouts::index16)
@@ -497,6 +512,22 @@ PYBIND11_MODULE(vk, m) {
 		py::arg("type"),
 		py::arg("rule"),
 		"Computes the byte layout (size, alignment, offsets/strides) of a TypeDescriptor under a given LayoutRule."
+	);
+
+	m.def(
+		"type_size", &type_size, py::arg("type"),
+		"Total byte size of one value of `type` (scalar, vector or matrix), tightly packed."
+	);
+	m.def("is_scalar", &is_scalar, py::arg("type"), "True iff `type` is a plain scalar.");
+	m.def("is_vector", &is_vector, py::arg("type"), "True iff `type` is a vector.");
+	m.def("is_matrix", &is_matrix, py::arg("type"), "True iff `type` is a matrix.");
+	m.def(
+		"type_component_type", &type_component_type, py::arg("type"),
+		"`type`'s own base scalar component (itself, for a scalar)."
+	);
+	m.def(
+		"type_component_count", &type_component_count, py::arg("type"),
+		"Total number of scalar components of `type` (rows * columns; 1 for a scalar)."
 	);
 
 	py::class_<CommandBuffer, std::shared_ptr<CommandBuffer>>(m, "CommandBuffer")
@@ -669,23 +700,20 @@ PYBIND11_MODULE(vk, m) {
 	py::class_<Stats, std::shared_ptr<Stats>>(m, "Stats")
 		.def_property_readonly("fps", &Stats::fps);
 
-	py::class_<Checkbox, std::shared_ptr<Checkbox>>(m, "Checkbox")
-		.def("draw", &Checkbox::draw)
-		.def_property("value", &Checkbox::value, &Checkbox::set_value);
+	py::class_<BoolState>(m, "BoolState")
+		.def(py::init<bool>(), py::arg("value") = false)
+		.def_readwrite("value", &BoolState::value)
+		.def_readonly("changed", &BoolState::changed);
 
-	py::class_<SliderFloat, std::shared_ptr<SliderFloat>>(m, "SliderFloat")
-		.def("draw", &SliderFloat::draw)
-		.def_property("value", &SliderFloat::value, &SliderFloat::set_value);
+	py::class_<FloatState>(m, "FloatState")
+		.def(py::init<float>(), py::arg("value") = 0.0f)
+		.def_readwrite("value", &FloatState::value)
+		.def_readonly("changed", &FloatState::changed);
 
-	py::class_<SliderInt, std::shared_ptr<SliderInt>>(m, "SliderInt")
-		.def("draw", &SliderInt::draw)
-		.def_property("value", &SliderInt::value, &SliderInt::set_value);
-
-	py::class_<Combobox, std::shared_ptr<Combobox>>(m, "Combobox")
-		.def("draw", &Combobox::draw)
-		.def_property("selected_index", &Combobox::selected_index, &Combobox::set_selected_index)
-		.def_property_readonly("selected_item", &Combobox::selected_item)
-		.def_property_readonly("items", &Combobox::items);
+	py::class_<IntState>(m, "IntState")
+		.def(py::init<int>(), py::arg("value") = 0)
+		.def_readwrite("value", &IntState::value)
+		.def_readonly("changed", &IntState::changed);
 
 	py::class_<Window, std::shared_ptr<Window>>(m, "Window")
 		.def("check_alive", &Window::check_alive)
@@ -712,10 +740,10 @@ PYBIND11_MODULE(vk, m) {
 			py::arg("text"), py::arg("value")
 		)
 		.def("button", &Window::button, py::arg("text"))
-		.def("checkbox", &Window::checkbox, py::arg("label"), py::arg("value") = false)
-		.def("slider_float", &Window::slider_float, py::arg("label"), py::arg("min"), py::arg("max"), py::arg("value"))
-		.def("slider_int", &Window::slider_int, py::arg("label"), py::arg("min"), py::arg("max"), py::arg("value"))
-		.def("combobox", &Window::combobox, py::arg("label"), py::arg("items"), py::arg("selected_index") = 0);
+		.def("checkbox", &Window::checkbox, py::arg("label"), py::arg("state"))
+		.def("slider_float", &Window::slider_float, py::arg("label"), py::arg("state"), py::arg("min"), py::arg("max"))
+		.def("slider_int", &Window::slider_int, py::arg("label"), py::arg("state"), py::arg("min"), py::arg("max"))
+		.def("combobox", &Window::combobox, py::arg("label"), py::arg("items"), py::arg("state"));
 
 	// Opaque handles: not constructible from Python (no .def(py::init<...>())),
 	// only obtainable from Pipeline::layout()/attach() and handed back to
@@ -979,7 +1007,8 @@ PYBIND11_MODULE(vk, m) {
 		},
 		"Enumerates every Vulkan-visible physical device (name, vendor, device_type, "
 		"api_version, driver_version, vram_bytes), without creating a logical Device for "
-		"any of them. `index` in each entry is what create_device()/Device.create_device() expects."
+		"any of them. `index` in each entry is what Device.create_device() (or, at the "
+		"pythonic layer, vk.device()) expects."
 	);
 }
 

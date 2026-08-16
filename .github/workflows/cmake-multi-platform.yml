@@ -28,13 +28,17 @@ jobs:
       # -- pinning its `version:` input still produced a much newer SDK
       # whose Vulkan-Hpp moved DispatchLoaderDynamic into vk::detail, which
       # this codebase isn't compatible with. 1.3.283.0 (not 1.3.275.0: no
-      # longer hosted by LunarG) matches the version the Linux job already
-      # gets via yum, and is confirmed to still expose vk::DispatchLoaderDynamic.
+      # longer hosted by LunarG) matched the version the Linux job already
+      # gets via yum, and was confirmed to still expose vk::DispatchLoaderDynamic
+      # -- LunarG has since delisted it too; 1.3.290.0 is its oldest still-hosted
+      # replacement and confirmed to still expose vk::DispatchLoaderDynamic
+      # outside vk::detail (checked against the KhronosGroup/Vulkan-Hpp source
+      # at that tag). Re-pin forward again if LunarG delists this one too.
       - name: Set up Vulkan SDK on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ver = "1.3.283.0"
+          $ver = "1.3.290.0"
           $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
           Invoke-WebRequest -Uri $url -OutFile VulkanSDK-Installer.exe
           Start-Process -FilePath .\VulkanSDK-Installer.exe -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait -NoNewWindow

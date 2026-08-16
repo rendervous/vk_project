@@ -326,29 +326,6 @@ enum class CompareOp : int {
     ALWAYS = 7,
 };
 
-// Opaque handle returned by Pipeline::layout(), identifying one declared
-// descriptor set binding. Not constructible from Python: only meaningful
-// when passed back to DescriptorSet::bind() on a descriptor set from the
-// same Pipeline.
-class LayoutHandle {
-public:
-    explicit LayoutHandle(int id) noexcept : id_(id) {}
-    [[nodiscard]] int vk_id() const noexcept { return id_; }
-private:
-    int id_;
-};
-
-// Opaque handle returned by Pipeline::attach(), identifying one declared
-// color attachment slot. Not constructible from Python: only meaningful
-// when passed back to Pipeline::create_framebuffer() on the same Pipeline.
-class AttachHandle {
-public:
-    explicit AttachHandle(int slot) noexcept : slot_(slot) {}
-    [[nodiscard]] int vk_slot() const noexcept { return slot_; }
-private:
-    int slot_;
-};
-
 // Opaque handle returned by Pipeline::stage() for a ray tracing stage
 // (RAYGEN/MISS/CLOSEST_HIT/ANY_HIT), identifying that shader module for use
 // with Pipeline::append_raygen_group()/append_miss_group()/append_hit_group().
@@ -445,8 +422,9 @@ struct LayoutField {
     std::weak_ptr<Layout> root;
 };
 
-// One binding declared via Pipeline::layout(). The id returned by that
-// method is the index of this entry in the owning vk_Pipeline's bindings.
+// One binding declared via Pipeline::layout(). Looked up by the name it was
+// declared with (see vk_Pipeline::vk_binding_index()) when resolving a
+// DescriptorSet::bind() call.
 struct vk_DescriptorBinding {
     int set;
     int binding;
@@ -454,11 +432,28 @@ struct vk_DescriptorBinding {
     int count;
 };
 
+// One (name, type[, count]) entry passed to Pipeline::layout(). Assigned a
+// binding index consecutively from that call's start_binding, in the order
+// given -- in Python, from a `name=description` keyword per binding.
+struct vk_NamedBinding {
+    std::string name;
+    DescriptorType type;
+    int count = 1;
+};
+
 // One color attachment declared via Pipeline::attach(), identified by the
 // fragment shader output location (`slot`), not by render-pass attachment
 // index (attachments may be declared out of order).
 struct vk_AttachmentDesc {
     int slot;
+    Format format;
+};
+
+// One (name, format) entry passed to Pipeline::attach(). Assigned a slot
+// consecutively from that call's start_slot, in the order given -- in
+// Python, from a `name=format` keyword per attachment.
+struct vk_NamedAttachment {
+    std::string name;
     Format format;
 };
 
@@ -1545,9 +1540,25 @@ public:
     // to later reference it from append_raygen_group()/append_miss_group()/
     // append_hit_group().
     int vk_stage(ShaderStageType type, const ShaderSource& source);
-    int vk_layout(int set, int binding, DescriptorType description, int count);
+    // Declares one binding per entry of `named_bindings`, at consecutive
+    // `binding` indices starting at `start_binding` within `set`, in the
+    // order given. Each entry's name must be unique across every layout()
+    // call on this Pipeline -- later resolved by vk_binding_index() (used
+    // by DescriptorSet::bind()).
+    void vk_layout(int set, int start_binding, const std::vector<vk_NamedBinding>& named_bindings);
+    // Resolves `name` (declared via layout()) to its index into bindings_.
+    // Throws std::runtime_error if unknown.
+    [[nodiscard]] int vk_binding_index(const std::string& name) const;
     void vk_vertex_layout(int start_location, const Layout& layout);
-    int vk_attach(int slot, Format format);
+    // Declares one color attachment per entry of `named_attachments`, at
+    // consecutive fragment shader output locations starting at `start_slot`,
+    // in the order given. Each entry's name must be unique across every
+    // attach() call on this Pipeline -- later resolved by vk_attach_slot()
+    // (used by Pipeline::create_framebuffer()).
+    void vk_attach(int start_slot, const std::vector<vk_NamedAttachment>& named_attachments);
+    // Resolves `name` (declared via attach()) to its fragment shader output
+    // location. Throws std::runtime_error if unknown.
+    [[nodiscard]] int vk_attach_slot(const std::string& name) const;
     // Declares this pipeline's depth/stencil attachment (at most one).
     // `format` must satisfy is_depth_format(). Requires
     // Device::vk_extended_dynamic_state_supported() (depth test/write/
@@ -1629,8 +1640,10 @@ private:
 
     std::vector<StageInfo> stages_;
     std::vector<vk_DescriptorBinding> bindings_;
+    std::unordered_map<std::string, int> binding_names_; // name -> index into bindings_
     std::vector<VertexBinding> vertex_bindings_;
     std::vector<vk_AttachmentDesc> attachments_;
+    std::unordered_map<std::string, int> attach_names_; // name -> slot
     std::optional<Format> depth_attachment_format_;
 
     // Ray tracing pipelines only: one vk_ShaderGroup per append_raygen_group/
@@ -1689,11 +1702,12 @@ public:
         return ShaderHandle(pipeline_->vk_stage(type, source));
     }
 
-    // Declares one binding of the descriptor set layout for `set`. Returns
-    // an opaque handle to later reference this binding from
+    // Declares one binding per entry of `named_bindings`, at consecutive
+    // binding indices starting at `start_binding` within `set`, in the
+    // order given -- each later referenced by name from
     // DescriptorSet::bind(). Must be called before close().
-    LayoutHandle layout(int set, int binding, DescriptorType description, int count = 1) {
-        return LayoutHandle(pipeline_->vk_layout(set, binding, description, count));
+    void layout(int set, int start_binding, const std::vector<vk_NamedBinding>& named_bindings) {
+        pipeline_->vk_layout(set, start_binding, named_bindings);
     }
 
     // Declares the per-vertex input consumed by the vertex shader, as one
@@ -1703,12 +1717,14 @@ public:
     // called before close().
     void vertex_layout(int start_location, const Layout& layout) { pipeline_->vk_vertex_layout(start_location, layout); }
 
-    // Declares one color attachment of this pipeline's render pass, at
-    // `slot` (the fragment shader output location) with `format`. Returns
-    // an opaque handle used to bind a render target Image via
-    // create_framebuffer(). Graphics pipelines only. Must be called before
-    // close().
-    AttachHandle attach(int slot, Format format) { return AttachHandle(pipeline_->vk_attach(slot, format)); }
+    // Declares one color attachment of this pipeline's render pass per
+    // entry of `named_attachments`, at consecutive fragment shader output
+    // locations starting at `start_slot`, in the order given -- each later
+    // referenced by name from create_framebuffer(). Graphics pipelines
+    // only. Must be called before close().
+    void attach(int start_slot, const std::vector<vk_NamedAttachment>& named_attachments) {
+        pipeline_->vk_attach(start_slot, named_attachments);
+    }
 
     // Declares this pipeline's depth (or depth/stencil) attachment, enabling
     // CommandBuffer::set_depth_test() and depth-buffer-aware rendering.
@@ -1757,13 +1773,13 @@ public:
     void close() { pipeline_->vk_close(); }
 
     // Creates a framebuffer compatible with this (closed) pipeline's render
-    // pass. `attachments` must provide exactly one image per slot declared
-    // via attach(), matching format and dimensions. `depth_image` must be
-    // provided (matching attach_depth()'s format and attachments' dimensions)
-    // if and only if attach_depth() was called on this pipeline. Graphics
-    // pipelines only.
+    // pass. `named_attachments` must provide exactly one image per name
+    // declared via attach(), matching format and dimensions. `depth_image`
+    // must be provided (matching attach_depth()'s format and attachments'
+    // dimensions) if and only if attach_depth() was called on this
+    // pipeline. Graphics pipelines only.
     [[nodiscard]] std::shared_ptr<Framebuffer> create_framebuffer(
-        std::vector<std::pair<AttachHandle, std::shared_ptr<Image>>> attachments,
+        const std::vector<std::pair<std::string, std::shared_ptr<Image>>>& named_attachments,
         std::shared_ptr<Image> depth_image = nullptr);
 
     // Allocates a new descriptor set matching the layout declared for `set`
@@ -2452,14 +2468,14 @@ public:
     vk_DescriptorSet& operator=(vk_DescriptorSet&& other) noexcept = delete;
     ~vk_DescriptorSet() noexcept = default;
 
-    void vk_bind_buffer(LayoutHandle layout_id, const std::shared_ptr<Buffer>& buffer);
-    void vk_bind_image(LayoutHandle layout_id, const std::shared_ptr<Image>& image);
+    void vk_bind_buffer(const std::string& name, const std::shared_ptr<Buffer>& buffer);
+    void vk_bind_image(const std::string& name, const std::shared_ptr<Image>& image);
     // Binding's declared type must be SAMPLER.
-    void vk_bind_sampler(LayoutHandle layout_id, const std::shared_ptr<Sampler>& sampler);
+    void vk_bind_sampler(const std::string& name, const std::shared_ptr<Sampler>& sampler);
     // Binding's declared type must be COMBINED_IMAGE_SAMPLER.
-    void vk_bind_combined(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler);
+    void vk_bind_combined(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler);
     // Binding's declared type must be ACCELERATION_STRUCTURE.
-    void vk_bind_ads(LayoutHandle layout_id, const std::shared_ptr<AccelerationStructure>& ads);
+    void vk_bind_ads(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads);
     // Underlying vk::DescriptorSet. Used internally by
     // CommandBuffer::set_pipeline, not exposed to Python.
     [[nodiscard]] vk::DescriptorSet vk_handle() const noexcept { return descriptor_set_; }
@@ -2486,29 +2502,30 @@ public:
     DescriptorSet& operator=(DescriptorSet&& other) noexcept = delete;
     ~DescriptorSet() noexcept = default;
 
-    // Writes `buffer` into the binding identified by `layout_id`. The
-    // binding's declared type must be STORAGE_BUFFER or UNIFORM_BUFFER.
-    void bind(LayoutHandle layout_id, const std::shared_ptr<Buffer>& buffer) { descriptor_set_->vk_bind_buffer(layout_id, buffer); }
-    // Writes `image` into the binding identified by `layout_id`. The
-    // binding's declared type must be STORAGE_IMAGE (read/write, no
-    // sampler) or SAMPLED_IMAGE (read-only, sampled in the shader via a
-    // separately-bound SAMPLER at another binding -- see the other
-    // overload for a single combined binding instead).
-    void bind(LayoutHandle layout_id, const std::shared_ptr<Image>& image) { descriptor_set_->vk_bind_image(layout_id, image); }
-    // Writes `sampler` into the binding identified by `layout_id`. The
+    // Writes `buffer` into the binding declared under `name` (via
+    // Pipeline::layout()). The binding's declared type must be
+    // STORAGE_BUFFER or UNIFORM_BUFFER.
+    void bind(const std::string& name, const std::shared_ptr<Buffer>& buffer) { descriptor_set_->vk_bind_buffer(name, buffer); }
+    // Writes `image` into the binding declared under `name`. The binding's
+    // declared type must be STORAGE_IMAGE (read/write, no sampler) or
+    // SAMPLED_IMAGE (read-only, sampled in the shader via a separately-
+    // bound SAMPLER at another binding -- see the other overload for a
+    // single combined binding instead).
+    void bind(const std::string& name, const std::shared_ptr<Image>& image) { descriptor_set_->vk_bind_image(name, image); }
+    // Writes `sampler` into the binding declared under `name`. The
     // binding's declared type must be SAMPLER (paired with a separate
     // SAMPLED_IMAGE binding, e.g. GLSL `texture2D tex; sampler s;`).
-    void bind(LayoutHandle layout_id, const std::shared_ptr<Sampler>& sampler) { descriptor_set_->vk_bind_sampler(layout_id, sampler); }
-    // Writes `image`+`sampler` together into the binding identified by
-    // `layout_id`. The binding's declared type must be
-    // COMBINED_IMAGE_SAMPLER (GLSL `sampler2D`).
-    void bind(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
-        descriptor_set_->vk_bind_combined(layout_id, image, sampler);
+    void bind(const std::string& name, const std::shared_ptr<Sampler>& sampler) { descriptor_set_->vk_bind_sampler(name, sampler); }
+    // Writes `image`+`sampler` together into the binding declared under
+    // `name`. The binding's declared type must be COMBINED_IMAGE_SAMPLER
+    // (GLSL `sampler2D`).
+    void bind(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
+        descriptor_set_->vk_bind_combined(name, image, sampler);
     }
-    // Writes `ads` into the binding identified by `layout_id`. The
-    // binding's declared type must be ACCELERATION_STRUCTURE.
-    void bind(LayoutHandle layout_id, const std::shared_ptr<AccelerationStructure>& ads) {
-        descriptor_set_->vk_bind_ads(layout_id, ads);
+    // Writes `ads` into the binding declared under `name`. The binding's
+    // declared type must be ACCELERATION_STRUCTURE.
+    void bind(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads) {
+        descriptor_set_->vk_bind_ads(name, ads);
     }
 
     // Underlying vk_DescriptorSet. Used internally by

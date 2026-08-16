@@ -3200,11 +3200,22 @@ void vk_Pipeline::vk_stack_size(int depth) {
     max_ray_recursion_depth_ = static_cast<std::uint32_t>(depth);
 }
 
-int vk_Pipeline::vk_layout(int set, int binding, DescriptorType description, int count) {
+void vk_Pipeline::vk_layout(int set, int start_binding, const std::vector<vk_NamedBinding>& named_bindings) {
     if (closed_) throw std::runtime_error("Pipeline::layout: pipeline is already closed");
-    if (set < 0 || binding < 0 || count <= 0) throw std::runtime_error("Pipeline::layout: invalid set/binding/count");
-    bindings_.push_back({ set, binding, description, count });
-    return static_cast<int>(bindings_.size()) - 1;
+    if (set < 0 || start_binding < 0) throw std::runtime_error("Pipeline::layout: invalid set/start_binding");
+    for (std::size_t i = 0; i < named_bindings.size(); ++i) {
+        const auto& named = named_bindings[i];
+        if (named.count <= 0) throw std::runtime_error("Pipeline::layout: invalid count for '" + named.name + "'");
+        if (binding_names_.count(named.name)) throw std::runtime_error("Pipeline::layout: name '" + named.name + "' already declared");
+        bindings_.push_back({ set, start_binding + static_cast<int>(i), named.type, named.count });
+        binding_names_[named.name] = static_cast<int>(bindings_.size()) - 1;
+    }
+}
+
+int vk_Pipeline::vk_binding_index(const std::string& name) const {
+    auto it = binding_names_.find(name);
+    if (it == binding_names_.end()) throw std::runtime_error("Pipeline::layout: no binding named '" + name + "'");
+    return it->second;
 }
 
 void vk_Pipeline::vk_vertex_layout(int start_location, const Layout& layout) {
@@ -3237,14 +3248,26 @@ void vk_Pipeline::vk_vertex_layout(int start_location, const Layout& layout) {
     vertex_bindings_.push_back(std::move(binding));
 }
 
-int vk_Pipeline::vk_attach(int slot, Format format) {
+void vk_Pipeline::vk_attach(int start_slot, const std::vector<vk_NamedAttachment>& named_attachments) {
     if (closed_) throw std::runtime_error("Pipeline::attach: pipeline is already closed");
     if (type_ != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::attach: only valid for RASTERIZATION pipelines");
-    for (const auto& attachment : attachments_) {
-        if (attachment.slot == slot) throw std::runtime_error("Pipeline::attach: slot already attached");
+    if (start_slot < 0) throw std::runtime_error("Pipeline::attach: invalid start_slot");
+    for (std::size_t i = 0; i < named_attachments.size(); ++i) {
+        const auto& named = named_attachments[i];
+        const int slot = start_slot + static_cast<int>(i);
+        if (attach_names_.count(named.name)) throw std::runtime_error("Pipeline::attach: name '" + named.name + "' already declared");
+        for (const auto& attachment : attachments_) {
+            if (attachment.slot == slot) throw std::runtime_error("Pipeline::attach: slot already attached");
+        }
+        attachments_.push_back({ slot, named.format });
+        attach_names_[named.name] = slot;
     }
-    attachments_.push_back({ slot, format });
-    return slot;
+}
+
+int vk_Pipeline::vk_attach_slot(const std::string& name) const {
+    auto it = attach_names_.find(name);
+    if (it == attach_names_.end()) throw std::runtime_error("Pipeline::attach: no attachment named '" + name + "'");
+    return it->second;
 }
 
 void vk_Pipeline::vk_attach_depth(Format format) {
@@ -3635,7 +3658,7 @@ const vk_DescriptorBinding& vk_Pipeline::vk_binding(int layout_id) const {
 }
 
 std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(
-    std::vector<std::pair<AttachHandle, std::shared_ptr<Image>>> attachments, std::shared_ptr<Image> depth_image) {
+    const std::vector<std::pair<std::string, std::shared_ptr<Image>>>& named_attachments, std::shared_ptr<Image> depth_image) {
     if (!pipeline_->is_closed()) throw std::runtime_error("Pipeline::create_framebuffer: pipeline must be closed first");
     if (pipeline_->type() != PipelineType::RASTERIZATION) throw std::runtime_error("Pipeline::create_framebuffer: only valid for RASTERIZATION pipelines");
     if (pipeline_->vk_has_depth_attachment() != (depth_image != nullptr)) {
@@ -3651,10 +3674,11 @@ std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(
     std::vector<bool> filled(attachment_descs.size(), false);
     std::uint32_t width = 0, height = 0;
 
-    for (auto& [slot, image] : attachments) {
+    for (auto& [name, image] : named_attachments) {
+        const int slot = pipeline_->vk_attach_slot(name);
         int index = -1;
         for (std::size_t i = 0; i < attachment_descs.size(); ++i) {
-            if (attachment_descs[i].slot == slot.vk_slot()) { index = static_cast<int>(i); break; }
+            if (attachment_descs[i].slot == slot) { index = static_cast<int>(i); break; }
         }
         if (index < 0) throw std::runtime_error("Pipeline::create_framebuffer: no attachment declared for this slot");
         if (image->format() != attachment_descs[static_cast<std::size_t>(index)].format) {
@@ -4675,9 +4699,9 @@ std::uint32_t vk_DescriptorSet::device_index() const {
     return device->device_index();
 }
 
-void vk_DescriptorSet::vk_bind_buffer(LayoutHandle layout_id, const std::shared_ptr<Buffer>& buffer) {
-    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
-    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+void vk_DescriptorSet::vk_bind_buffer(const std::string& name, const std::shared_ptr<Buffer>& buffer) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::STORAGE_BUFFER && binding.type != DescriptorType::UNIFORM_BUFFER) {
         throw std::runtime_error("DescriptorSet::bind: this binding does not expect a buffer");
     }
@@ -4699,13 +4723,13 @@ void vk_DescriptorSet::vk_bind_buffer(LayoutHandle layout_id, const std::shared_
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_image(LayoutHandle layout_id, const std::shared_ptr<Image>& image) {
-    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
-    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+void vk_DescriptorSet::vk_bind_image(const std::string& name, const std::shared_ptr<Image>& image) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::STORAGE_IMAGE && binding.type != DescriptorType::SAMPLED_IMAGE) {
         throw std::runtime_error(
-            "DescriptorSet::bind: this binding's declared type requires a sampler; "
-            "call bind(layout_id, sampler) for a SAMPLER binding, or bind(layout_id, image, sampler) for COMBINED_IMAGE_SAMPLER");
+            "DescriptorSet::bind: '" + name + "' declared type requires a sampler; "
+            "call bind(" + name + "=sampler) for a SAMPLER binding, or bind(" + name + "=(image, sampler)) for COMBINED_IMAGE_SAMPLER");
     }
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
@@ -4728,11 +4752,11 @@ void vk_DescriptorSet::vk_bind_image(LayoutHandle layout_id, const std::shared_p
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_sampler(LayoutHandle layout_id, const std::shared_ptr<Sampler>& sampler) {
-    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
-    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+void vk_DescriptorSet::vk_bind_sampler(const std::string& name, const std::shared_ptr<Sampler>& sampler) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::SAMPLER) {
-        throw std::runtime_error("DescriptorSet::bind: this binding does not expect a standalone sampler");
+        throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not expect a standalone sampler");
     }
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
@@ -4750,11 +4774,11 @@ void vk_DescriptorSet::vk_bind_sampler(LayoutHandle layout_id, const std::shared
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_combined(LayoutHandle layout_id, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
-    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
-    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+void vk_DescriptorSet::vk_bind_combined(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::COMBINED_IMAGE_SAMPLER) {
-        throw std::runtime_error("DescriptorSet::bind: this binding is not a COMBINED_IMAGE_SAMPLER");
+        throw std::runtime_error("DescriptorSet::bind: '" + name + "' is not a COMBINED_IMAGE_SAMPLER");
     }
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
@@ -4774,11 +4798,11 @@ void vk_DescriptorSet::vk_bind_combined(LayoutHandle layout_id, const std::share
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_ads(LayoutHandle layout_id, const std::shared_ptr<AccelerationStructure>& ads) {
-    const auto& binding = pipeline_->vk_binding(layout_id.vk_id());
-    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: layout_id does not belong to this descriptor set");
+void vk_DescriptorSet::vk_bind_ads(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::ACCELERATION_STRUCTURE) {
-        throw std::runtime_error("DescriptorSet::bind: this binding is not an ACCELERATION_STRUCTURE");
+        throw std::runtime_error("DescriptorSet::bind: '" + name + "' is not an ACCELERATION_STRUCTURE");
     }
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");

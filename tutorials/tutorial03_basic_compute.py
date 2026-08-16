@@ -104,8 +104,7 @@ ubo.write(
 
 pipeline = vk.pipeline(vk.PipelineType.COMPUTE)
 pipeline.local_size(32, 32)
-img_slot = pipeline.layout(0, 0, vk.DescriptorType.STORAGE_IMAGE)
-ubo_slot = pipeline.layout(0, 1, vk.DescriptorType.UNIFORM_BUFFER)
+pipeline.layout(0, 0, img=vk.DescriptorType.STORAGE_IMAGE, ubo=vk.DescriptorType.UNIFORM_BUFFER)
 pipeline.stage(vk.ShaderStageType.COMPUTE, vk.shader_from_glsl(compute_code, vk.ShaderStageType.COMPUTE))
 pipeline.close()
 
@@ -121,8 +120,7 @@ pipeline.close()
 # %%
 
 bindings = pipeline.descriptor_set(set=0)
-bindings.bind(ubo_slot, ubo)
-bindings.bind(img_slot, render_target)
+bindings.bind(ubo=ubo, img=render_target)
 
 with vk.compute() as cmd:
     cmd.set_pipeline(pipeline)

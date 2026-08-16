@@ -746,46 +746,38 @@ PYBIND11_MODULE(vk, m) {
 		.def("combobox", &Window::combobox, py::arg("label"), py::arg("items"), py::arg("state"));
 
 	// Opaque handles: not constructible from Python (no .def(py::init<...>())),
-	// only obtainable from Pipeline::layout()/attach() and handed back to
-	// DescriptorSet::bind()/Pipeline::create_framebuffer().
-	py::class_<LayoutHandle>(m, "LayoutHandle");
-	py::class_<AttachHandle>(m, "AttachHandle");
-	// Likewise, only obtainable from Pipeline::stage() (a ray tracing stage)
-	// and Pipeline::append_raygen_group()/append_miss_group()/append_hit_group().
+	// only obtainable from Pipeline::stage() (a ray tracing stage) and
+	// Pipeline::append_raygen_group()/append_miss_group()/append_hit_group().
+	// Descriptor bindings/attachments/framebuffer images are instead
+	// referenced by the name given to Pipeline::layout()/attach() -- see
+	// DescriptorSet::bind() and Pipeline::create_framebuffer() below.
 	py::class_<ShaderHandle>(m, "ShaderHandle");
 	py::class_<ShaderGroupHandle>(m, "ShaderGroupHandle");
 
 	py::class_<DescriptorSet, std::shared_ptr<DescriptorSet>>(m, "DescriptorSet")
 		.def(
 			"bind",
-			py::overload_cast<LayoutHandle, const std::shared_ptr<Buffer>&>(&DescriptorSet::bind),
-			py::arg("layout_id"),
-			py::arg("buffer")
-		)
-		.def(
-			"bind",
-			py::overload_cast<LayoutHandle, const std::shared_ptr<Image>&>(&DescriptorSet::bind),
-			py::arg("layout_id"),
-			py::arg("image")
-		)
-		.def(
-			"bind",
-			py::overload_cast<LayoutHandle, const std::shared_ptr<Sampler>&>(&DescriptorSet::bind),
-			py::arg("layout_id"),
-			py::arg("sampler")
-		)
-		.def(
-			"bind",
-			py::overload_cast<LayoutHandle, const std::shared_ptr<Image>&, const std::shared_ptr<Sampler>&>(&DescriptorSet::bind),
-			py::arg("layout_id"),
-			py::arg("image"),
-			py::arg("sampler")
-		)
-		.def(
-			"bind",
-			py::overload_cast<LayoutHandle, const std::shared_ptr<AccelerationStructure>&>(&DescriptorSet::bind),
-			py::arg("layout_id"),
-			py::arg("ads")
+			[](DescriptorSet& self, py::kwargs kwargs) {
+				for (auto item : kwargs) {
+					const std::string name = item.first.cast<std::string>();
+					py::handle value = item.second;
+					if (py::isinstance<py::tuple>(value)) {
+						py::tuple pair = py::reinterpret_borrow<py::tuple>(value);
+						if (pair.size() != 2) throw std::runtime_error("DescriptorSet::bind: '" + name + "' tuple value must be (image, sampler)");
+						self.bind(name, pair[0].cast<std::shared_ptr<Image>>(), pair[1].cast<std::shared_ptr<Sampler>>());
+					} else if (py::isinstance<Buffer>(value)) {
+						self.bind(name, value.cast<std::shared_ptr<Buffer>>());
+					} else if (py::isinstance<Image>(value)) {
+						self.bind(name, value.cast<std::shared_ptr<Image>>());
+					} else if (py::isinstance<Sampler>(value)) {
+						self.bind(name, value.cast<std::shared_ptr<Sampler>>());
+					} else if (py::isinstance<AccelerationStructure>(value)) {
+						self.bind(name, value.cast<std::shared_ptr<AccelerationStructure>>());
+					} else {
+						throw std::runtime_error("DescriptorSet::bind: unsupported resource type for '" + name + "'");
+					}
+				}
+			}
 		)
 		.def_property_readonly("device_index", &DescriptorSet::device_index);
 
@@ -793,14 +785,38 @@ PYBIND11_MODULE(vk, m) {
 		.def("stage", &Pipeline::stage, py::arg("type"), py::arg("source"))
 		.def(
 			"layout",
-			&Pipeline::layout,
+			[](Pipeline& self, int set, int start_binding, py::kwargs kwargs) {
+				std::vector<vk_NamedBinding> named_bindings;
+				named_bindings.reserve(kwargs.size());
+				for (auto item : kwargs) {
+					std::string name = item.first.cast<std::string>();
+					py::handle value = item.second;
+					if (py::isinstance<py::tuple>(value)) {
+						py::tuple pair = py::reinterpret_borrow<py::tuple>(value);
+						if (pair.size() != 2) throw std::runtime_error("Pipeline::layout: '" + name + "' tuple value must be (DescriptorType, count)");
+						named_bindings.push_back({ std::move(name), pair[0].cast<DescriptorType>(), pair[1].cast<int>() });
+					} else {
+						named_bindings.push_back({ std::move(name), value.cast<DescriptorType>(), 1 });
+					}
+				}
+				self.layout(set, start_binding, named_bindings);
+			},
 			py::arg("set"),
-			py::arg("binding"),
-			py::arg("description"),
-			py::arg("count") = 1
+			py::arg("start_binding")
 		)
 		.def("vertex_layout", &Pipeline::vertex_layout, py::arg("start_location"), py::arg("layout"))
-		.def("attach", &Pipeline::attach, py::arg("slot"), py::arg("format"))
+		.def(
+			"attach",
+			[](Pipeline& self, int start_slot, py::kwargs kwargs) {
+				std::vector<vk_NamedAttachment> named_attachments;
+				named_attachments.reserve(kwargs.size());
+				for (auto item : kwargs) {
+					named_attachments.push_back({ item.first.cast<std::string>(), item.second.cast<Format>() });
+				}
+				self.attach(start_slot, named_attachments);
+			},
+			py::arg("start_slot")
+		)
 		.def("attach_depth", &Pipeline::attach_depth, py::arg("format"))
 		.def("local_size", &Pipeline::local_size, py::arg("x"), py::arg("y") = 1, py::arg("z") = 1)
 		.def(
@@ -823,8 +839,14 @@ PYBIND11_MODULE(vk, m) {
 		.def("close", &Pipeline::close)
 		.def(
 			"create_framebuffer",
-			&Pipeline::create_framebuffer,
-			py::arg("attachments"),
+			[](Pipeline& self, std::shared_ptr<Image> depth_image, py::kwargs kwargs) {
+				std::vector<std::pair<std::string, std::shared_ptr<Image>>> named_attachments;
+				named_attachments.reserve(kwargs.size());
+				for (auto item : kwargs) {
+					named_attachments.emplace_back(item.first.cast<std::string>(), item.second.cast<std::shared_ptr<Image>>());
+				}
+				return self.create_framebuffer(named_attachments, depth_image);
+			},
 			py::arg("depth_image") = nullptr,
 			py::return_value_policy::move
 		)

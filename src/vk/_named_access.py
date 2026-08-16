@@ -1,12 +1,5 @@
-"""Two Python-only conveniences layered on top of the raw pybind11 classes
+"""A Python-only convenience layered on top of the raw pybind11 classes
 (no changes to the C++ bindings):
-
-- Named descriptor/attachment bindings: :meth:`Pipeline.layout`/
-  :meth:`Pipeline.attach` accept a single ``name=DescriptorType``/
-  ``name=Format`` keyword instead of a positional type, remembering that
-  name; :meth:`DescriptorSet.bind` and :meth:`Pipeline.create_framebuffer`
-  then accept ``name=resource`` keywords instead of the raw opaque handle,
-  resolved back to the matching handle.
 
 - Name-path Buffer field access: :meth:`Buffer.write`/:meth:`Buffer.read`
   accept a dotted string path (e.g. ``"lights.0.P"``) instead of a
@@ -19,106 +12,7 @@
   way to poke arbitrary bytes into a mapped buffer from pure Python).
 """
 
-import weakref
-
-from .vk import Buffer, DescriptorSet, Pipeline, Type, TypeKind
-
-# ---------------------------------------------------------------------------
-# Named descriptor/attachment bindings.
-# ---------------------------------------------------------------------------
-
-_layout_names = weakref.WeakKeyDictionary()  # Pipeline -> {name: LayoutHandle}
-_attach_names = weakref.WeakKeyDictionary()  # Pipeline -> {name: AttachHandle}
-_descriptor_set_names = weakref.WeakKeyDictionary()  # DescriptorSet -> {name: LayoutHandle}
-
-_orig_pipeline_layout = Pipeline.layout
-_orig_pipeline_attach = Pipeline.attach
-_orig_descriptor_set = Pipeline.descriptor_set
-_orig_descriptor_set_collection = Pipeline.descriptor_set_collection
-_orig_create_framebuffer = Pipeline.create_framebuffer
-_orig_descriptor_set_bind = DescriptorSet.bind
-
-
-def _one_name_kwarg(kwargs, positional, what):
-    if not kwargs:
-        return None, positional
-    if positional is not None or len(kwargs) != 1:
-        raise TypeError(f"{what}() takes either a positional value or a single name=... keyword")
-    name, value = next(iter(kwargs.items()))
-    return name, value
-
-
-def _layout(self, set, binding, description=None, count=1, **kwargs):
-    name, description = _one_name_kwarg(kwargs, description, "layout")
-    handle = _orig_pipeline_layout(self, set, binding, description, count)
-    if name is not None:
-        _layout_names.setdefault(self, {})[name] = handle
-    return handle
-
-
-def _attach(self, slot, format=None, **kwargs):
-    name, format = _one_name_kwarg(kwargs, format, "attach")
-    handle = _orig_pipeline_attach(self, slot, format)
-    if name is not None:
-        _attach_names.setdefault(self, {})[name] = handle
-    return handle
-
-
-def _descriptor_set(self, set=0):
-    ds = _orig_descriptor_set(self, set)
-    names = _layout_names.get(self)
-    if names:
-        _descriptor_set_names[ds] = names
-    return ds
-
-
-def _descriptor_set_collection(self, set=0, count=1):
-    collection = _orig_descriptor_set_collection(self, set, count)
-    names = _layout_names.get(self)
-    if names:
-        for ds in collection:
-            _descriptor_set_names[ds] = names
-    return collection
-
-
-def _create_framebuffer(self, attachments=None, depth_image=None, **kwargs):
-    if kwargs:
-        if attachments is not None:
-            raise TypeError("create_framebuffer() takes either an attachments list or name=image keywords, not both")
-        names = _attach_names.get(self, {})
-        attachments = []
-        for name, image in kwargs.items():
-            if name not in names:
-                raise KeyError(f"No attachment named {name!r} on this pipeline")
-            attachments.append((names[name], image))
-    return _orig_create_framebuffer(self, attachments or [], depth_image)
-
-
-def _descriptor_set_bind(self, layout_id=None, *args, **kwargs):
-    if layout_id is not None:
-        return _orig_descriptor_set_bind(self, layout_id, *args)
-    names = _descriptor_set_names.get(self, {})
-    for name, resource in kwargs.items():
-        if name not in names:
-            raise KeyError(f"No layout binding named {name!r} on this pipeline")
-        handle = names[name]
-        if isinstance(resource, tuple):
-            _orig_descriptor_set_bind(self, handle, *resource)
-        else:
-            _orig_descriptor_set_bind(self, handle, resource)
-
-
-Pipeline.layout = _layout
-Pipeline.attach = _attach
-Pipeline.descriptor_set = _descriptor_set
-Pipeline.descriptor_set_collection = _descriptor_set_collection
-Pipeline.create_framebuffer = _create_framebuffer
-DescriptorSet.bind = _descriptor_set_bind
-
-
-# ---------------------------------------------------------------------------
-# Name-path Buffer field access.
-# ---------------------------------------------------------------------------
+from .vk import Buffer, Type, TypeKind
 
 _orig_buffer_write = Buffer.write
 _orig_buffer_read = Buffer.read

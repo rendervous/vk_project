@@ -25,7 +25,7 @@ del _ensure_vulkan_driver
 
 from . import math3d
 from . import _interop  # noqa: F401  (side effect only: adds Buffer/Tensor.torch()/.numpy()/.jax()/...)
-from . import _named_access  # noqa: F401  (side effect only: name=... bindings, and Buffer.write/read("a.b.0") paths)
+from . import _named_access  # noqa: F401  (side effect only: adds Buffer.write/read("a.b.0") paths)
 
 from .math3d import (
     mat4,
@@ -72,7 +72,6 @@ from .vk import (
     ADSAABB,
     ADSInstances,
     ADSTriangles,
-    AttachHandle,
     Buffer,
     BoolState,
     CommandBuffer,
@@ -84,7 +83,6 @@ from .vk import (
     IntState,
     Layout,
     LayoutField,
-    LayoutHandle,
     Layouts,
     Material,
     Mesh,
@@ -177,7 +175,6 @@ __all__ = [
     "ADSAABB",
     "ADSInstances",
     "ADSTriangles",
-    "AttachHandle",
     "Buffer",
     "BoolState",
     "CommandBuffer",
@@ -189,7 +186,6 @@ __all__ = [
     "IntState",
     "Layout",
     "LayoutField",
-    "LayoutHandle",
     "Layouts",
     "Material",
     "Mesh",

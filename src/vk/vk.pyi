@@ -464,25 +464,6 @@ class CompareOp(enum.Enum):
     ALWAYS = 7
 
 
-class LayoutHandle:
-    """Opaque handle returned by :meth:`Pipeline.layout`, identifying one
-    declared descriptor set binding.
-
-    Not constructible from Python: only meaningful when passed back to
-    :meth:`DescriptorSet.bind` on a descriptor set from the same
-    :class:`Pipeline`.
-    """
-
-
-class AttachHandle:
-    """Opaque handle returned by :meth:`Pipeline.attach`, identifying one
-    declared color attachment slot.
-
-    Not constructible from Python: only meaningful when passed back to
-    :meth:`Pipeline.create_framebuffer` on the same :class:`Pipeline`.
-    """
-
-
 class ShaderHandle:
     """Opaque handle returned by :meth:`Pipeline.stage` for a ray tracing
     stage (``RAYGEN``/``MISS``/``CLOSEST_HIT``/``ANY_HIT``), identifying
@@ -2447,77 +2428,31 @@ class DescriptorSet:
     a given ``set`` index, obtained from :meth:`Pipeline.descriptor_set`.
     """
 
-    @overload
-    def bind(self, layout_id: LayoutHandle, resource: Buffer) -> None:
-        """Writes `resource` into the binding identified by ``layout_id``.
-
-        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
-        :param resource: A :class:`Buffer`, for a binding declared with
-            :attr:`DescriptorType.STORAGE_BUFFER` or
-            :attr:`DescriptorType.UNIFORM_BUFFER`.
-        """
-        ...
-
-    @overload
-    def bind(self, layout_id: LayoutHandle, resource: "Image") -> None:
-        """Writes `resource` into the binding identified by ``layout_id``.
-
-        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
-        :param resource: An :class:`Image`, for a binding declared with
-            :attr:`DescriptorType.STORAGE_IMAGE` (read/write, no sampler)
-            or :attr:`DescriptorType.SAMPLED_IMAGE` (read-only, sampled in
-            the shader via a separately-bound :class:`Sampler` at another
-            binding -- see the ``(image, sampler)`` overload for a single
-            combined binding instead).
-        """
-        ...
-
-    @overload
-    def bind(self, layout_id: LayoutHandle, resource: "Sampler") -> None:
-        """Writes `resource` into the binding identified by ``layout_id``.
-
-        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
-        :param resource: A :class:`Sampler`, for a binding declared with
-            :attr:`DescriptorType.SAMPLER` (paired with a separate
-            :attr:`DescriptorType.SAMPLED_IMAGE` binding, e.g. GLSL
-            ``texture2D tex; sampler s;``).
-        """
-        ...
-
-    @overload
-    def bind(self, layout_id: LayoutHandle, image: "Image", sampler: "Sampler") -> None:
-        """Writes `image`+`sampler` together into the binding identified by
-        ``layout_id``.
-
-        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
-        :param image: Image to sample.
-        :param sampler: Sampler describing how to sample it. The binding's
-            declared type must be :attr:`DescriptorType.COMBINED_IMAGE_SAMPLER`
-            (GLSL ``sampler2D``).
-        """
-        ...
-
-    @overload
-    def bind(self, layout_id: LayoutHandle, resource: "AccelerationStructure") -> None:
-        """Writes `resource` into the binding identified by ``layout_id``.
-
-        :param layout_id: Handle returned by the matching :meth:`Pipeline.layout` call.
-        :param resource: An :class:`AccelerationStructure` (typically a
-            TLAS, from :func:`ads`/:func:`ads_instances`), for a binding
-            declared with :attr:`DescriptorType.ACCELERATION_STRUCTURE`.
-        """
-        ...
-
-    @overload
     def bind(self, **bindings: object) -> None:
-        """Binds one or more resources by the ``name`` given to the
-        matching :meth:`Pipeline.layout` call(s) instead of its
-        ``LayoutHandle`` -- e.g. ``ds.bind(img=render_target, ubo=ubo)``.
-        A ``(image, sampler)`` tuple value binds a combined image/sampler.
-        Only works for a descriptor set whose originating
-        :class:`Pipeline` used ``name=...`` at :meth:`Pipeline.layout`.
+        """Writes one or more resources into the bindings declared by the
+        matching :meth:`Pipeline.layout` call(s), by name.
 
-        :raises KeyError: If a keyword doesn't match any named binding.
+        Each keyword's name must match a name given to :meth:`Pipeline.layout`
+        on the originating :class:`Pipeline`; its value depends on that
+        binding's declared :class:`DescriptorType`:
+
+        - :attr:`DescriptorType.STORAGE_BUFFER`/:attr:`DescriptorType.UNIFORM_BUFFER`:
+          a :class:`Buffer`.
+        - :attr:`DescriptorType.STORAGE_IMAGE`/:attr:`DescriptorType.SAMPLED_IMAGE`:
+          an :class:`Image` (read-only sampling still needs a separately-bound
+          :attr:`DescriptorType.SAMPLER`, unless the binding is
+          ``COMBINED_IMAGE_SAMPLER`` -- see below).
+        - :attr:`DescriptorType.SAMPLER`: a :class:`Sampler`.
+        - :attr:`DescriptorType.COMBINED_IMAGE_SAMPLER`: an
+          ``(image, sampler)`` tuple (GLSL ``sampler2D``).
+        - :attr:`DescriptorType.ACCELERATION_STRUCTURE`: an
+          :class:`AccelerationStructure` (typically a TLAS, from
+          :func:`ads`/:func:`ads_instances`).
+
+        e.g. ``ds.bind(transform=ubo, albedo=(texture, sampler))``.
+
+        :raises KeyError: If a keyword doesn't match any binding declared on
+            the originating :class:`Pipeline`.
         """
         ...
 
@@ -2551,22 +2486,22 @@ class Pipeline:
         """
         ...
 
-    def layout(self, set: int, binding: int, description: DescriptorType, count: int = 1) -> LayoutHandle:
-        """Declares one binding of the descriptor set layout for ``set``.
+    def layout(self, set: int, start_binding: int, **bindings: "DescriptorType | tuple[DescriptorType, int]") -> None:
+        """Declares one or more bindings of the descriptor set layout for
+        ``set``, at consecutive binding indices starting at
+        ``start_binding``, in the order given.
 
         Must be called before :meth:`close`.
 
         :param set: Descriptor set index.
-        :param binding: Binding index within ``set``.
-        :param description: Kind of resource this binding expects. May
-            instead be passed as a single ``name=description`` keyword
-            (e.g. ``pipeline.layout(0, 0, img=DescriptorType.STORAGE_IMAGE)``),
-            remembering ``name`` so the matching :class:`DescriptorSet`
-            can later be bound via :meth:`DescriptorSet.bind` ``(name=resource)``
-            instead of the returned handle.
-        :param count: Number of array elements at this binding.
-        :return: An opaque handle identifying this binding, for use with
-            :meth:`DescriptorSet.bind`.
+        :param start_binding: Binding index of the first keyword; each
+            subsequent keyword is declared at the next consecutive index.
+        :param bindings: One keyword per binding -- its name is later used
+            to reference this binding from :meth:`DescriptorSet.bind`. The
+            value is either a :class:`DescriptorType` (kind of resource this
+            binding expects, with ``count=1``), or a
+            ``(DescriptorType, count)`` tuple for an array of ``count``
+            elements. e.g. ``pipeline.layout(0, 0, transform=DescriptorType.UNIFORM_BUFFER)``.
         """
         ...
 
@@ -2586,19 +2521,21 @@ class Pipeline:
         """
         ...
 
-    def attach(self, slot: int, format: Format) -> AttachHandle:
-        """Declares one color attachment of this pipeline's render pass.
+    def attach(self, start_slot: int, **attachments: Format) -> None:
+        """Declares one or more color attachments of this pipeline's render
+        pass, at consecutive fragment shader output locations starting at
+        ``start_slot``, in the order given.
 
         Graphics pipelines only. Must be called before :meth:`close`.
 
-        :param slot: Fragment shader output location for this attachment.
-        :param format: Pixel format of this attachment. May instead be
-            passed as a single ``name=format`` keyword (e.g.
-            ``pipeline.attach(0, color=Format.RGBA32_Float)``), remembering
-            ``name`` so :meth:`create_framebuffer` can later be passed
-            ``name=image`` instead of the returned handle.
-        :return: An opaque handle used to bind a render target image via
-            :meth:`create_framebuffer`.
+        :param start_slot: Fragment shader output location of the first
+            keyword; each subsequent keyword is declared at the next
+            consecutive location.
+        :param attachments: One keyword per attachment -- its name is later
+            used to bind a render target image to it via
+            :meth:`create_framebuffer`. The value is the pixel
+            :class:`Format` of that attachment. e.g.
+            ``pipeline.attach(0, color=Format.RGBA32_Float)``.
         """
         ...
 
@@ -2679,23 +2616,18 @@ class Pipeline:
         """
         ...
 
-    def create_framebuffer(
-        self, attachments: "list[tuple[AttachHandle, Image]] | None" = None, depth_image: "Image | None" = None,
-        **named_attachments: "Image"
-    ) -> Framebuffer:
+    def create_framebuffer(self, depth_image: "Image | None" = None, **attachments: Image) -> Framebuffer:
         """Creates a framebuffer compatible with this pipeline's render pass.
 
         Pipeline must be closed first. Graphics pipelines only.
 
-        :param attachments: One ``(slot, image)`` pair per handle returned
-            by :meth:`attach`, each image matching that attachment's
-            declared format, and all sharing the same dimensions. Omit and
-            use ``name=image`` keywords instead (one per :meth:`attach`
-            call that used ``name=...``), e.g.
-            ``pipeline.create_framebuffer(color=render_target)``.
         :param depth_image: Required (and matching :meth:`attach_depth`'s
             format/dimensions) if and only if :meth:`attach_depth` was
             called on this pipeline.
+        :param attachments: One keyword per name declared via :meth:`attach`,
+            each image matching that attachment's declared format, and all
+            sharing the same dimensions. e.g.
+            ``pipeline.create_framebuffer(color=render_target)``.
         :return: A new :class:`Framebuffer`.
         """
         ...
@@ -2707,8 +2639,7 @@ class Pipeline:
         Pipeline must be closed first.
 
         :param set: Descriptor set index, as passed to :meth:`layout`.
-        :return: A new :class:`DescriptorSet`, whose :meth:`DescriptorSet.bind`
-            accepts this pipeline's ``name=...`` bindings, if any.
+        :return: A new :class:`DescriptorSet`.
         """
         ...
 
@@ -2722,9 +2653,7 @@ class Pipeline:
 
         :param set: Descriptor set index, as passed to :meth:`layout`.
         :param count: Number of independent descriptor sets to allocate.
-        :return: A list of ``count`` new :class:`DescriptorSet`, each whose
-            :meth:`DescriptorSet.bind` accepts this pipeline's ``name=...``
-            bindings, if any.
+        :return: A list of ``count`` new :class:`DescriptorSet`.
         """
         ...
 

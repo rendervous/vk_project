@@ -7,7 +7,7 @@ recording/submitting GPU commands through :class:`Engine`.
 """
 
 import enum
-from typing import overload
+from typing import Optional, overload
 
 
 class MemoryLocation(enum.Enum):
@@ -1400,6 +1400,11 @@ class WrappedMemory:
         after a shader wrote through it) as holding the freshest data,
         so the next :meth:`update_cpu` call will copy it back. No-op
         for a direct mapping.
+
+        :raises RuntimeError: If the wrapped object is a ``tuple``: it's
+            immutable, so a later :meth:`update_cpu` would have no way
+            to write GPU data back into it. Wrap a ``list`` instead if
+            round-tripping is needed.
         """
         ...
 
@@ -1654,6 +1659,7 @@ class CommandBuffer:
     an internal command pool.
     """
 
+    @overload
     def transfer(self, source: Buffer, destination: Buffer) -> None:
         """Records a device-side copy from one buffer to another.
 
@@ -1662,6 +1668,64 @@ class CommandBuffer:
 
         :param source: Buffer to copy from.
         :param destination: Buffer to copy into.
+        """
+        ...
+
+    @overload
+    def transfer(self, source: Image, destination: Buffer) -> None:
+        """Records a device-side copy of every mip level/array layer
+        ``source`` covers into ``destination`` (tightly packed, mip by
+        mip, no row/slice padding -- matching what
+        :func:`staging`/:meth:`Device.create_staging` allocates for an
+        image).
+
+        Must be called while the command buffer is still recording, i.e.
+        before :meth:`close`.
+
+        :param source: Image to copy from, assumed to be in
+            ``VK_IMAGE_LAYOUT_GENERAL`` (true of every :class:`Image`).
+        :param destination: Buffer to copy into; must be exactly
+            ``source``'s byte size.
+        :raises RuntimeError: If ``destination``'s size doesn't match
+            ``source``'s byte size.
+        """
+        ...
+
+    @overload
+    def transfer(self, source: Buffer, destination: Image) -> None:
+        """Symmetric to ``transfer(Image, Buffer)``: copies ``source``'s
+        bytes into every mip level/array layer ``destination`` covers, in
+        the same tightly-packed layout.
+
+        Must be called while the command buffer is still recording, i.e.
+        before :meth:`close`.
+
+        :param source: Buffer to copy from; must be exactly
+            ``destination``'s byte size.
+        :param destination: Image to copy into, assumed to be in
+            ``VK_IMAGE_LAYOUT_GENERAL`` (true of every :class:`Image`).
+        :raises RuntimeError: If ``source``'s size doesn't match
+            ``destination``'s byte size.
+        """
+        ...
+
+    @overload
+    def transfer(self, source: WrappedMemory, destination: Image) -> None:
+        """Same as ``transfer(Buffer, Image)`` above, using the
+        :class:`Buffer` `source` is backed by.
+
+        Must be called while the command buffer is still recording, i.e.
+        before :meth:`close`.
+
+        :param source: Wrap to copy from; must be backed by an actual
+            :class:`Buffer` (true of every :func:`wrap`/:meth:`Device.wrap`
+            source except a wrapped :class:`Tensor`, or a CUDA tensor
+            already reused zero-copy from one of our own buffers via
+            DLPack), and exactly ``destination``'s byte size.
+        :param destination: Image to copy into, assumed to be in
+            ``VK_IMAGE_LAYOUT_GENERAL`` (true of every :class:`Image`).
+        :raises RuntimeError: If `source` has no backing :class:`Buffer`,
+            or its size doesn't match ``destination``'s byte size.
         """
         ...
 
@@ -2449,10 +2513,44 @@ class DescriptorSet:
           :class:`AccelerationStructure` (typically a TLAS, from
           :func:`ads`/:func:`ads_instances`).
 
-        e.g. ``ds.bind(transform=ubo, albedo=(texture, sampler))``.
+        For a binding declared with ``count > 1`` (an image/sampler/buffer/
+        acceleration-structure array -- see :meth:`Pipeline.layout`), a call
+        can write one slot or several at once:
+
+        - One slot: pass ``(resource, index)`` instead of a bare resource
+          (or ``(image, sampler, index)`` for a ``COMBINED_IMAGE_SAMPLER``
+          array), where `index` is the 0-based slot within that binding's
+          declared `count`. Omitting `index` (a bare resource, or a plain
+          ``(image, sampler)`` pair) always targets slot 0 -- the only
+          valid slot for a non-array (``count == 1``) binding.
+        - Several slots, in one call: pass a ``list``/``tuple`` of
+          resources (or of ``(image, sampler)`` pairs, for a
+          ``COMBINED_IMAGE_SAMPLER`` array) to write consecutive slots
+          starting at 0, or ``([...], start_index)`` to start at
+          `start_index` instead. All of an array's slots can be written in
+          a single underlying descriptor-set update this way, rather than
+          one update per slot.
+
+        e.g. ``ds.bind(transform=ubo, albedo=(texture, sampler))`` for
+        plain bindings; ``ds.bind(textures=(texture, 2))``/
+        ``ds.bind(textures=(texture, sampler, 2))`` to write slot 2 of an
+        array binding declared with ``count > 2``; or
+        ``ds.bind(textures=[tex0, tex1, tex2])``/
+        ``ds.bind(textures=([tex2, tex3], 2))`` to write several slots of
+        an image array at once.
+
+        For a binding declared unbounded (``count=0`` -- see
+        :meth:`Pipeline.layout`), `count` above means this
+        :class:`DescriptorSet`'s own ``variable_count`` (from
+        :meth:`Pipeline.descriptor_set`) instead of the binding's own
+        declared ``count``.
 
         :raises KeyError: If a keyword doesn't match any binding declared on
             the originating :class:`Pipeline`.
+        :raises RuntimeError: If an index, or an array's ``[start_index,
+            start_index + len)`` span, falls outside ``[0, count)`` for the
+            matching binding's effective array size; or if an
+            ``(images, samplers)`` array pair has mismatched lengths.
         """
         ...
 
@@ -2501,7 +2599,17 @@ class Pipeline:
             value is either a :class:`DescriptorType` (kind of resource this
             binding expects, with ``count=1``), or a
             ``(DescriptorType, count)`` tuple for an array of ``count``
-            elements. e.g. ``pipeline.layout(0, 0, transform=DescriptorType.UNIFORM_BUFFER)``.
+            elements -- or, with ``count=0``, an *unbounded* array (GLSL
+            ``layout(...) buffer/uniform ... name[]``): its actual capacity
+            is only fixed later, per :class:`DescriptorSet`, by
+            :meth:`descriptor_set`'s ``variable_count``. A set may declare
+            at most one unbounded binding, and it must be the one with the
+            highest binding number in that set. e.g.
+            ``pipeline.layout(0, 0, transform=DescriptorType.UNIFORM_BUFFER)``,
+            or ``pipeline.layout(0, 1, textures=(DescriptorType.SAMPLED_IMAGE, 0))``
+            for a bindless-style unbounded texture array.
+        :raises RuntimeError: On :meth:`close`, if a set declares more than
+            one unbounded binding, or one that isn't its highest-numbered.
         """
         ...
 
@@ -2632,18 +2740,27 @@ class Pipeline:
         """
         ...
 
-    def descriptor_set(self, set: int = 0) -> DescriptorSet:
+    def descriptor_set(self, set: int = 0, variable_count: int = -1) -> DescriptorSet:
         """Allocates a new descriptor set matching the layout declared for
         ``set`` via :meth:`layout`.
 
         Pipeline must be closed first.
 
         :param set: Descriptor set index, as passed to :meth:`layout`.
+        :param variable_count: Only meaningful if ``set`` declared an
+            unbounded binding (``count=0`` -- see :meth:`layout`): how many
+            slots of that binding this particular set actually reserves,
+            in ``[0, 1024]``. ``-1`` (default) reserves the full 1024.
+            Ignored (must be left at ``-1``) if ``set`` has no unbounded
+            binding. :meth:`DescriptorSet.bind` on the resulting set
+            treats this as that binding's effective ``count``.
         :return: A new :class:`DescriptorSet`.
+        :raises RuntimeError: If ``variable_count`` is given but ``set``
+            has no unbounded binding, or is outside ``[0, 1024]``.
         """
         ...
 
-    def descriptor_set_collection(self, set: int = 0, count: int = 1) -> list[DescriptorSet]:
+    def descriptor_set_collection(self, set: int = 0, count: int = 1, variable_count: int = -1) -> list[DescriptorSet]:
         """Allocates ``count`` independent descriptor sets matching the
         layout declared for ``set`` -- one per object to draw/dispatch
         with its own bindings (e.g. a different transform buffer each),
@@ -2653,6 +2770,8 @@ class Pipeline:
 
         :param set: Descriptor set index, as passed to :meth:`layout`.
         :param count: Number of independent descriptor sets to allocate.
+        :param variable_count: As in :meth:`descriptor_set`, applied to
+            every set in the returned list.
         :return: A list of ``count`` new :class:`DescriptorSet`.
         """
         ...
@@ -2665,6 +2784,40 @@ class Pipeline:
     @property
     def device_index(self) -> int:
         """Index of the Device this pipeline was created from."""
+        ...
+
+
+class Caps:
+    """Snapshot of a :class:`Device`'s optional-feature support, obtained
+    from :meth:`Device.caps`/:func:`caps`. More properties are added here
+    over time as the library grows to expose more optional Vulkan
+    features.
+    """
+
+    @property
+    def can_update_after_bind(self) -> bool:
+        """Whether this device supports updating a descriptor binding
+        after it's been bound to a command buffer (rather than only
+        before) for at least the descriptor types this library itself can
+        declare a binding of (buffers and images).
+
+        :meth:`Pipeline.close` opts each binding into this independently,
+        per its own declared :class:`DescriptorType`, wherever the device
+        actually supports it for that specific type -- so some bindings
+        of a pipeline may support it even when this aggregate flag is
+        ``False``, and this flag being ``True`` doesn't guarantee every
+        binding does (e.g. :attr:`DescriptorType.ACCELERATION_STRUCTURE`
+        has its own, separate feature bit).
+        """
+        ...
+
+    @property
+    def supports_ray_queries(self) -> bool:
+        """Whether ``VK_KHR_ray_query`` is supported and enabled --
+        ``rayQueryEXT``/inline ray tracing (``traceRayEXT`` without a
+        dedicated ray tracing pipeline) from any shader stage, tracing
+        against a :class:`AccelerationStructure` TLAS.
+        """
         ...
 
 
@@ -2686,6 +2839,12 @@ class Device:
 
     def dispose(self) -> None:
         """Releases all Vulkan resources owned by this device."""
+        ...
+
+    def caps(self) -> Caps:
+        """Snapshot of this device's optional-feature support, queried
+        once at device creation.
+        """
         ...
 
     @property
@@ -3006,13 +3165,26 @@ class Device:
           array): always copied into a new buffer at ``location`` on
           demand, since a foreign host allocation has no Vulkan device
           address of its own.
+        - A ``list`` or ``tuple`` of all-``int`` or all-``float``
+          numbers (``float`` wins if mixed): neither implements the
+          buffer protocol, so its values are mirrored into an
+          intermediate ``array.array`` (rebuilt fresh from the sequence
+          on every :meth:`WrappedMemory.update_gpu`, so later mutations
+          are picked up), then copied into a new buffer at ``location``
+          on demand, same as a buffer-protocol object. A ``list`` is
+          written back element-by-element from that intermediate buffer
+          on :meth:`WrappedMemory.update_cpu`; a ``tuple`` is immutable
+          and can only ever be read from --
+          :meth:`WrappedMemory.make_gpu_dirty` raises if called on one.
 
         :param obj: The object to wrap.
         :param location: Where to allocate a copy, if one is needed.
             Ignored when the object can be used directly.
         :return: A new :class:`WrappedMemory`.
-        :raises RuntimeError: If ``obj`` is none of the above, or a
-            copy is required from/to CUDA-resident data but no interop
+        :raises RuntimeError: If ``obj`` is none of the above, is an
+            empty list/tuple (no scalar type to infer), a list/tuple
+            with elements that aren't all ``int``/``float``, or a copy
+            is required from/to CUDA-resident data but no interop
             library is available.
         """
         ...
@@ -3058,5 +3230,300 @@ def device_infos() -> list[dict]:
 
     :return: One dict per Vulkan-visible physical device, in the same
         order/indexing as :meth:`Device.create_device`/:func:`vk.device` expects.
+    """
+    ...
+
+
+# ---- Implicit "current device"/"current engine" context ----
+#
+# The free functions below operate on whichever device/engine is currently
+# active rather than an explicit Device/Engine instance -- see
+# cpp/context.hpp/context.cpp. device()/engine() activate one explicitly
+# (optionally as a context manager, restoring the previously active one on
+# __exit__); every other function here lazily activates sensible defaults
+# (device 0, a combined GRAPHICS|COMPUTE engine falling back to plain
+# COMPUTE) the first time one is needed.
+
+
+class _DeviceContext:
+    """Returned by :func:`device`. Used as a context manager (``with
+    vk.device(1): ...``), restores the previously active device on
+    ``__exit__``; discarded (no ``with``), the switch is permanent.
+    """
+
+    def __enter__(self) -> "_DeviceContext": ...
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None: ...
+
+
+class _EngineContext:
+    """Returned by :func:`engine`. Used as a context manager, restores the
+    previously active engine (for this device) on ``__exit__``; discarded
+    (no ``with``), the switch is permanent.
+    """
+
+    def __enter__(self) -> "_EngineContext": ...
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None: ...
+
+
+class _RecordingContext:
+    """Returned by :func:`transfer`/:func:`compute`/:func:`graphics`. A
+    context manager: yields a :class:`CommandBuffer` already recording on
+    ``__enter__``, closes, submits, and waits on it on ``__exit__``.
+    """
+
+    def __enter__(self) -> CommandBuffer: ...
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None: ...
+
+
+def device(device_index: int = 0) -> _DeviceContext:
+    """Creates/activates the device at ``device_index`` as the current
+    device. Used as a context manager (``with vk.device(1): ...``), the
+    previously active device is restored on exit; used as a plain
+    statement, the switch is permanent.
+
+    :param device_index: Index of the physical Vulkan device to use, as
+        returned by :func:`device_infos`.
+    :return: A context manager; discard it for a permanent switch.
+    """
+    ...
+
+
+def device_index() -> int:
+    """The current/active device's index (activating device 0 first, via
+    :func:`device`, if it was never called).
+    """
+    ...
+
+
+def caps() -> Caps:
+    """Optional-feature support snapshot of the current device
+    (activating device 0 first, via :func:`device`, if it was never
+    called) -- see :meth:`Device.caps`.
+    """
+    ...
+
+
+def engine(engine_type: Optional[EngineType] = None, engine_index: int = 0) -> _EngineContext:
+    """Creates/activates an engine on the current device as the current
+    engine. Used as a context manager, the previously active engine (for
+    this device) is restored on exit; used as a plain statement, the
+    switch is permanent.
+
+    :param engine_type: Capability requested for this engine. ``None``
+        (default) tries a combined ``GRAPHICS|COMPUTE`` engine first,
+        falling back to a plain ``COMPUTE`` engine if this device has no
+        queue family supporting both.
+    :param engine_index: Index selecting among multiple queues that
+        support the requested capability, when more than one is available.
+    :return: A context manager; discard it for a permanent switch.
+    """
+    ...
+
+
+def dispose() -> None:
+    """Disposes the current device and drops it from the registry (so a
+    further :func:`device` call for the same index creates a fresh one).
+    """
+    ...
+
+
+def relax() -> None:
+    """Drops every reference this module keeps to created devices/engines,
+    without disposing them. A device/engine still referenced elsewhere
+    (a live :class:`Buffer`/:class:`Image`/:class:`CommandBuffer`/etc.)
+    stays alive via normal reference counting.
+    """
+    ...
+
+
+def tensor(shape: list[int], scalar_type: Type, location: MemoryLocation = MemoryLocation.DEVICE) -> Tensor:
+    """Creates a :class:`Tensor` of `shape`/`scalar_type` on the current
+    device -- see :meth:`Device.create_tensor`.
+    """
+    ...
+
+
+@overload
+def buffer(elements: int, element_type: Type, location: MemoryLocation = MemoryLocation.DEVICE) -> Buffer:
+    """Creates a :class:`Buffer` of `elements` scalars of `element_type`
+    on the current device -- see :meth:`Device.create_buffer`.
+    """
+    ...
+
+
+@overload
+def buffer(elements: int, format: Format, location: MemoryLocation = MemoryLocation.DEVICE) -> Buffer:
+    """Creates a :class:`Buffer` of `elements` texels of `format` on the
+    current device -- see :meth:`Device.create_buffer`.
+    """
+    ...
+
+
+@overload
+def buffer(elements: int, layout: Layout, location: MemoryLocation = MemoryLocation.DEVICE) -> Buffer:
+    """Creates a :class:`Buffer` of `elements` instances of `layout` on
+    the current device -- see :meth:`Device.create_buffer`.
+    """
+    ...
+
+
+def image(
+    width: int,
+    height: int = 1,
+    depth: int = 1,
+    mip_levels: int = 1,
+    array_layers: int = 1,
+    format: Format = Format.RGBA8_UNorm,
+    location: MemoryLocation = MemoryLocation.DEVICE,
+) -> Image:
+    """Creates a 1D/2D/3D :class:`Image` on the current device -- see
+    :meth:`Device.create_image`.
+    """
+    ...
+
+
+def depth_buffer_image(
+    width: int,
+    height: int,
+    format: Format = Format.Depth32_Float,
+    location: MemoryLocation = MemoryLocation.DEVICE,
+) -> Image:
+    """Creates a 2D depth (or depth/stencil) attachment :class:`Image` on
+    the current device -- see :meth:`Device.create_depth_buffer_image`.
+    """
+    ...
+
+
+def sampler(
+    mag_filter: Filter = Filter.LINEAR,
+    min_filter: Filter = Filter.LINEAR,
+    mipmap_mode: MipmapMode = MipmapMode.LINEAR,
+    wrap_u: WrapMode = WrapMode.REPEAT,
+    wrap_v: WrapMode = WrapMode.REPEAT,
+    wrap_w: WrapMode = WrapMode.REPEAT,
+) -> Sampler:
+    """Creates a texture :class:`Sampler` on the current device -- see
+    :meth:`Device.create_sampler`.
+    """
+    ...
+
+
+def ads(declaration: ADSDeclaration) -> AccelerationStructure:
+    """Creates (sizes and allocates, but does not build) an acceleration
+    structure on the current device -- see :meth:`Device.create_ads`.
+    """
+    ...
+
+
+def window(
+    width: int,
+    height: int,
+    title: str,
+    format: Format,
+    frames_on_the_fly: int = 3,
+    vsync: bool = True,
+) -> Window:
+    """Creates a :class:`Window` on the current device -- see
+    :meth:`Device.create_window`.
+    """
+    ...
+
+
+@overload
+def staging(buffer: Buffer, location: MemoryLocation = MemoryLocation.HOST) -> Buffer:
+    """Creates a plain, byte-addressable staging :class:`Buffer` sized to
+    match `buffer` on the current device -- see :meth:`Device.create_staging`.
+    """
+    ...
+
+
+@overload
+def staging(image: Image, location: MemoryLocation = MemoryLocation.HOST) -> Buffer:
+    """Creates a plain, byte-addressable staging :class:`Buffer` sized to
+    match `image` on the current device -- see :meth:`Device.create_staging`.
+    """
+    ...
+
+
+def pipeline(type: PipelineType) -> Pipeline:
+    """Creates a new, empty :class:`Pipeline` of the given type on the
+    current device -- see :meth:`Device.create_pipeline`.
+    """
+    ...
+
+
+def wrap(obj: "Buffer | Tensor | object", location: MemoryLocation = MemoryLocation.DEVICE) -> WrappedMemory:
+    """Wraps an external object as a :class:`WrappedMemory` on the current
+    device -- see :meth:`Device.wrap`.
+    """
+    ...
+
+
+def load_scene(
+    filename: str,
+    resolution_mode: VertexResolutionMode = VertexResolutionMode.BY_ALL_ATTRIBUTES,
+) -> Scene:
+    """Loads a scene file into device-resident :class:`Mesh` buffers on
+    the current device -- see :meth:`Device.load_scene`.
+    """
+    ...
+
+
+def command_buffer() -> CommandBuffer:
+    """Creates (or recycles) a :class:`CommandBuffer` on the current
+    engine, ready for recording -- see :meth:`Engine.create_command_buffer`.
+    """
+    ...
+
+
+def submit(command_buffers: list[CommandBuffer]) -> SubmissionTask:
+    """Submits one or more closed command buffers for execution on the
+    current engine -- see :meth:`Engine.submit`.
+    """
+    ...
+
+
+def wait() -> None:
+    """Blocks until every command previously submitted through the
+    current engine has finished executing on the GPU -- see
+    :meth:`Engine.wait`.
+    """
+    ...
+
+
+def transfer(engine_index: int = 0) -> _RecordingContext:
+    """Creates a temporary :class:`CommandBuffer` on a ``TRANSFER`` engine,
+    recording a transfer operation into it. Use as a context manager: the
+    command buffer is closed, submitted, and waited on at the end of the
+    ``with`` block.
+
+    :param engine_index: Index selecting among multiple queues that
+        support the ``TRANSFER`` capability, when more than one is available.
+    """
+    ...
+
+
+def compute(engine_index: int = 0) -> _RecordingContext:
+    """Creates a temporary :class:`CommandBuffer` on a
+    ``COMPUTE|TRANSFER`` engine, recording a compute operation into it.
+    Use as a context manager: the command buffer is closed, submitted, and
+    waited on at the end of the ``with`` block.
+
+    :param engine_index: Index selecting among multiple queues that
+        support the ``COMPUTE|TRANSFER`` capability, when more than one is
+        available.
+    """
+    ...
+
+
+def graphics(engine_index: int = 0) -> _RecordingContext:
+    """Creates a temporary :class:`CommandBuffer` on a
+    ``GRAPHICS|COMPUTE|TRANSFER`` engine, recording a graphics operation
+    into it. Use as a context manager: the command buffer is closed,
+    submitted, and waited on at the end of the ``with`` block.
+
+    :param engine_index: Index selecting among multiple queues that
+        support the ``GRAPHICS|COMPUTE|TRANSFER`` capability, when more
+        than one is available.
     """
     ...

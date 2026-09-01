@@ -205,6 +205,7 @@ install(TARGETS vk_cuda_interop
 
 pybind11_add_module(vk
         cpp/bindings.cpp
+        cpp/context.cpp
         cpp/device.cpp
         cpp/loaders.cpp
         ${IMGUI_SOURCES}

@@ -69,6 +69,25 @@ bool supports_extension(const std::vector<vk::ExtensionProperties>& extensions, 
     });
 }
 
+// Prints validation layer messages to stdout unconditionally, rather than
+// relying on VK_LAYER_KHRONOS_validation's own default reporting -- whether
+// that reports anywhere at all (and where) depends on layer settings that
+// are outside this codebase's control (a vk_layer_settings.txt/
+// VK_LAYER_SETTINGS_PATH, a machine-wide Vulkan Configurator override,
+// ...), so enable_validation_layers=true only reliably produces visible
+// output if the app registers its own messenger. Used only when validation
+// layers are enabled -- see Device::Device().
+VKAPI_ATTR VkBool32 VKAPI_CALL debug_utils_callback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
+    const VkDebugUtilsMessengerCallbackDataEXT* callback_data, void*) {
+    const char* level =
+        (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "ERROR" :
+        (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) ? "WARNING" :
+        (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) ? "INFO" : "VERBOSE";
+    std::cout << "[VALIDATION " << level << "] " << callback_data->pMessage << std::endl;
+    return VK_FALSE;
+}
+
 uint32_t formatSize(Format format) {
     vk::Format vk_format = (vk::Format) format;
     switch (vk_format)
@@ -253,6 +272,26 @@ vk::DescriptorType to_vk_descriptor_type(DescriptorType type) {
         case DescriptorType::COMBINED_IMAGE_SAMPLER: return vk::DescriptorType::eCombinedImageSampler;
         case DescriptorType::ACCELERATION_STRUCTURE: return vk::DescriptorType::eAccelerationStructureKHR;
         default: throw std::runtime_error("Unsupported descriptor type");
+    }
+}
+
+// Whether `type` supports VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT on
+// `device` -- see Device::vk_uab_*_supported()'s docstrings for which
+// VkPhysicalDeviceVulkan12Features field gates which descriptor type.
+// Consulted per-binding by Pipeline::close() so update-after-bind is
+// opted into wherever the specific descriptor type actually supports it,
+// rather than all-or-nothing for the whole pipeline.
+bool binding_type_supports_update_after_bind(DescriptorType type, const Device& device) {
+    switch (type) {
+        case DescriptorType::UNIFORM_BUFFER: return device.vk_uab_uniform_buffer_supported();
+        case DescriptorType::STORAGE_BUFFER: return device.vk_uab_storage_buffer_supported();
+        case DescriptorType::SAMPLED_IMAGE:
+        case DescriptorType::SAMPLER:
+        case DescriptorType::COMBINED_IMAGE_SAMPLER:
+            return device.vk_uab_sampled_image_supported();
+        case DescriptorType::STORAGE_IMAGE: return device.vk_uab_storage_image_supported();
+        case DescriptorType::ACCELERATION_STRUCTURE: return device.vk_uab_acceleration_structure_supported();
+        default: return false;
     }
 }
 
@@ -451,6 +490,13 @@ Type scalar_type_from_buffer_format(const std::string& format, std::uint64_t ite
     if (format == "q") return Type::INT64;
     if (format == "Q") return Type::UINT64;
     throw std::runtime_error("Device::wrap: unsupported buffer format '" + format + "'");
+}
+
+// array.array typecode for a list/tuple wrap's inferred scalar type (see
+// Device::wrap's LIST/TUPLE case and WrappedMemory::update_gpu) -- only
+// ever FLOAT32 or INT32, so no need to cover every Type here.
+const char* array_typecode_for(Type scalar) {
+    return scalar == Type::FLOAT32 ? "f" : "i";
 }
 
 // True if `shape`/`strides` (DLPack convention: strides in units of
@@ -1065,7 +1111,12 @@ std::shared_ptr<Layout> compute_layout(const TypeDescriptor& type, LayoutRule ru
             layout->kind = TypeKind::STRUCT;
             layout->fields = std::move(fields);
             layout->alignment = align;
-            layout->size = round_up(running_offset, align);
+            // GL_EXT_scalar_block_layout does not pad a struct's own size up
+            // to its alignment the way std140/std430 do -- glslang places
+            // the next sibling field right after the raw content (verified
+            // via GPU write/read); only aligned_size (array-of-struct
+            // stride, below) still needs that padding under every rule.
+            layout->size = (rule == LayoutRule::Scalar) ? running_offset : round_up(running_offset, align);
         }
     }, type.payload());
     // Size this layout would occupy as one element of an array of itself
@@ -1520,6 +1571,10 @@ void CommandBuffer::transfer(const std::shared_ptr<Buffer>& source, const std::s
         source->vk_buffer(), destination->vk_image(), vk::ImageLayout::eGeneral, plan.regions);
     bound_images_.push_back(destination);
     bound_vertex_index_buffers_.push_back(source);
+}
+
+void CommandBuffer::transfer(const std::shared_ptr<WrappedMemory>& source, const std::shared_ptr<Image>& destination) {
+    transfer(source->vk_transfer_buffer(), destination);
 }
 
 void CommandBuffer::set_pipeline(const std::shared_ptr<Pipeline>& pipeline) {
@@ -2025,6 +2080,14 @@ std::uint64_t Buffer::device_ptr() const {
 
 std::uint64_t Buffer::external_ptr() const {
     return data_->external_ptr() + slice_.buffer.offset;
+}
+
+pybind11::object Buffer::memoryview() const {
+    if (!data_->is_cpu()) {
+        throw std::runtime_error("Buffer::memoryview: only valid for host-visible memory (this buffer is DEVICE-located)");
+    }
+    void* ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(external_ptr()));
+    return pybind11::memoryview::from_memory(ptr, static_cast<pybind11::ssize_t>(size()), /*readonly=*/false);
 }
 
 void Buffer::load(const pybind11::object& source) const {
@@ -2747,6 +2810,7 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     extended_dynamic_state_supported_ = api_version >= VK_API_VERSION_1_3;
 
     std::vector<const char*> enabled_layers;
+    std::string validation_layer_name;
     const std::vector<VkLayerProperties> instance_layers = enumerate_instance_layers();
     if (enable_validation_layers) {
         auto layer_it = std::find_if(instance_layers.begin(), instance_layers.end(), [](const VkLayerProperties& layer) {
@@ -2755,7 +2819,8 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
         if (layer_it == instance_layers.end()) {
             throw std::runtime_error("Validation layers were requested, but no *_validation layer was found");
         }
-        enabled_layers.push_back(layer_it->layerName);
+        validation_layer_name = layer_it->layerName;
+        enabled_layers.push_back(validation_layer_name.c_str());
     }
 
     // Surface extensions, needed for Window/swapchain support. Enabled
@@ -2784,6 +2849,38 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     add_instance_extension_if_supported("VK_KHR_xlib_surface");
     add_instance_extension_if_supported("VK_KHR_wayland_surface");
 #endif
+    // Registers debug_utils_callback() below as this instance's own
+    // VkDebugUtilsMessengerEXT once created, so enable_validation_layers=true
+    // reliably prints validation messages to stdout regardless of the
+    // *_validation layer's own (locally-configurable, effectively
+    // unpredictable) default reporting destination.
+    const bool debug_utils_supported =
+        enable_validation_layers && supports_extension(instance_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (debug_utils_supported) {
+        enabled_instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    // Opts into shader debugPrintfEXT() output (routed through
+    // debug_utils_callback() above as an INFO-severity, GENERAL-type
+    // message) -- otherwise debugPrintfEXT() calls compile fine but are
+    // silently no-ops, since printf is a validation-layer feature that
+    // must be explicitly requested, not just "the validation layer is on".
+    // VK_EXT_validation_features is provided BY the *_validation layer
+    // itself (unlike VK_EXT_debug_utils, which the loader always exposes),
+    // so it only shows up when instance extensions are enumerated scoped to
+    // that layer's name -- the unscoped instance_extensions query above
+    // never lists it, even with the layer enabled.
+    const bool validation_features_supported = enable_validation_layers && !validation_layer_name.empty() &&
+        supports_extension(vk::enumerateInstanceExtensionProperties(validation_layer_name), VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+    if (validation_features_supported) {
+        enabled_instance_extensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+    }
+    const std::array<VkValidationFeatureEnableEXT, 1> enabled_validation_features{
+        VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT
+    };
+    VkValidationFeaturesEXT validation_features{};
+    validation_features.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+    validation_features.enabledValidationFeatureCount = static_cast<uint32_t>(enabled_validation_features.size());
+    validation_features.pEnabledValidationFeatures = enabled_validation_features.data();
 
     vk::InstanceCreateInfo ci{};
     ci.pApplicationInfo = &app;
@@ -2791,8 +2888,27 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     ci.ppEnabledLayerNames = enabled_layers.empty() ? nullptr : enabled_layers.data();
     ci.enabledExtensionCount = static_cast<uint32_t>(enabled_instance_extensions.size());
     ci.ppEnabledExtensionNames = enabled_instance_extensions.empty() ? nullptr : enabled_instance_extensions.data();
+    if (validation_features_supported) {
+        ci.pNext = &validation_features;
+    }
 
     instance_ = vk::createInstance(ci);
+
+    if (debug_utils_supported) {
+        auto create_messenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(static_cast<VkInstance>(instance_), "vkCreateDebugUtilsMessengerEXT"));
+        if (create_messenger) {
+            VkDebugUtilsMessengerCreateInfoEXT messenger_ci{};
+            messenger_ci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+            messenger_ci.messageSeverity =
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            messenger_ci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            messenger_ci.pfnUserCallback = debug_utils_callback;
+            create_messenger(static_cast<VkInstance>(instance_), &messenger_ci, nullptr, &debug_messenger_);
+        }
+    }
 
     const auto gpus = instance_.enumeratePhysicalDevices();
     if (gpus.empty()) {
@@ -2853,6 +2969,12 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
     const bool ray_tracing_pipeline_extension_supported =
         acceleration_structure_supported_ &&
         supports_extension(supported_extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+    // Gates vk_ray_query_supported(); a ray query traces against a TLAS
+    // just like a ray tracing pipeline does, so this also requires
+    // acceleration_structure_supported_.
+    const bool ray_query_extension_supported =
+        acceleration_structure_supported_ &&
+        supports_extension(supported_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
     vk::PhysicalDeviceProperties2 properties2{};
     vk::PhysicalDeviceVulkan12Properties vulkan12_properties{};
@@ -2894,6 +3016,13 @@ Device::Device(uint32_t device_index, bool enable_validation_layers) {
         shader_group_handle_alignment_ = ray_tracing_pipeline_properties.shaderGroupHandleAlignment;
         shader_group_base_alignment_ = ray_tracing_pipeline_properties.shaderGroupBaseAlignment;
     }
+    ray_query_supported_ = ray_query_extension_supported && ray_query_features.rayQuery;
+    uab_uniform_buffer_supported_ = vulkan12_features.descriptorBindingUniformBufferUpdateAfterBind;
+    uab_storage_buffer_supported_ = vulkan12_features.descriptorBindingStorageBufferUpdateAfterBind;
+    uab_sampled_image_supported_ = vulkan12_features.descriptorBindingSampledImageUpdateAfterBind;
+    uab_storage_image_supported_ = vulkan12_features.descriptorBindingStorageImageUpdateAfterBind;
+    uab_acceleration_structure_supported_ =
+        acceleration_structure_supported_ && acceleration_structure_features.descriptorBindingAccelerationStructureUpdateAfterBind;
 
     constexpr float priority = 1.0f;
     const auto queue_families = physical_.getQueueFamilyProperties();
@@ -3205,7 +3334,11 @@ void vk_Pipeline::vk_layout(int set, int start_binding, const std::vector<vk_Nam
     if (set < 0 || start_binding < 0) throw std::runtime_error("Pipeline::layout: invalid set/start_binding");
     for (std::size_t i = 0; i < named_bindings.size(); ++i) {
         const auto& named = named_bindings[i];
-        if (named.count <= 0) throw std::runtime_error("Pipeline::layout: invalid count for '" + named.name + "'");
+        // count == 0 declares an unbounded (VARIABLE_DESCRIPTOR_COUNT)
+        // array -- see vk_close()'s per-set validation (must be the sole,
+        // highest-binding-number one in its set) and
+        // vk_allocate_descriptor_set()'s variable_count.
+        if (named.count < 0) throw std::runtime_error("Pipeline::layout: invalid count for '" + named.name + "'");
         if (binding_names_.count(named.name)) throw std::runtime_error("Pipeline::layout: name '" + named.name + "' already declared");
         bindings_.push_back({ set, start_binding + static_cast<int>(i), named.type, named.count });
         binding_names_[named.name] = static_cast<int>(bindings_.size()) - 1;
@@ -3301,18 +3434,60 @@ void vk_Pipeline::vk_close() {
     int max_set = -1;
     for (const auto& binding : bindings_) max_set = std::max(max_set, binding.set);
     descriptor_set_layouts_.assign(static_cast<std::size_t>(max_set + 1), vk::DescriptorSetLayout{});
+    bool pool_needs_update_after_bind = false;
     for (int set = 0; set <= max_set; ++set) {
         std::vector<vk::DescriptorSetLayoutBinding> vk_bindings;
+        std::vector<vk::DescriptorBindingFlags> binding_flags;
+        int max_binding_number = -1;
+        int unbounded_count = 0;
+        bool set_needs_update_after_bind = false;
         for (const auto& binding : bindings_) {
             if (binding.set != set) continue;
+            max_binding_number = std::max(max_binding_number, binding.binding);
+            if (binding.count == 0) ++unbounded_count;
+        }
+        for (const auto& binding : bindings_) {
+            if (binding.set != set) continue;
+            const bool is_unbounded = binding.count == 0;
+            if (is_unbounded && binding.binding != max_binding_number) {
+                throw std::runtime_error(
+                    "Pipeline::close: set " + std::to_string(set) + "'s unbounded (count == 0) binding "
+                    "must be the one with the highest binding number in its set");
+            }
+            // Opted into per-binding, per descriptor type: update-after-bind
+            // lets DescriptorSet::bind() rewrite this binding even after a
+            // command buffer referencing it has been submitted (as long as
+            // that submission isn't still using it without
+            // NonUniformIndexing-style dynamic guarantees -- ordinary
+            // usage patterns here are unaffected either way), whenever this
+            // device's driver actually supports it for this type.
+            const bool wants_update_after_bind = binding_type_supports_update_after_bind(binding.type, *device);
+            if (wants_update_after_bind) {
+                set_needs_update_after_bind = true;
+                pool_needs_update_after_bind = true;
+            }
             vk::DescriptorSetLayoutBinding vk_binding{};
             vk_binding.binding = static_cast<std::uint32_t>(binding.binding);
             vk_binding.descriptorType = to_vk_descriptor_type(binding.type);
-            vk_binding.descriptorCount = static_cast<std::uint32_t>(binding.count);
+            vk_binding.descriptorCount = is_unbounded ? kUnboundedDescriptorCapacity : static_cast<std::uint32_t>(binding.count);
             vk_binding.stageFlags = vk::ShaderStageFlagBits::eAll;
             vk_bindings.push_back(vk_binding);
+            vk::DescriptorBindingFlags flags{};
+            if (is_unbounded) flags |= vk::DescriptorBindingFlagBits::eVariableDescriptorCount | vk::DescriptorBindingFlagBits::ePartiallyBound;
+            if (wants_update_after_bind) flags |= vk::DescriptorBindingFlagBits::eUpdateAfterBind;
+            binding_flags.push_back(flags);
         }
+        if (unbounded_count > 1) {
+            throw std::runtime_error("Pipeline::close: set " + std::to_string(set) + " declares more than one unbounded (count == 0) binding");
+        }
+
+        vk::DescriptorSetLayoutBindingFlagsCreateInfo binding_flags_info{};
+        binding_flags_info.bindingCount = static_cast<std::uint32_t>(binding_flags.size());
+        binding_flags_info.pBindingFlags = binding_flags.data();
+
         vk::DescriptorSetLayoutCreateInfo layout_info{};
+        layout_info.pNext = &binding_flags_info;
+        if (set_needs_update_after_bind) layout_info.flags |= vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
         layout_info.bindingCount = static_cast<std::uint32_t>(vk_bindings.size());
         layout_info.pBindings = vk_bindings.data();
         descriptor_set_layouts_[static_cast<std::size_t>(set)] = dev.createDescriptorSetLayout(layout_info);
@@ -3330,7 +3505,8 @@ void vk_Pipeline::vk_close() {
         constexpr std::uint32_t kMaxSetInstances = 16;
         std::unordered_map<VkDescriptorType, std::uint32_t> counts;
         for (const auto& binding : bindings_) {
-            counts[static_cast<VkDescriptorType>(to_vk_descriptor_type(binding.type))] += static_cast<std::uint32_t>(binding.count) * kMaxSetInstances;
+            const std::uint32_t reserved = binding.count == 0 ? kUnboundedDescriptorCapacity : static_cast<std::uint32_t>(binding.count);
+            counts[static_cast<VkDescriptorType>(to_vk_descriptor_type(binding.type))] += reserved * kMaxSetInstances;
         }
         std::vector<vk::DescriptorPoolSize> pool_sizes;
         pool_sizes.reserve(counts.size());
@@ -3342,6 +3518,7 @@ void vk_Pipeline::vk_close() {
         pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
         pool_info.pPoolSizes = pool_sizes.data();
         pool_info.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
+        if (pool_needs_update_after_bind) pool_info.flags |= vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
         descriptor_pool_ = dev.createDescriptorPool(pool_info);
     }
 
@@ -3636,18 +3813,43 @@ void vk_Pipeline::vk_close() {
     closed_ = true;
 }
 
-vk::DescriptorSet vk_Pipeline::vk_allocate_descriptor_set(int set) {
+std::pair<vk::DescriptorSet, int> vk_Pipeline::vk_allocate_descriptor_set(int set, int variable_count) {
     if (!closed_) throw std::runtime_error("Pipeline::descriptor_set: pipeline must be closed first");
     if (set < 0 || set >= static_cast<int>(descriptor_set_layouts_.size())) {
         throw std::runtime_error("Pipeline::descriptor_set: invalid set index");
     }
     auto device = device_.lock();
     if (!device) throw std::runtime_error("Pipeline::descriptor_set: device has been disposed");
+
+    bool has_unbounded = false;
+    for (const auto& binding : bindings_) {
+        if (binding.set == set && binding.count == 0) { has_unbounded = true; break; }
+    }
+    if (!has_unbounded && variable_count != -1) {
+        throw std::runtime_error("Pipeline::descriptor_set: variable_count given but set " + std::to_string(set) + " has no unbounded (count == 0) binding");
+    }
+
     vk::DescriptorSetAllocateInfo alloc_info{};
     alloc_info.descriptorPool = descriptor_pool_;
     alloc_info.descriptorSetCount = 1;
     alloc_info.pSetLayouts = &descriptor_set_layouts_[static_cast<std::size_t>(set)];
-    return device->logical_device().allocateDescriptorSets(alloc_info)[0];
+
+    int resolved_variable_count = 0;
+    vk::DescriptorSetVariableDescriptorCountAllocateInfo variable_count_info{};
+    if (has_unbounded) {
+        resolved_variable_count = variable_count == -1 ? static_cast<int>(kUnboundedDescriptorCapacity) : variable_count;
+        if (resolved_variable_count < 0 || resolved_variable_count > static_cast<int>(kUnboundedDescriptorCapacity)) {
+            throw std::runtime_error(
+                "Pipeline::descriptor_set: variable_count must be in [0, " +
+                std::to_string(kUnboundedDescriptorCapacity) + "]");
+        }
+        const auto resolved_u32 = static_cast<std::uint32_t>(resolved_variable_count);
+        variable_count_info.descriptorSetCount = 1;
+        variable_count_info.pDescriptorCounts = &resolved_u32;
+        alloc_info.pNext = &variable_count_info;
+        return { device->logical_device().allocateDescriptorSets(alloc_info)[0], resolved_variable_count };
+    }
+    return { device->logical_device().allocateDescriptorSets(alloc_info)[0], resolved_variable_count };
 }
 
 const vk_DescriptorBinding& vk_Pipeline::vk_binding(int layout_id) const {
@@ -3728,18 +3930,18 @@ std::shared_ptr<Framebuffer> Pipeline::create_framebuffer(
     return std::make_shared<Framebuffer>(std::move(vk_fb));
 }
 
-std::shared_ptr<DescriptorSet> Pipeline::descriptor_set(int set) {
-    vk::DescriptorSet ds = pipeline_->vk_allocate_descriptor_set(set);
-    auto vk_ds = std::make_shared<vk_DescriptorSet>(device_, pipeline_, set, ds);
+std::shared_ptr<DescriptorSet> Pipeline::descriptor_set(int set, int variable_count) {
+    auto [ds, resolved_variable_count] = pipeline_->vk_allocate_descriptor_set(set, variable_count);
+    auto vk_ds = std::make_shared<vk_DescriptorSet>(device_, pipeline_, set, ds, resolved_variable_count);
     return std::make_shared<DescriptorSet>(std::move(vk_ds));
 }
 
-std::vector<std::shared_ptr<DescriptorSet>> Pipeline::descriptor_set_collection(int set, int count) {
+std::vector<std::shared_ptr<DescriptorSet>> Pipeline::descriptor_set_collection(int set, int count, int variable_count) {
     if (count <= 0) throw std::runtime_error("Pipeline::descriptor_set_collection: count must be at least 1");
     std::vector<std::shared_ptr<DescriptorSet>> result;
     result.reserve(static_cast<std::size_t>(count));
     for (int i = 0; i < count; ++i) {
-        result.push_back(descriptor_set(set));
+        result.push_back(descriptor_set(set, variable_count));
     }
     return result;
 }
@@ -4690,8 +4892,8 @@ std::shared_ptr<Window> Device::create_window(std::uint32_t width, std::uint32_t
     return window;
 }
 
-vk_DescriptorSet::vk_DescriptorSet(std::weak_ptr<Device> device, std::shared_ptr<vk_Pipeline> pipeline, int set, vk::DescriptorSet descriptor_set) noexcept
-    : device_(std::move(device)), pipeline_(std::move(pipeline)), set_(set), descriptor_set_(descriptor_set) {}
+vk_DescriptorSet::vk_DescriptorSet(std::weak_ptr<Device> device, std::shared_ptr<vk_Pipeline> pipeline, int set, vk::DescriptorSet descriptor_set, int variable_count) noexcept
+    : device_(std::move(device)), pipeline_(std::move(pipeline)), set_(set), descriptor_set_(descriptor_set), variable_count_(variable_count) {}
 
 std::uint32_t vk_DescriptorSet::device_index() const {
     auto device = device_.lock();
@@ -4699,12 +4901,41 @@ std::uint32_t vk_DescriptorSet::device_index() const {
     return device->device_index();
 }
 
-void vk_DescriptorSet::vk_bind_buffer(const std::string& name, const std::shared_ptr<Buffer>& buffer) {
+namespace {
+// `count` is the binding's *effective* capacity (vk_DescriptorSet::
+// vk_effective_count()): its declared count, or -- for an unbounded
+// (count == 0) binding -- this particular set's actually-allocated
+// variable_count.
+void check_array_index(const std::string& name, int count, int index) {
+    if (index < 0 || index >= count) {
+        throw std::runtime_error(
+            "DescriptorSet::bind: '" + name + "' index " + std::to_string(index) +
+            " is out of range for its declared count (" + std::to_string(count) + ")");
+    }
+}
+
+// Range-checked version of check_array_index() for the array bind forms:
+// validates that [start_index, start_index + element_count) as a whole
+// fits within the binding's effective count, in one check covering the
+// entire span written by a single vkUpdateDescriptorSets call.
+void check_array_range(const std::string& name, int count, int start_index, std::size_t element_count) {
+    if (element_count == 0) throw std::runtime_error("DescriptorSet::bind: '" + name + "' was given an empty array");
+    if (start_index < 0 || start_index + static_cast<std::int64_t>(element_count) > count) {
+        throw std::runtime_error(
+            "DescriptorSet::bind: '" + name + "' array [" + std::to_string(start_index) + ", " +
+            std::to_string(start_index + element_count) + ") is out of range for its declared count (" +
+            std::to_string(count) + ")");
+    }
+}
+} // namespace
+
+void vk_DescriptorSet::vk_bind_buffer(const std::string& name, const std::shared_ptr<Buffer>& buffer, int index) {
     const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::STORAGE_BUFFER && binding.type != DescriptorType::UNIFORM_BUFFER) {
         throw std::runtime_error("DescriptorSet::bind: this binding does not expect a buffer");
     }
+    check_array_index(name, vk_effective_count(binding), index);
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
 
@@ -4716,6 +4947,7 @@ void vk_DescriptorSet::vk_bind_buffer(const std::string& name, const std::shared
     vk::WriteDescriptorSet write{};
     write.dstSet = descriptor_set_;
     write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(index);
     write.descriptorCount = 1;
     write.descriptorType = to_vk_descriptor_type(binding.type);
     write.pBufferInfo = &buffer_info;
@@ -4723,7 +4955,7 @@ void vk_DescriptorSet::vk_bind_buffer(const std::string& name, const std::shared
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_image(const std::string& name, const std::shared_ptr<Image>& image) {
+void vk_DescriptorSet::vk_bind_image(const std::string& name, const std::shared_ptr<Image>& image, int index) {
     const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::STORAGE_IMAGE && binding.type != DescriptorType::SAMPLED_IMAGE) {
@@ -4731,6 +4963,7 @@ void vk_DescriptorSet::vk_bind_image(const std::string& name, const std::shared_
             "DescriptorSet::bind: '" + name + "' declared type requires a sampler; "
             "call bind(" + name + "=sampler) for a SAMPLER binding, or bind(" + name + "=(image, sampler)) for COMBINED_IMAGE_SAMPLER");
     }
+    check_array_index(name, vk_effective_count(binding), index);
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
 
@@ -4745,6 +4978,7 @@ void vk_DescriptorSet::vk_bind_image(const std::string& name, const std::shared_
     vk::WriteDescriptorSet write{};
     write.dstSet = descriptor_set_;
     write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(index);
     write.descriptorCount = 1;
     write.descriptorType = to_vk_descriptor_type(binding.type);
     write.pImageInfo = &image_info;
@@ -4752,12 +4986,13 @@ void vk_DescriptorSet::vk_bind_image(const std::string& name, const std::shared_
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_sampler(const std::string& name, const std::shared_ptr<Sampler>& sampler) {
+void vk_DescriptorSet::vk_bind_sampler(const std::string& name, const std::shared_ptr<Sampler>& sampler, int index) {
     const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::SAMPLER) {
         throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not expect a standalone sampler");
     }
+    check_array_index(name, vk_effective_count(binding), index);
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
 
@@ -4767,6 +5002,7 @@ void vk_DescriptorSet::vk_bind_sampler(const std::string& name, const std::share
     vk::WriteDescriptorSet write{};
     write.dstSet = descriptor_set_;
     write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(index);
     write.descriptorCount = 1;
     write.descriptorType = to_vk_descriptor_type(binding.type);
     write.pImageInfo = &image_info;
@@ -4774,12 +5010,13 @@ void vk_DescriptorSet::vk_bind_sampler(const std::string& name, const std::share
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_combined(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
+void vk_DescriptorSet::vk_bind_combined(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler, int index) {
     const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::COMBINED_IMAGE_SAMPLER) {
         throw std::runtime_error("DescriptorSet::bind: '" + name + "' is not a COMBINED_IMAGE_SAMPLER");
     }
+    check_array_index(name, vk_effective_count(binding), index);
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
 
@@ -4791,6 +5028,7 @@ void vk_DescriptorSet::vk_bind_combined(const std::string& name, const std::shar
     vk::WriteDescriptorSet write{};
     write.dstSet = descriptor_set_;
     write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(index);
     write.descriptorCount = 1;
     write.descriptorType = to_vk_descriptor_type(binding.type);
     write.pImageInfo = &image_info;
@@ -4798,12 +5036,13 @@ void vk_DescriptorSet::vk_bind_combined(const std::string& name, const std::shar
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
 }
 
-void vk_DescriptorSet::vk_bind_ads(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads) {
+void vk_DescriptorSet::vk_bind_ads(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads, int index) {
     const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
     if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
     if (binding.type != DescriptorType::ACCELERATION_STRUCTURE) {
         throw std::runtime_error("DescriptorSet::bind: '" + name + "' is not an ACCELERATION_STRUCTURE");
     }
+    check_array_index(name, vk_effective_count(binding), index);
     auto device = device_.lock();
     if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
 
@@ -4816,7 +5055,154 @@ void vk_DescriptorSet::vk_bind_ads(const std::string& name, const std::shared_pt
     write.pNext = &ads_info;
     write.dstSet = descriptor_set_;
     write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(index);
     write.descriptorCount = 1;
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+void vk_DescriptorSet::vk_bind_buffers(const std::string& name, const std::vector<std::shared_ptr<Buffer>>& buffers, int start_index) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
+    if (binding.type != DescriptorType::STORAGE_BUFFER && binding.type != DescriptorType::UNIFORM_BUFFER) {
+        throw std::runtime_error("DescriptorSet::bind: this binding does not expect a buffer");
+    }
+    check_array_range(name, vk_effective_count(binding), start_index, buffers.size());
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    std::vector<vk::DescriptorBufferInfo> buffer_infos(buffers.size());
+    for (std::size_t i = 0; i < buffers.size(); ++i) {
+        buffer_infos[i].buffer = buffers[i]->vk_buffer();
+        buffer_infos[i].offset = buffers[i]->vk_buffer_offset();
+        buffer_infos[i].range = buffers[i]->vk_buffer_size();
+    }
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(start_index);
+    write.descriptorCount = static_cast<std::uint32_t>(buffer_infos.size());
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pBufferInfo = buffer_infos.data();
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+void vk_DescriptorSet::vk_bind_images(const std::string& name, const std::vector<std::shared_ptr<Image>>& images, int start_index) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
+    if (binding.type != DescriptorType::STORAGE_IMAGE && binding.type != DescriptorType::SAMPLED_IMAGE) {
+        throw std::runtime_error(
+            "DescriptorSet::bind: '" + name + "' declared type requires a sampler; "
+            "call bind(" + name + "=sampler) for a SAMPLER binding, or bind(" + name + "=(image, sampler)) for COMBINED_IMAGE_SAMPLER");
+    }
+    check_array_range(name, vk_effective_count(binding), start_index, images.size());
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    std::vector<vk::DescriptorImageInfo> image_infos(images.size());
+    for (std::size_t i = 0; i < images.size(); ++i) {
+        image_infos[i].imageView = images[i]->get_view();
+        image_infos[i].imageLayout = vk::ImageLayout::eGeneral; // see vk_bind_image's comment
+    }
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(start_index);
+    write.descriptorCount = static_cast<std::uint32_t>(image_infos.size());
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pImageInfo = image_infos.data();
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+void vk_DescriptorSet::vk_bind_samplers(const std::string& name, const std::vector<std::shared_ptr<Sampler>>& samplers, int start_index) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
+    if (binding.type != DescriptorType::SAMPLER) {
+        throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not expect a standalone sampler");
+    }
+    check_array_range(name, vk_effective_count(binding), start_index, samplers.size());
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    std::vector<vk::DescriptorImageInfo> image_infos(samplers.size());
+    for (std::size_t i = 0; i < samplers.size(); ++i) {
+        image_infos[i].sampler = samplers[i]->vk_sampler();
+    }
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(start_index);
+    write.descriptorCount = static_cast<std::uint32_t>(image_infos.size());
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pImageInfo = image_infos.data();
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+void vk_DescriptorSet::vk_bind_combined_array(
+    const std::string& name, const std::vector<std::shared_ptr<Image>>& images,
+    const std::vector<std::shared_ptr<Sampler>>& samplers, int start_index) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
+    if (binding.type != DescriptorType::COMBINED_IMAGE_SAMPLER) {
+        throw std::runtime_error("DescriptorSet::bind: '" + name + "' is not a COMBINED_IMAGE_SAMPLER");
+    }
+    if (images.size() != samplers.size()) {
+        throw std::runtime_error("DescriptorSet::bind: '" + name + "' images/samplers arrays must be the same size");
+    }
+    check_array_range(name, vk_effective_count(binding), start_index, images.size());
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    std::vector<vk::DescriptorImageInfo> image_infos(images.size());
+    for (std::size_t i = 0; i < images.size(); ++i) {
+        image_infos[i].sampler = samplers[i]->vk_sampler();
+        image_infos[i].imageView = images[i]->get_view();
+        image_infos[i].imageLayout = vk::ImageLayout::eGeneral; // see vk_bind_image's comment
+    }
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(start_index);
+    write.descriptorCount = static_cast<std::uint32_t>(image_infos.size());
+    write.descriptorType = to_vk_descriptor_type(binding.type);
+    write.pImageInfo = image_infos.data();
+
+    device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+void vk_DescriptorSet::vk_bind_ads_array(const std::string& name, const std::vector<std::shared_ptr<AccelerationStructure>>& ads, int start_index) {
+    const auto& binding = pipeline_->vk_binding(pipeline_->vk_binding_index(name));
+    if (binding.set != set_) throw std::runtime_error("DescriptorSet::bind: '" + name + "' does not belong to this descriptor set");
+    if (binding.type != DescriptorType::ACCELERATION_STRUCTURE) {
+        throw std::runtime_error("DescriptorSet::bind: '" + name + "' is not an ACCELERATION_STRUCTURE");
+    }
+    check_array_range(name, vk_effective_count(binding), start_index, ads.size());
+    auto device = device_.lock();
+    if (!device) throw std::runtime_error("DescriptorSet::bind: device has been disposed");
+
+    std::vector<vk::AccelerationStructureKHR> handles(ads.size());
+    for (std::size_t i = 0; i < ads.size(); ++i) {
+        handles[i] = ads[i]->vk_ads()->vk_handle();
+    }
+
+    vk::WriteDescriptorSetAccelerationStructureKHR ads_info{};
+    ads_info.accelerationStructureCount = static_cast<std::uint32_t>(handles.size());
+    ads_info.pAccelerationStructures = handles.data();
+
+    vk::WriteDescriptorSet write{};
+    write.pNext = &ads_info;
+    write.dstSet = descriptor_set_;
+    write.dstBinding = static_cast<std::uint32_t>(binding.binding);
+    write.dstArrayElement = static_cast<std::uint32_t>(start_index);
+    write.descriptorCount = static_cast<std::uint32_t>(handles.size());
     write.descriptorType = to_vk_descriptor_type(binding.type);
 
     device->logical_device().updateDescriptorSets(1, &write, 0, nullptr);
@@ -5402,9 +5788,16 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, MemoryLocation
         const Type scalar = layout.kind == TypeKind::STRUCT ? Type::UINT8 : resolve_component_type(layout);
         const std::uint64_t itemsize = static_cast<std::uint64_t>(scalar_type_size(scalar));
         std::vector<std::uint64_t> shape{ buffer->size() / itemsize };
+        // `buffer` itself (not a temporary copy) is threaded through as the
+        // owned_buffer_ below: is_direct() (SourceKind::NONE) still makes
+        // every dirty/update method a no-op, since none of them touch
+        // owned_buffer_ without first checking source_kind_/is_direct() --
+        // this just also makes it available to
+        // WrappedMemory::vk_transfer_buffer() for CommandBuffer::transfer()
+        // to/from an Image.
         return std::make_shared<WrappedMemory>(
             weak_from_this(), buffer->device_ptr(), std::move(shape), scalar,
-            nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object());
+            buffer, location, WrappedMemory::SourceKind::NONE, pybind11::object(), pybind11::object());
     }
 
     // Case 1b: one of our own Tensors -- same as a Buffer, always a direct
@@ -5414,7 +5807,7 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, MemoryLocation
         auto tensor = obj.cast<std::shared_ptr<Tensor>>();
         return std::make_shared<WrappedMemory>(
             weak_from_this(), tensor->device_ptr(), tensor->shape(), tensor->scalar_type(),
-            nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object());
+            nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object(), pybind11::object());
     }
 
     // Case 2: a DLPack-compatible object (e.g. a torch tensor).
@@ -5448,7 +5841,7 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, MemoryLocation
             if (own_device_ptr != 0) {
                 return std::make_shared<WrappedMemory>(
                     weak_from_this(), own_device_ptr, std::move(shape), scalar,
-                    nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object());
+                    nullptr, location, WrappedMemory::SourceKind::NONE, pybind11::object(), pybind11::object());
             }
         }
 
@@ -5457,7 +5850,7 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, MemoryLocation
         auto temp = create_buffer(elements, scalar, location);
         return std::make_shared<WrappedMemory>(
             weak_from_this(), temp->device_ptr(), std::move(shape), scalar,
-            temp, location, WrappedMemory::SourceKind::DLPACK, std::move(obj));
+            temp, location, WrappedMemory::SourceKind::DLPACK, std::move(obj), pybind11::object());
     }
 
     // Case 3: a plain Python buffer-protocol object (e.g. a numpy array).
@@ -5471,10 +5864,44 @@ std::shared_ptr<WrappedMemory> Device::wrap(pybind11::object obj, MemoryLocation
         std::vector<std::uint64_t> shape{ elements };
         return std::make_shared<WrappedMemory>(
             weak_from_this(), temp->device_ptr(), std::move(shape), scalar,
-            temp, location, WrappedMemory::SourceKind::BUFFER_PROTOCOL, std::move(obj));
+            temp, location, WrappedMemory::SourceKind::BUFFER_PROTOCOL, std::move(obj), pybind11::object());
     }
 
-    throw std::runtime_error("Device::wrap: value must be a Buffer, a DLPack-compatible object, or a Python buffer object");
+    // Case 4: a plain Python list/tuple -- neither implements the buffer
+    // protocol on its own, so its numbers are first mirrored into an
+    // intermediate array.array (which does), the same "always copied" way
+    // as a buffer-protocol object. update_gpu() rebuilds that intermediate
+    // array fresh from the sequence every time (it may have been mutated
+    // since); update_cpu() copies GPU data into it and then writes it back
+    // into the original list -- impossible for a tuple, so make_gpu_dirty()
+    // rejects marking a wrapped tuple GPU-dirty up front.
+    if (py::isinstance<py::list>(obj) || py::isinstance<py::tuple>(obj)) {
+        const bool is_list = py::isinstance<py::list>(obj);
+        py::sequence seq = obj.cast<py::sequence>();
+        if (seq.size() == 0) {
+            throw std::runtime_error("Device::wrap: cannot infer a scalar type from an empty list/tuple");
+        }
+        bool any_float = false;
+        for (auto item : seq) {
+            if (py::isinstance<py::float_>(item)) any_float = true;
+            else if (!py::isinstance<py::int_>(item))
+                throw std::runtime_error("Device::wrap: list/tuple elements must all be int or float");
+        }
+        const Type scalar = any_float ? Type::FLOAT32 : Type::INT32;
+
+        py::object array_module = py::module_::import("array");
+        py::object intermediate = array_module.attr("array")(array_typecode_for(scalar), seq);
+        const std::uint64_t elements = static_cast<std::uint64_t>(seq.size());
+
+        auto temp = create_buffer(elements, scalar, location);
+        std::vector<std::uint64_t> shape{ elements };
+        return std::make_shared<WrappedMemory>(
+            weak_from_this(), temp->device_ptr(), std::move(shape), scalar,
+            temp, location, is_list ? WrappedMemory::SourceKind::LIST : WrappedMemory::SourceKind::TUPLE,
+            std::move(intermediate), obj);
+    }
+
+    throw std::runtime_error("Device::wrap: value must be a Buffer, a DLPack-compatible object, a Python buffer object, or a list/tuple");
 }
 
 std::pair<std::uint64_t, DLDevice> Device::vk_resolve_external(std::uint64_t device_ptr) const noexcept {
@@ -5493,14 +5920,26 @@ WrappedMemory::WrappedMemory(
     std::shared_ptr<Buffer> owned_buffer,
     MemoryLocation owned_location,
     SourceKind source_kind,
-    pybind11::object source) noexcept
+    pybind11::object source,
+    pybind11::object sequence_source) noexcept
     : device_(std::move(device)), device_ptr_(device_ptr), shape_(std::move(shape)), scalar_type_(scalar_type),
       owned_buffer_(std::move(owned_buffer)), owned_location_(owned_location), source_kind_(source_kind),
       source_(source.is_none() ? nullptr : std::make_unique<pybind11::object>(std::move(source))),
+      sequence_source_(sequence_source.is_none() ? nullptr : std::make_unique<pybind11::object>(std::move(sequence_source))),
       // A freshly wrapped copy starts out CPU-fresh: the wrapped object's
       // data hasn't been pushed into owned_buffer_ yet, so the first
       // update_gpu() call performs that copy. Irrelevant when is_direct().
       cpu_version_(1), gpu_version_(0) {
+}
+
+std::shared_ptr<Buffer> WrappedMemory::vk_transfer_buffer() const {
+    if (!owned_buffer_) {
+        throw std::runtime_error(
+            "WrappedMemory: no backing Buffer available for a transfer to/from an Image -- this wrap "
+            "directly aliases memory it doesn't own a Buffer for (e.g. a wrapped Tensor, or a CUDA "
+            "tensor already reused zero-copy from one of our own buffers via DLPack)");
+    }
+    return owned_buffer_;
 }
 
 void WrappedMemory::make_cpu_dirty() noexcept {
@@ -5508,8 +5947,13 @@ void WrappedMemory::make_cpu_dirty() noexcept {
     cpu_version_ = gpu_version_ + 1;
 }
 
-void WrappedMemory::make_gpu_dirty() noexcept {
+void WrappedMemory::make_gpu_dirty() {
     if (is_direct()) return;
+    if (source_kind_ == SourceKind::TUPLE) {
+        throw std::runtime_error(
+            "WrappedMemory::make_gpu_dirty: wrapped a tuple, which is immutable and can't be "
+            "updated from GPU data on update_cpu() -- wrap a list instead");
+    }
     gpu_version_ = cpu_version_ + 1;
 }
 
@@ -5532,6 +5976,21 @@ void WrappedMemory::update_gpu() {
     } else if (source_kind_ == SourceKind::BUFFER_PROTOCOL) {
         pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(*source_);
         pybind11::buffer_info info = buf.request();
+        const std::int64_t total = static_cast<std::int64_t>(info.size);
+        const std::int64_t stride1 = 1;
+        device->vk_copy_in(owned_buffer_->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*source_is_cuda=*/false);
+    } else if (source_kind_ == SourceKind::LIST || source_kind_ == SourceKind::TUPLE) {
+        // A list/tuple has no memory of its own to export via the buffer
+        // protocol, and may have been mutated since the last push -- rebuild
+        // the intermediate array.array fresh from the live sequence, then
+        // copy through it exactly like BUFFER_PROTOCOL.
+        pybind11::object array_module = pybind11::module_::import("array");
+        *source_ = array_module.attr("array")(array_typecode_for(scalar_type_), *sequence_source_);
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(*source_);
+        pybind11::buffer_info info = buf.request();
+        if (static_cast<std::uint64_t>(info.size) != shape_[0]) {
+            throw std::runtime_error("WrappedMemory::update_gpu: wrapped list/tuple changed length since it was wrapped");
+        }
         const std::int64_t total = static_cast<std::int64_t>(info.size);
         const std::int64_t stride1 = 1;
         device->vk_copy_in(owned_buffer_->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*source_is_cuda=*/false);
@@ -5561,6 +6020,25 @@ void WrappedMemory::update_cpu() {
         const std::int64_t total = static_cast<std::int64_t>(info.size);
         const std::int64_t stride1 = 1;
         device->vk_copy_out(owned_buffer_->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*dst_is_cuda=*/false);
+    } else if (source_kind_ == SourceKind::LIST || source_kind_ == SourceKind::TUPLE) {
+        pybind11::buffer buf = pybind11::reinterpret_borrow<pybind11::buffer>(*source_);
+        pybind11::buffer_info info = buf.request();
+        const std::int64_t total = static_cast<std::int64_t>(info.size);
+        const std::int64_t stride1 = 1;
+        device->vk_copy_out(owned_buffer_->external_ptr(), owned_location_, info.ptr, &total, &stride1, 1, itemsize, /*dst_is_cuda=*/false);
+        if (source_kind_ == SourceKind::LIST) {
+            // Update the list from the intermediate buffer: a plain Python
+            // list can't be memcpy'd into directly (it's an array of object
+            // pointers, not raw uniform memory), so write it back element by
+            // element instead. Never reached for a tuple -- make_gpu_dirty()
+            // already rejects marking a wrapped tuple GPU-dirty.
+            pybind11::object seq = *sequence_source_;
+            pybind11::object intermediate = *source_;
+            const auto n = static_cast<pybind11::ssize_t>(info.size);
+            for (pybind11::ssize_t i = 0; i < n; ++i) {
+                seq[pybind11::int_(i)] = intermediate[pybind11::int_(i)];
+            }
+        }
     }
     cpu_version_ = gpu_version_;
 }
@@ -5724,6 +6202,13 @@ void Device::dispose() noexcept {
 
     physical_ = vk::PhysicalDevice{};
 
+    if (debug_messenger_ && instance_) {
+        auto destroy_messenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(static_cast<VkInstance>(instance_), "vkDestroyDebugUtilsMessengerEXT"));
+        if (destroy_messenger) destroy_messenger(static_cast<VkInstance>(instance_), debug_messenger_, nullptr);
+        debug_messenger_ = VK_NULL_HANDLE;
+    }
+
     if (instance_) {
         instance_.destroy();
         instance_ = vk::Instance{};
@@ -5828,13 +6313,37 @@ MemoryManager::MemoryManager(std::weak_ptr<Device> device, uint32_t memory_type_
     }
 }
 
-MemoryManager::~MemoryManager() noexcept = default;
+MemoryManager::~MemoryManager() noexcept {
+    for (auto& [size, slice] : reserve_) {
+        delete slice;
+    }
+}
 
 void MemoryManager::vk_dispose_with(vk::Device dev) noexcept {
+    // Actually free every still-reserved slice first (its page is about to
+    // be destroyed wholesale right after, but ~MemorySlice() touching an
+    // already-torn-down page's allocator is not something to rely on).
+    for (auto& [size, slice] : reserve_) {
+        delete slice;
+    }
+    reserve_.clear();
     for (auto& page : pages_) {
         if (page) page->vk_dispose_with(dev);
     }
     pages_.clear();
+}
+
+void MemoryManager::vk_reclaim(std::weak_ptr<MemoryManager> self, MemorySlice* slice) noexcept {
+    if (auto manager = self.lock()) {
+        manager->reserve_.emplace(slice->size(), slice);
+    } else {
+        delete slice; // Manager is gone: nothing to reserve into, just free it for real.
+    }
+}
+
+std::shared_ptr<MemorySlice> MemoryManager::vk_own(MemorySlice* slice) {
+    std::weak_ptr<MemoryManager> self = weak_from_this();
+    return std::shared_ptr<MemorySlice>(slice, [self](MemorySlice* p) { vk_reclaim(self, p); });
 }
 
 std::shared_ptr<MemorySlice> MemoryManager::allocate(std::uint64_t size, int alignment) {
@@ -5845,9 +6354,40 @@ std::shared_ptr<MemorySlice> MemoryManager::allocate(std::uint64_t size, int ali
     if (size <= 0) {
         throw std::runtime_error("Allocation size must be positive");
     }
+
+    // Fast path: a slice released earlier (its last external reference
+    // dropped) and not yet freed back to its page is sitting here with the
+    // exact requested size -- reuse that very object outright, no page/
+    // allocator search needed. offset() % alignment == 0 guards against
+    // handing back a slice whose offset was only ever aligned to a looser
+    // requirement than this particular request.
+    for (auto it = reserve_.find(size); it != reserve_.end() && it->first == size; ++it) {
+        if (it->second->offset() % static_cast<std::uint64_t>(alignment) == 0) {
+            MemorySlice* slice = it->second;
+            reserve_.erase(it);
+            return vk_own(slice);
+        }
+    }
+
     for (auto& page : pages_) {
         if (page->can_allocate(size, alignment)) {
-            return page->allocate(size, alignment);
+            return vk_own(page->allocate(size, alignment));
+        }
+    }
+
+    // No page can satisfy this request as-is: the reserve is just idle
+    // memory sitting on pages that could otherwise fit it (or free up room
+    // for a new page) -- actually free all of it back to its pages'
+    // allocators and retry once before growing/creating a new page.
+    if (!reserve_.empty()) {
+        for (auto& [reserved_size, slice] : reserve_) {
+            delete slice;
+        }
+        reserve_.clear();
+        for (auto& page : pages_) {
+            if (page->can_allocate(size, alignment)) {
+                return vk_own(page->allocate(size, alignment));
+            }
         }
     }
 
@@ -5858,7 +6398,7 @@ std::shared_ptr<MemorySlice> MemoryManager::allocate(std::uint64_t size, int ali
         next_page_capacity_ *= 2;
     }
 
-    return pages_.back()->allocate(size, alignment);
+    return vk_own(pages_.back()->allocate(size, alignment));
 }
 
 std::uint64_t MemoryManager::external_to_device(std::uint64_t external_ptr) const noexcept {
@@ -6029,14 +6569,14 @@ bool MemoryPage::can_allocate(std::uint64_t size, std::uint64_t alignment) const
     return allocator_->can_allocate(size + alignment - 1);
 }
 
-std::shared_ptr<MemorySlice> MemoryPage::allocate(std::uint64_t size, std::uint64_t alignment) {
+MemorySlice* MemoryPage::allocate(std::uint64_t size, std::uint64_t alignment) {
     auto device = device_.lock(); // get the device
     if (!device) {
         throw std::runtime_error("Page can not allocate memory in a disposed device");
     }
     const int offset = allocator_->allocate(size + alignment - 1);
     int aligned_offset = (offset + alignment - 1) & ~(alignment - 1);
-    return std::make_shared<MemorySlice>(device, shared_from_this(), offset, size + alignment - 1, aligned_offset, size);
+    return new MemorySlice(device, shared_from_this(), offset, size + alignment - 1, aligned_offset, size);
 }
 
 void MemoryPage::free_memory(std::uint64_t allocated_offset) noexcept {

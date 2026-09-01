@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 
 #include "device.hpp"
+#include "context.hpp"
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -290,6 +291,7 @@ PYBIND11_MODULE(vk, m) {
 		)
 		.def("load", &Buffer::load, py::arg("source"))
 		.def("save", &Buffer::save, py::arg("target"))
+		.def("memoryview", &Buffer::memoryview)
 		.def(
 			"cast",
 			py::overload_cast<Type>(&Buffer::cast, py::const_),
@@ -551,6 +553,12 @@ PYBIND11_MODULE(vk, m) {
 			py::arg("destination")
 		)
 		.def(
+			"transfer",
+			py::overload_cast<const std::shared_ptr<WrappedMemory>&, const std::shared_ptr<Image>&>(&CommandBuffer::transfer),
+			py::arg("source"),
+			py::arg("destination")
+		)
+		.def(
 			"set_pipeline",
 			&CommandBuffer::set_pipeline,
 			py::arg("pipeline")
@@ -758,13 +766,99 @@ PYBIND11_MODULE(vk, m) {
 		.def(
 			"bind",
 			[](DescriptorSet& self, py::kwargs kwargs) {
+				// A `name=[...]`/`name=(...)` array value: writes every
+				// element into consecutive array slots starting at
+				// `start_index`, in one call -- dispatches on the first
+				// element's type (Buffer/Image/Sampler/AccelerationStructure,
+				// or an (image, sampler) pair for a COMBINED_IMAGE_SAMPLER
+				// array), then casts every element to match.
+				auto bind_array = [](DescriptorSet& self, const std::string& name, const py::sequence& seq, int start_index) {
+					const auto n = static_cast<std::size_t>(py::len(seq));
+					if (n == 0) throw std::runtime_error("DescriptorSet::bind: '" + name + "' array must not be empty");
+					py::handle first = seq[0];
+					if (py::isinstance<py::tuple>(first)) {
+						std::vector<std::shared_ptr<Image>> images;
+						std::vector<std::shared_ptr<Sampler>> samplers;
+						images.reserve(n);
+						samplers.reserve(n);
+						for (auto item : seq) {
+							py::tuple pair = py::reinterpret_borrow<py::tuple>(item);
+							if (pair.size() != 2) {
+								throw std::runtime_error("DescriptorSet::bind: '" + name + "' array element must be an (image, sampler) pair");
+							}
+							images.push_back(pair[0].cast<std::shared_ptr<Image>>());
+							samplers.push_back(pair[1].cast<std::shared_ptr<Sampler>>());
+						}
+						self.bind(name, images, samplers, start_index);
+					} else if (py::isinstance<Buffer>(first)) {
+						std::vector<std::shared_ptr<Buffer>> buffers;
+						buffers.reserve(n);
+						for (auto item : seq) buffers.push_back(item.cast<std::shared_ptr<Buffer>>());
+						self.bind(name, buffers, start_index);
+					} else if (py::isinstance<Image>(first)) {
+						std::vector<std::shared_ptr<Image>> images;
+						images.reserve(n);
+						for (auto item : seq) images.push_back(item.cast<std::shared_ptr<Image>>());
+						self.bind(name, images, start_index);
+					} else if (py::isinstance<Sampler>(first)) {
+						std::vector<std::shared_ptr<Sampler>> samplers;
+						samplers.reserve(n);
+						for (auto item : seq) samplers.push_back(item.cast<std::shared_ptr<Sampler>>());
+						self.bind(name, samplers, start_index);
+					} else if (py::isinstance<AccelerationStructure>(first)) {
+						std::vector<std::shared_ptr<AccelerationStructure>> ads;
+						ads.reserve(n);
+						for (auto item : seq) ads.push_back(item.cast<std::shared_ptr<AccelerationStructure>>());
+						self.bind(name, ads, start_index);
+					} else {
+						throw std::runtime_error(
+							"DescriptorSet::bind: '" + name + "' array elements must be Buffer, Image, Sampler, "
+							"AccelerationStructure, or (image, sampler) pairs");
+					}
+				};
+
 				for (auto item : kwargs) {
 					const std::string name = item.first.cast<std::string>();
 					py::handle value = item.second;
-					if (py::isinstance<py::tuple>(value)) {
-						py::tuple pair = py::reinterpret_borrow<py::tuple>(value);
-						if (pair.size() != 2) throw std::runtime_error("DescriptorSet::bind: '" + name + "' tuple value must be (image, sampler)");
-						self.bind(name, pair[0].cast<std::shared_ptr<Image>>(), pair[1].cast<std::shared_ptr<Sampler>>());
+					const bool is_array_container = py::isinstance<py::list>(value) || py::isinstance<py::tuple>(value);
+					if (is_array_container) {
+						py::sequence seq = py::reinterpret_borrow<py::sequence>(value);
+						// (image, sampler): COMBINED_IMAGE_SAMPLER, index 0.
+						// (image, sampler, index): COMBINED_IMAGE_SAMPLER, explicit array slot.
+						// (resource, index): any other single resource, explicit array slot.
+						// ([...], start_index) / ((...), start_index): array, explicit start slot.
+						// [...] / (...): otherwise, an array of resources (or (image, sampler)
+						// pairs), written starting at slot 0.
+						// The seq[0]-is-an-Image check below (not just seq[1]-is-a-Sampler)
+						// is required to disambiguate an actual (image, sampler) pair from a
+						// plain 2-element array of Sampler resources (e.g. [sampler0,
+						// sampler1]) -- both have a Sampler in slot 1, but only the former
+						// also has an Image in slot 0.
+						if (seq.size() == 2 && py::isinstance<Image>(seq[0]) && py::isinstance<Sampler>(seq[1])) {
+							self.bind(name, seq[0].cast<std::shared_ptr<Image>>(), seq[1].cast<std::shared_ptr<Sampler>>());
+						} else if (seq.size() == 3 && py::isinstance<Image>(seq[0]) && py::isinstance<Sampler>(seq[1]) && py::isinstance<py::int_>(seq[2])) {
+							self.bind(name, seq[0].cast<std::shared_ptr<Image>>(), seq[1].cast<std::shared_ptr<Sampler>>(), seq[2].cast<int>());
+						} else if (seq.size() == 2 && py::isinstance<py::int_>(seq[1])
+							&& !py::isinstance<py::list>(seq[0]) && !py::isinstance<py::tuple>(seq[0])) {
+							py::handle resource = seq[0];
+							const int index = seq[1].cast<int>();
+							if (py::isinstance<Buffer>(resource)) {
+								self.bind(name, resource.cast<std::shared_ptr<Buffer>>(), index);
+							} else if (py::isinstance<Image>(resource)) {
+								self.bind(name, resource.cast<std::shared_ptr<Image>>(), index);
+							} else if (py::isinstance<Sampler>(resource)) {
+								self.bind(name, resource.cast<std::shared_ptr<Sampler>>(), index);
+							} else if (py::isinstance<AccelerationStructure>(resource)) {
+								self.bind(name, resource.cast<std::shared_ptr<AccelerationStructure>>(), index);
+							} else {
+								throw std::runtime_error("DescriptorSet::bind: unsupported resource type for '" + name + "'");
+							}
+						} else if (seq.size() == 2 && py::isinstance<py::int_>(seq[1])
+							&& (py::isinstance<py::list>(seq[0]) || py::isinstance<py::tuple>(seq[0]))) {
+							bind_array(self, name, py::reinterpret_borrow<py::sequence>(seq[0]), seq[1].cast<int>());
+						} else {
+							bind_array(self, name, seq, 0);
+						}
 					} else if (py::isinstance<Buffer>(value)) {
 						self.bind(name, value.cast<std::shared_ptr<Buffer>>());
 					} else if (py::isinstance<Image>(value)) {
@@ -854,6 +948,7 @@ PYBIND11_MODULE(vk, m) {
 			"descriptor_set",
 			&Pipeline::descriptor_set,
 			py::arg("set") = 0,
+			py::arg("variable_count") = -1,
 			py::return_value_policy::move
 		)
 		.def(
@@ -861,13 +956,19 @@ PYBIND11_MODULE(vk, m) {
 			&Pipeline::descriptor_set_collection,
 			py::arg("set") = 0,
 			py::arg("count") = 1,
+			py::arg("variable_count") = -1,
 			py::return_value_policy::move
 		)
 		.def_property_readonly("is_closed", &Pipeline::is_closed)
 		.def_property_readonly("device_index", &Pipeline::device_index);
 
+	py::class_<Caps>(m, "Caps")
+		.def_property_readonly("can_update_after_bind", &Caps::can_update_after_bind)
+		.def_property_readonly("supports_ray_queries", &Caps::supports_ray_queries);
+
 	py::class_<Device, std::shared_ptr<Device>>(m, "Device")
 		.def("dispose", &Device::dispose)
+		.def("caps", &Device::caps)
 		.def_property_readonly("index", &Device::device_index)
 		.def(
 			"create_tensor",
@@ -1011,26 +1112,289 @@ PYBIND11_MODULE(vk, m) {
 	m.def(
 		"device_infos",
 		[]() {
-			py::list result;
-			for (const auto& info : query_device_infos()) {
-				py::dict d;
-				d["index"] = info.index;
-				d["name"] = info.name;
-				d["vendor"] = info.vendor;
-				d["vendor_id"] = info.vendor_id;
-				d["device_id"] = info.device_id;
-				d["device_type"] = info.device_type;
-				d["api_version"] = info.api_version;
-				d["driver_version"] = info.driver_version;
-				d["vram_bytes"] = info.vram_bytes;
-				result.append(std::move(d));
+			// Memoized: physical devices don't come and go mid-process, and
+			// querying re-creates/destroys a throwaway Vulkan instance each
+			// time (see query_device_infos()), so repeat calls just replay
+			// the first result instead of paying that cost again.
+			static std::optional<py::list> cached;
+			if (!cached.has_value()) {
+				py::list result;
+				for (const auto& info : query_device_infos()) {
+					py::dict d;
+					d["index"] = info.index;
+					d["name"] = info.name;
+					d["vendor"] = info.vendor;
+					d["vendor_id"] = info.vendor_id;
+					d["device_id"] = info.device_id;
+					d["device_type"] = info.device_type;
+					d["api_version"] = info.api_version;
+					d["driver_version"] = info.driver_version;
+					d["vram_bytes"] = info.vram_bytes;
+					result.append(std::move(d));
+				}
+				cached = std::move(result);
 			}
-			return result;
+			return *cached;
 		},
 		"Enumerates every Vulkan-visible physical device (name, vendor, device_type, "
 		"api_version, driver_version, vram_bytes), without creating a logical Device for "
 		"any of them. `index` in each entry is what Device.create_device() (or, at the "
 		"pythonic layer, vk.device()) expects."
 	);
+
+	// ---- Context management (device()/engine() + every "current device"/
+	// "current engine" free function) - see context.hpp/context.cpp. ----
+
+	py::class_<vk_context::DeviceContext>(m, "_DeviceContext")
+		.def("__enter__", &vk_context::DeviceContext::enter, py::return_value_policy::reference_internal)
+		.def("__exit__", &vk_context::DeviceContext::exit);
+
+	py::class_<vk_context::EngineContext>(m, "_EngineContext")
+		.def("__enter__", &vk_context::EngineContext::enter, py::return_value_policy::reference_internal)
+		.def("__exit__", &vk_context::EngineContext::exit);
+
+	py::class_<vk_context::RecordingContext>(m, "_RecordingContext")
+		.def("__enter__", &vk_context::RecordingContext::enter)
+		.def("__exit__", &vk_context::RecordingContext::exit);
+
+	m.def(
+		"device",
+		&vk_context::device,
+		py::arg("device_index") = 0,
+		"Creates/activates the device at device_index as the current device. Used as a "
+		"context manager (`with vk.device(1): ...`), the previously active device is "
+		"restored on exit; used as a plain statement, the switch is permanent."
+	);
+
+	m.def(
+		"device_index",
+		&vk_context::current_device_index,
+		"The current/active device's index (activating device 0 first if device() was "
+		"never called)."
+	);
+
+	m.def(
+		"caps",
+		&vk_context::caps,
+		"Optional-feature support snapshot (Caps) of the current device (activating "
+		"device 0 first if device() was never called)."
+	);
+
+	m.def(
+		"engine",
+		&vk_context::engine,
+		py::arg("engine_type") = std::nullopt,
+		py::arg("engine_index") = 0,
+		"Creates/activates an engine on the current device as the current engine. "
+		"engine_type=None tries a combined GRAPHICS|COMPUTE engine first, falling back "
+		"to a plain COMPUTE engine if unsupported. Used as a context manager, the "
+		"previously active engine (for this device) is restored on exit."
+	);
+
+	m.def("dispose", &vk_context::dispose,
+		"Disposes the current device and drops it from the registry.");
+	m.def("relax", &vk_context::relax,
+		"Drops every reference this module keeps to created devices/engines, without "
+		"disposing them.");
+
+	m.def(
+		"tensor",
+		&vk_context::tensor,
+		py::arg("shape"),
+		py::arg("scalar_type"),
+		py::arg("location") = MemoryLocation::DEVICE,
+		py::return_value_policy::move,
+		"Creates a Tensor on the current device."
+	);
+
+	m.def(
+		"buffer",
+		&vk_context::buffer_of_type,
+		py::arg("elements"),
+		py::arg("element_type"),
+		py::arg("location") = MemoryLocation::DEVICE,
+		py::return_value_policy::move,
+		"Creates a Buffer of `elements` scalars of `element_type` on the current device."
+	);
+	m.def(
+		"buffer",
+		&vk_context::buffer_of_format,
+		py::arg("elements"),
+		py::arg("format"),
+		py::arg("location") = MemoryLocation::DEVICE,
+		py::return_value_policy::move,
+		"Creates a Buffer of `elements` texels of `format` on the current device."
+	);
+	m.def(
+		"buffer",
+		&vk_context::buffer_of_layout,
+		py::arg("elements"),
+		py::arg("layout"),
+		py::arg("location") = MemoryLocation::DEVICE,
+		py::return_value_policy::move,
+		"Creates a Buffer of `elements` instances of `layout` on the current device."
+	);
+
+	m.def(
+		"image",
+		&vk_context::image,
+		py::arg("width"),
+		py::arg("height") = 1,
+		py::arg("depth") = 1,
+		py::arg("mip_levels") = 1,
+		py::arg("array_layers") = 1,
+		py::arg("format") = Format::RGBA8_UNorm,
+		py::arg("location") = MemoryLocation::DEVICE,
+		py::return_value_policy::move,
+		"Creates a 1D/2D/3D Image on the current device."
+	);
+
+	m.def(
+		"depth_buffer_image",
+		&vk_context::depth_buffer_image,
+		py::arg("width"),
+		py::arg("height"),
+		py::arg("format") = Format::Depth32_Float,
+		py::arg("location") = MemoryLocation::DEVICE,
+		py::return_value_policy::move,
+		"Creates a 2D depth (or depth/stencil) attachment Image on the current device."
+	);
+
+	m.def(
+		"sampler",
+		&vk_context::sampler,
+		py::arg("mag_filter") = Filter::LINEAR,
+		py::arg("min_filter") = Filter::LINEAR,
+		py::arg("mipmap_mode") = MipmapMode::LINEAR,
+		py::arg("wrap_u") = WrapMode::REPEAT,
+		py::arg("wrap_v") = WrapMode::REPEAT,
+		py::arg("wrap_w") = WrapMode::REPEAT,
+		py::return_value_policy::move,
+		"Creates a texture Sampler on the current device."
+	);
+
+	m.def(
+		"ads",
+		&vk_context::ads,
+		py::arg("declaration"),
+		py::return_value_policy::move,
+		"Creates (sizes and allocates, but does not build) an acceleration structure on "
+		"the current device."
+	);
+
+	m.def(
+		"window",
+		&vk_context::window,
+		py::arg("width"),
+		py::arg("height"),
+		py::arg("title"),
+		py::arg("format"),
+		py::arg("frames_on_the_fly") = 3,
+		py::arg("vsync") = true,
+		py::return_value_policy::move,
+		"Creates a Window on the current device."
+	);
+
+	m.def(
+		"staging",
+		&vk_context::staging_for_buffer,
+		py::arg("buffer"),
+		py::arg("location") = MemoryLocation::HOST,
+		py::return_value_policy::move,
+		"Creates a plain, byte-addressable staging Buffer sized to match `buffer` on the "
+		"current device."
+	);
+	m.def(
+		"staging",
+		&vk_context::staging_for_image,
+		py::arg("image"),
+		py::arg("location") = MemoryLocation::HOST,
+		py::return_value_policy::move,
+		"Creates a plain, byte-addressable staging Buffer sized to match `image` on the "
+		"current device."
+	);
+
+	m.def(
+		"pipeline",
+		&vk_context::pipeline,
+		py::arg("type"),
+		py::return_value_policy::move,
+		"Creates a new, empty Pipeline of the given type on the current device."
+	);
+
+	m.def(
+		"wrap",
+		&vk_context::wrap,
+		py::arg("obj"),
+		py::arg("location") = MemoryLocation::DEVICE,
+		py::return_value_policy::move,
+		"Wraps an external object as a WrappedMemory on the current device."
+	);
+
+	m.def(
+		"load_scene",
+		&vk_context::load_scene,
+		py::arg("filename"),
+		py::arg("resolution_mode") = VertexResolutionMode::ByAllAttributes,
+		py::return_value_policy::move,
+		"Loads a scene file into device-resident Mesh buffers on the current device."
+	);
+
+	m.def(
+		"command_buffer",
+		&vk_context::command_buffer,
+		py::return_value_policy::move,
+		"Creates (or recycles) a command buffer on the current engine, ready for recording."
+	);
+
+	m.def(
+		"submit",
+		&vk_context::submit,
+		py::arg("command_buffers"),
+		py::return_value_policy::move,
+		"Submits one or more closed command buffers for execution on the current engine."
+	);
+
+	m.def("wait", &vk_context::wait,
+		"Blocks until every command previously submitted through the current engine has "
+		"finished executing on the GPU.");
+
+	m.def(
+		"transfer",
+		&vk_context::transfer,
+		py::arg("engine_index") = 0,
+		"Creates a temporary command buffer on a transfer engine, recording a transfer "
+		"operation into it - use as a context manager."
+	);
+	m.def(
+		"compute",
+		&vk_context::compute,
+		py::arg("engine_index") = 0,
+		"Creates a temporary command buffer on a compute|transfer engine, recording a "
+		"compute operation into it - use as a context manager."
+	);
+	m.def(
+		"graphics",
+		&vk_context::graphics,
+		py::arg("engine_index") = 0,
+		"Creates a temporary command buffer on a graphics|compute|transfer engine, "
+		"recording a graphics operation into it - use as a context manager."
+	);
+
+	// g_devices/g_active_device/g_active_engine (context.cpp) are plain C++
+	// statics now, not Python-owned objects the interpreter's own module-dict
+	// teardown would clear -- left alone, they're only destroyed by the CRT's
+	// process-wide static-destruction pass, which runs *after* Py_Finalize()
+	// has already torn down the interpreter, segfaulting the first time that
+	// destruction chain touches a live VkDevice/VkInstance. A capsule stashed
+	// in the module's own __dict__ is pybind11's documented fix (see "Module
+	// Destructors" in the pybind11 docs): CPython clears every module's
+	// __dict__ as one of the first steps of interpreter shutdown, so this
+	// capsule's destructor -- and the vk_context::relax() it runs -- fires
+	// while the interpreter (and this DLL) are still fully alive, tearing
+	// down every still-registered device/engine deterministically instead of
+	// leaving it to unspecified, cross-translation-unit static-destructor
+	// order.
+	m.add_object("_context_cleanup", py::capsule([]() { vk_context::relax(); }));
 }
 

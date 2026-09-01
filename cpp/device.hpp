@@ -744,6 +744,13 @@ public:
     // already sized to receive size() bytes).
     void save(const pybind11::object& target) const;
 
+    // Exposes this buffer's own bytes as a Python memoryview, with no copy
+    // -- only valid when this buffer is host-visible (a HOST buffer, or a
+    // host-visible DEVICE page): a DEVICE-only buffer has no CPU-
+    // dereferenceable pointer, so a memoryview over it would segfault the
+    // first time it's actually read/written from Python.
+    pybind11::object memoryview() const;
+
     vk::BufferView get_view();
     std::uint64_t device_ptr() const;
     std::uint64_t external_ptr() const;
@@ -845,6 +852,8 @@ public:
         NONE = 0,             // Directly mapped: no copy, ever.
         DLPACK = 1,           // Copy via `source`'s __dlpack__() export.
         BUFFER_PROTOCOL = 2,  // Copy via `source`'s buffer-protocol memory.
+        LIST = 3,             // Copy via an intermediate array.array mirroring a (mutable) list.
+        TUPLE = 4,            // Same as LIST, but write-back to the original object is rejected.
     };
 
     WrappedMemory(
@@ -855,7 +864,8 @@ public:
         std::shared_ptr<Buffer> owned_buffer,
         MemoryLocation owned_location,
         SourceKind source_kind,
-        pybind11::object source) noexcept;
+        pybind11::object source,
+        pybind11::object sequence_source) noexcept;
     WrappedMemory() = delete;
     WrappedMemory(const WrappedMemory&) = delete;
     WrappedMemory& operator=(const WrappedMemory&) = delete;
@@ -870,7 +880,10 @@ public:
     // Symmetric to make_cpu_dirty(): marks the GPU side (this wrap's own
     // device_ptr, e.g. after a shader wrote through it) as holding the
     // freshest data, so the next update_cpu() call will copy it back.
-    void make_gpu_dirty() noexcept;
+    // Throws std::runtime_error if the wrapped source is a tuple: it's
+    // immutable, so a later update_cpu() would have no way to write GPU
+    // data back into it (wrap a list instead if round-tripping is needed).
+    void make_gpu_dirty();
     // Copies GPU -> CPU (this wrap's temporary buffer back into the
     // wrapped Python object) only if the GPU side is currently the fresher
     // one; a no-op otherwise, and always a no-op for a direct mapping.
@@ -892,6 +905,16 @@ public:
     // directly: there is only one copy of the data, so dirty/update calls
     // have nothing to do.
     [[nodiscard]] bool is_direct() const noexcept { return source_kind_ == SourceKind::NONE; }
+
+    // The Buffer backing this wrap, for use as a CommandBuffer::transfer()
+    // source/destination to/from an Image. Available whenever this wrap
+    // owns (SourceKind::DLPACK/BUFFER_PROTOCOL/LIST/TUPLE) or directly
+    // aliases (a wrapped Buffer) an actual Buffer object -- i.e. every
+    // Device::wrap() source except a wrapped Tensor or a CUDA tensor
+    // reused zero-copy from one of our own buffers via DLPack, neither of
+    // which retains a citable Buffer object (only the raw device_ptr_).
+    // Used internally by CommandBuffer::transfer, not exposed to Python.
+    [[nodiscard]] std::shared_ptr<Buffer> vk_transfer_buffer() const;
 
     // DLPack export of device_ptr_ itself (not the original wrapped Python
     // object): resolves it back to its host/CUDA-visible pointer via
@@ -922,6 +945,13 @@ private:
     // forward-declared here) can't be a direct member of a class defined
     // in this header.
     std::unique_ptr<pybind11::object> source_;
+    // Non-null only for SourceKind::LIST/TUPLE: the original wrapped list/
+    // tuple, as opposed to `source_` (for these two kinds, the intermediate
+    // array.array update_cpu()/update_gpu() actually memcpy through). Reread
+    // to rebuild `source_` fresh on every update_gpu() (the list may have
+    // been mutated since), and written back into (LIST only) after every
+    // update_cpu().
+    std::unique_ptr<pybind11::object> sequence_source_;
     // Version counters implementing lazy CPU/GPU synchronization: whichever
     // side has the strictly higher counter is the one holding fresh data.
     // update_cpu()/update_gpu() copy from the fresher side into the stale
@@ -1186,6 +1216,11 @@ public:
     // every mip level/array layer `destination` covers, in the same
     // tightly-packed layout.
     void transfer(const std::shared_ptr<Buffer>& source, const std::shared_ptr<Image>& destination);
+    // Same as transfer(Buffer, Image) above, using the Buffer `source` is
+    // backed by (see WrappedMemory::vk_transfer_buffer()). Throws
+    // std::runtime_error if `source` has none (a wrapped Tensor, or a CUDA
+    // tensor reused zero-copy from one of our own buffers via DLPack).
+    void transfer(const std::shared_ptr<WrappedMemory>& source, const std::shared_ptr<Image>& destination);
 
     // Binds `pipeline` for subsequent bind()/dispatch_threads() (compute) or
     // draw commands (graphics). `pipeline` must already be closed. Keeps a
@@ -1527,6 +1562,14 @@ private:
  */
 class vk_Pipeline : public std::enable_shared_from_this<vk_Pipeline> {
 public:
+    // Reserved VkDescriptorSetLayoutBinding::descriptorCount (and matching
+    // descriptor pool reservation) for a binding declared with count == 0
+    // (see vk_layout()) -- Vulkan's VARIABLE_DESCRIPTOR_COUNT binding still
+    // needs a concrete upper bound at layout-creation time, even though the
+    // actual per-set count is only chosen later, at allocation
+    // (vk_allocate_descriptor_set()'s variable_count).
+    static constexpr std::uint32_t kUnboundedDescriptorCapacity = 1024;
+
     vk_Pipeline(std::weak_ptr<Device> device, PipelineType type);
     vk_Pipeline() = delete;
     vk_Pipeline(const vk_Pipeline&) = delete;
@@ -1592,7 +1635,13 @@ public:
     void vk_stack_size(int depth);
     void vk_close();
 
-    [[nodiscard]] vk::DescriptorSet vk_allocate_descriptor_set(int set);
+    // `variable_count` is only meaningful (and required, sentinel -1
+    // meaning "use the full reserved capacity") if `set`'s unbounded
+    // binding, if any (see vk_layout()'s count == 0), needs fewer than
+    // kUnboundedDescriptorCapacity slots actually allocated. Returns the
+    // allocated set together with the variable count actually used (0 if
+    // `set` has no unbounded binding).
+    [[nodiscard]] std::pair<vk::DescriptorSet, int> vk_allocate_descriptor_set(int set, int variable_count = -1);
     [[nodiscard]] const vk_DescriptorBinding& vk_binding(int layout_id) const;
     [[nodiscard]] vk::RenderPass vk_render_pass() const noexcept { return render_pass_; }
     [[nodiscard]] const std::vector<vk_AttachmentDesc>& vk_attachments() const noexcept { return attachments_; }
@@ -1783,13 +1832,18 @@ public:
         std::shared_ptr<Image> depth_image = nullptr);
 
     // Allocates a new descriptor set matching the layout declared for `set`
-    // via layout(). Pipeline must be closed first.
-    [[nodiscard]] std::shared_ptr<DescriptorSet> descriptor_set(int set = 0);
+    // via layout(). Pipeline must be closed first. `variable_count` sets
+    // how many slots of `set`'s unbounded binding (see layout()'s count ==
+    // 0) this particular set actually reserves; -1 (default) means "the
+    // full kUnboundedDescriptorCapacity reserved by the layout". Ignored
+    // if `set` has no unbounded binding.
+    [[nodiscard]] std::shared_ptr<DescriptorSet> descriptor_set(int set = 0, int variable_count = -1);
     // Allocates `count` independent descriptor sets matching the layout
     // declared for `set` -- e.g. one per object to draw/dispatch with its
     // own bindings, sharing the same Pipeline layout. Pipeline must be
-    // closed first.
-    [[nodiscard]] std::vector<std::shared_ptr<DescriptorSet>> descriptor_set_collection(int set = 0, int count = 1);
+    // closed first. `variable_count` is as in descriptor_set() above,
+    // applied to every set in the collection.
+    [[nodiscard]] std::vector<std::shared_ptr<DescriptorSet>> descriptor_set_collection(int set = 0, int count = 1, int variable_count = -1);
 
     [[nodiscard]] bool is_closed() const noexcept { return pipeline_->is_closed(); }
 
@@ -2460,7 +2514,12 @@ private:
  */
 class vk_DescriptorSet {
 public:
-    vk_DescriptorSet(std::weak_ptr<Device> device, std::shared_ptr<vk_Pipeline> pipeline, int set, vk::DescriptorSet descriptor_set) noexcept;
+    // `variable_count` is this specific set's actually-allocated capacity
+    // for its unbounded binding (see vk_Pipeline::vk_layout()'s count == 0),
+    // if it has one -- used in place of that binding's (sentinel 0)
+    // declared count by every vk_bind_*'s array-range check. Meaningless
+    // (and unused) if `set` has no unbounded binding.
+    vk_DescriptorSet(std::weak_ptr<Device> device, std::shared_ptr<vk_Pipeline> pipeline, int set, vk::DescriptorSet descriptor_set, int variable_count = 0) noexcept;
     vk_DescriptorSet() = delete;
     vk_DescriptorSet(const vk_DescriptorSet&) = delete;
     vk_DescriptorSet& operator=(const vk_DescriptorSet&) = delete;
@@ -2468,24 +2527,51 @@ public:
     vk_DescriptorSet& operator=(vk_DescriptorSet&& other) noexcept = delete;
     ~vk_DescriptorSet() noexcept = default;
 
-    void vk_bind_buffer(const std::string& name, const std::shared_ptr<Buffer>& buffer);
-    void vk_bind_image(const std::string& name, const std::shared_ptr<Image>& image);
+    // `index` is the dstArrayElement written to -- the slot within the
+    // binding's descriptor array (see Pipeline::layout()'s `count`); must
+    // be in [0, count).
+    void vk_bind_buffer(const std::string& name, const std::shared_ptr<Buffer>& buffer, int index = 0);
+    void vk_bind_image(const std::string& name, const std::shared_ptr<Image>& image, int index = 0);
     // Binding's declared type must be SAMPLER.
-    void vk_bind_sampler(const std::string& name, const std::shared_ptr<Sampler>& sampler);
+    void vk_bind_sampler(const std::string& name, const std::shared_ptr<Sampler>& sampler, int index = 0);
     // Binding's declared type must be COMBINED_IMAGE_SAMPLER.
-    void vk_bind_combined(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler);
+    void vk_bind_combined(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler, int index = 0);
     // Binding's declared type must be ACCELERATION_STRUCTURE.
-    void vk_bind_ads(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads);
+    void vk_bind_ads(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads, int index = 0);
+
+    // Array forms: write `resources.size()` consecutive slots, starting at
+    // `start_index`, in a single vkUpdateDescriptorSets call -- one
+    // VkWriteDescriptorSet with descriptorCount == resources.size(), rather
+    // than one call per element. `start_index + resources.size()` must be
+    // <= the binding's declared `count`.
+    void vk_bind_buffers(const std::string& name, const std::vector<std::shared_ptr<Buffer>>& buffers, int start_index = 0);
+    void vk_bind_images(const std::string& name, const std::vector<std::shared_ptr<Image>>& images, int start_index = 0);
+    // Binding's declared type must be SAMPLER.
+    void vk_bind_samplers(const std::string& name, const std::vector<std::shared_ptr<Sampler>>& samplers, int start_index = 0);
+    // Binding's declared type must be COMBINED_IMAGE_SAMPLER. `images` and
+    // `samplers` must be the same size (paired index by index).
+    void vk_bind_combined_array(
+        const std::string& name, const std::vector<std::shared_ptr<Image>>& images,
+        const std::vector<std::shared_ptr<Sampler>>& samplers, int start_index = 0);
+    // Binding's declared type must be ACCELERATION_STRUCTURE.
+    void vk_bind_ads_array(const std::string& name, const std::vector<std::shared_ptr<AccelerationStructure>>& ads, int start_index = 0);
     // Underlying vk::DescriptorSet. Used internally by
     // CommandBuffer::set_pipeline, not exposed to Python.
     [[nodiscard]] vk::DescriptorSet vk_handle() const noexcept { return descriptor_set_; }
     // Defined out-of-line in device.cpp: Device isn't a complete type yet here.
     [[nodiscard]] std::uint32_t device_index() const;
 private:
+    // binding.count == 0 (unbounded) resolves to variable_count_ instead,
+    // for every array-range check.
+    [[nodiscard]] int vk_effective_count(const vk_DescriptorBinding& binding) const noexcept {
+        return binding.count == 0 ? variable_count_ : binding.count;
+    }
+
     std::weak_ptr<Device> device_;
     std::shared_ptr<vk_Pipeline> pipeline_;
     int set_;
     vk::DescriptorSet descriptor_set_;
+    int variable_count_;
 };
 
 /**
@@ -2504,28 +2590,63 @@ public:
 
     // Writes `buffer` into the binding declared under `name` (via
     // Pipeline::layout()). The binding's declared type must be
-    // STORAGE_BUFFER or UNIFORM_BUFFER.
-    void bind(const std::string& name, const std::shared_ptr<Buffer>& buffer) { descriptor_set_->vk_bind_buffer(name, buffer); }
+    // STORAGE_BUFFER or UNIFORM_BUFFER. `index` selects the array slot for
+    // a `count > 1` binding (default 0; must be 0 for a non-array one).
+    void bind(const std::string& name, const std::shared_ptr<Buffer>& buffer, int index = 0) {
+        descriptor_set_->vk_bind_buffer(name, buffer, index);
+    }
     // Writes `image` into the binding declared under `name`. The binding's
     // declared type must be STORAGE_IMAGE (read/write, no sampler) or
     // SAMPLED_IMAGE (read-only, sampled in the shader via a separately-
     // bound SAMPLER at another binding -- see the other overload for a
-    // single combined binding instead).
-    void bind(const std::string& name, const std::shared_ptr<Image>& image) { descriptor_set_->vk_bind_image(name, image); }
+    // single combined binding instead). `index` selects the array slot for
+    // a `count > 1` binding (default 0; must be 0 for a non-array one).
+    void bind(const std::string& name, const std::shared_ptr<Image>& image, int index = 0) {
+        descriptor_set_->vk_bind_image(name, image, index);
+    }
     // Writes `sampler` into the binding declared under `name`. The
     // binding's declared type must be SAMPLER (paired with a separate
     // SAMPLED_IMAGE binding, e.g. GLSL `texture2D tex; sampler s;`).
-    void bind(const std::string& name, const std::shared_ptr<Sampler>& sampler) { descriptor_set_->vk_bind_sampler(name, sampler); }
+    // `index` selects the array slot for a `count > 1` binding (default 0;
+    // must be 0 for a non-array one).
+    void bind(const std::string& name, const std::shared_ptr<Sampler>& sampler, int index = 0) {
+        descriptor_set_->vk_bind_sampler(name, sampler, index);
+    }
     // Writes `image`+`sampler` together into the binding declared under
     // `name`. The binding's declared type must be COMBINED_IMAGE_SAMPLER
-    // (GLSL `sampler2D`).
-    void bind(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler) {
-        descriptor_set_->vk_bind_combined(name, image, sampler);
+    // (GLSL `sampler2D`). `index` selects the array slot for a `count > 1`
+    // binding (default 0; must be 0 for a non-array one).
+    void bind(const std::string& name, const std::shared_ptr<Image>& image, const std::shared_ptr<Sampler>& sampler, int index = 0) {
+        descriptor_set_->vk_bind_combined(name, image, sampler, index);
     }
     // Writes `ads` into the binding declared under `name`. The binding's
-    // declared type must be ACCELERATION_STRUCTURE.
-    void bind(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads) {
-        descriptor_set_->vk_bind_ads(name, ads);
+    // declared type must be ACCELERATION_STRUCTURE. `index` selects the
+    // array slot for a `count > 1` binding (default 0; must be 0 for a
+    // non-array one).
+    void bind(const std::string& name, const std::shared_ptr<AccelerationStructure>& ads, int index = 0) {
+        descriptor_set_->vk_bind_ads(name, ads, index);
+    }
+
+    // Array forms of the 5 overloads above: write every element of the
+    // given vector into consecutive array slots of the binding declared
+    // under `name`, starting at `start_index` (default 0), in one
+    // vkUpdateDescriptorSets call rather than one per element.
+    void bind(const std::string& name, const std::vector<std::shared_ptr<Buffer>>& buffers, int start_index = 0) {
+        descriptor_set_->vk_bind_buffers(name, buffers, start_index);
+    }
+    void bind(const std::string& name, const std::vector<std::shared_ptr<Image>>& images, int start_index = 0) {
+        descriptor_set_->vk_bind_images(name, images, start_index);
+    }
+    void bind(const std::string& name, const std::vector<std::shared_ptr<Sampler>>& samplers, int start_index = 0) {
+        descriptor_set_->vk_bind_samplers(name, samplers, start_index);
+    }
+    void bind(
+        const std::string& name, const std::vector<std::shared_ptr<Image>>& images,
+        const std::vector<std::shared_ptr<Sampler>>& samplers, int start_index = 0) {
+        descriptor_set_->vk_bind_combined_array(name, images, samplers, start_index);
+    }
+    void bind(const std::string& name, const std::vector<std::shared_ptr<AccelerationStructure>>& ads, int start_index = 0) {
+        descriptor_set_->vk_bind_ads_array(name, ads, start_index);
     }
 
     // Underlying vk_DescriptorSet. Used internally by
@@ -2557,6 +2678,34 @@ struct DeviceInfo {
 // is what Device::create_device() (or, at the Python level, vk.device())
 // expects.
 std::vector<DeviceInfo> query_device_infos();
+
+/**
+ * Snapshot of a Device's optional-feature support, queried once at device
+ * creation (see Device::vk_init()) -- exposed to Python as Device.caps()/
+ * vk.caps(). Growing this is meant to be cheap: add a field, a matching
+ * accessor, populate it in Device::vk_init(), thread it through Device::
+ * caps()'s constructor call, and bind the new property in bindings.cpp.
+ */
+class Caps {
+public:
+    explicit Caps(bool can_update_after_bind, bool supports_ray_queries) noexcept
+        : can_update_after_bind_(can_update_after_bind), supports_ray_queries_(supports_ray_queries) {}
+    Caps() = delete;
+
+    // Whether at least the descriptor types this library itself can
+    // declare (buffers, images) support VK_DESCRIPTOR_BINDING_UPDATE_AFTER_
+    // BIND_BIT -- see Pipeline::close(), which enables it per-binding
+    // wherever the specific descriptor type supports it, regardless of
+    // this aggregate flag.
+    [[nodiscard]] bool can_update_after_bind() const noexcept { return can_update_after_bind_; }
+    // Whether VK_KHR_ray_query (rayQueryEXT/traceRayInline in any shader
+    // stage, without a dedicated ray tracing pipeline) is supported and
+    // enabled.
+    [[nodiscard]] bool supports_ray_queries() const noexcept { return supports_ray_queries_; }
+private:
+    bool can_update_after_bind_;
+    bool supports_ray_queries_;
+};
 
 /**
  * Wraps a vk::Instance, a vk::Device and its associated resources, memory managers and engines.
@@ -2731,6 +2880,31 @@ public:
     [[nodiscard]] std::uint32_t vk_shader_group_handle_size() const noexcept { return shader_group_handle_size_; }
     [[nodiscard]] std::uint32_t vk_shader_group_handle_alignment() const noexcept { return shader_group_handle_alignment_; }
     [[nodiscard]] std::uint32_t vk_shader_group_base_alignment() const noexcept { return shader_group_base_alignment_; }
+    // Whether VK_KHR_ray_query was supported and enabled; requires
+    // vk_acceleration_structure_supported() as well (a ray query traces
+    // against a TLAS just like a ray tracing pipeline does).
+    [[nodiscard]] bool vk_ray_query_supported() const noexcept { return ray_query_supported_; }
+    // Per-descriptor-type VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+    // support (VkPhysicalDeviceVulkan12Features's descriptorBinding*
+    // UpdateAfterBind fields for the 4 descriptor-type families this
+    // library can declare a binding of, plus acceleration structures via
+    // its own separate feature bit); consulted per-binding by
+    // Pipeline::close() to opt each one into update-after-bind wherever
+    // its own descriptor type supports it.
+    [[nodiscard]] bool vk_uab_uniform_buffer_supported() const noexcept { return uab_uniform_buffer_supported_; }
+    [[nodiscard]] bool vk_uab_storage_buffer_supported() const noexcept { return uab_storage_buffer_supported_; }
+    // Also covers SAMPLER and COMBINED_IMAGE_SAMPLER: both are grouped
+    // under the same descriptorBindingSampledImageUpdateAfterBind feature.
+    [[nodiscard]] bool vk_uab_sampled_image_supported() const noexcept { return uab_sampled_image_supported_; }
+    [[nodiscard]] bool vk_uab_storage_image_supported() const noexcept { return uab_storage_image_supported_; }
+    [[nodiscard]] bool vk_uab_acceleration_structure_supported() const noexcept { return uab_acceleration_structure_supported_; }
+    // Snapshot of this device's optional-feature support -- see Caps.
+    [[nodiscard]] Caps caps() const noexcept {
+        return Caps(
+            uab_uniform_buffer_supported_ && uab_storage_buffer_supported_ &&
+                uab_sampled_image_supported_ && uab_storage_image_supported_,
+            ray_query_supported_);
+    }
 
     // Tracks `framebuffer` (a weak reference) so Device::dispose() can
     // proactively destroy it -- and the render pass/image views it
@@ -2823,6 +2997,12 @@ private:
     vk::Instance instance_;
     vk::PhysicalDevice physical_;
     vk::Device device_;
+    // Non-null iff enable_validation_layers was true and VK_EXT_debug_utils
+    // was supported; created right after instance_ in Device::Device(),
+    // destroyed in dispose(). See debug_utils_callback()'s comment
+    // (device.cpp) for why this exists instead of relying on the
+    // *_validation layer's own default reporting.
+    VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
     // See vk_dynamic_dispatch()'s comment; populated in vk_init().
     vk::DispatchLoaderDynamic dynamic_dispatch_;
     // Whether VK_KHR_external_semaphore plus the platform win32/fd
@@ -2846,6 +3026,17 @@ private:
     std::uint32_t shader_group_handle_size_ = 0;
     std::uint32_t shader_group_handle_alignment_ = 0;
     std::uint32_t shader_group_base_alignment_ = 0;
+    // Whether VK_KHR_ray_query was supported and enabled; see
+    // vk_ray_query_supported().
+    bool ray_query_supported_ = false;
+    // See vk_uab_uniform_buffer_supported()/vk_uab_storage_buffer_supported()/
+    // vk_uab_sampled_image_supported()/vk_uab_storage_image_supported()/
+    // vk_uab_acceleration_structure_supported().
+    bool uab_uniform_buffer_supported_ = false;
+    bool uab_storage_buffer_supported_ = false;
+    bool uab_sampled_image_supported_ = false;
+    bool uab_storage_image_supported_ = false;
+    bool uab_acceleration_structure_supported_ = false;
     vk::Semaphore interop_semaphore_;
     std::uint64_t interop_semaphore_value_ = 0;
     std::shared_ptr<MemoryManager> host_memory_manager_;
@@ -2950,7 +3141,7 @@ private:
  * Represents a manager of memory for a specific memory type.
  * Memory is reserved by pages and suballocations on them.
  */
-class MemoryManager {
+class MemoryManager : public std::enable_shared_from_this<MemoryManager> {
 public:
     MemoryManager(std::weak_ptr<Device> device, uint32_t memory_type_index, bool host_visible);
     ~MemoryManager() noexcept;
@@ -3007,11 +3198,38 @@ private:
     // copy). Returns 0 if unavailable for any reason.
     [[nodiscard]] std::uint64_t vk_interop_semaphore_handle() const;
 
+    // Deleter bound into every MemorySlice this manager hands out (see
+    // vk_own()): fired when the caller's last reference drops. Instead of
+    // unconditionally destroying the slice (freeing its bytes back to its
+    // page right away), it's handed into reserve_ so a later allocate()
+    // call for the exact same size can reuse this very object -- see
+    // allocate()'s fast path. Falls back to actually destroying it (`delete
+    // slice`, running ~MemorySlice() for real) if this manager itself no
+    // longer exists. A free function bound via a weak_ptr, not a plain
+    // member, so it stays safe to run after the manager is gone.
+    static void vk_reclaim(std::weak_ptr<MemoryManager> self, MemorySlice* slice) noexcept;
+    // Wraps a freshly (page-)allocated MemorySlice for handing out to a
+    // caller, its deleter bound to vk_reclaim so its eventual dispose feeds
+    // reserve_ instead of unconditionally freeing back to the page.
+    std::shared_ptr<MemorySlice> vk_own(MemorySlice* slice);
+
     std::weak_ptr<Device> device_;
     uint32_t memory_type_index_ = 0;
     bool host_visible_ = false;
     std::uint64_t next_page_capacity_ = 1 << 30; // Start with 1 GiB pages.
     std::vector<std::shared_ptr<MemoryPage>> pages_;
+    // Slices whose last external reference has already dropped, but that
+    // haven't been freed back to their page's allocator yet -- kept around
+    // on the chance the exact same size is requested again right after,
+    // which allocate() can then satisfy by simply handing this same object
+    // back out, skipping the page/allocator search entirely. Keyed by exact
+    // size (see vk_reclaim()); owned outright (raw, not shared_ptr -- reusing
+    // the same recycling deleter here would just put a "cleared" entry
+    // straight back in). Actually freed -- ~MemorySlice() running for real,
+    // returning the bytes to their page -- the moment no page can satisfy a
+    // request, right before growing/creating a new one (see allocate()), and
+    // at teardown (see ~MemoryManager()/vk_dispose_with()).
+    std::unordered_multimap<std::uint64_t, MemorySlice*> reserve_;
     std::shared_ptr<ExternalInteropLibraryImpl> interop_library_;
     ExternalImportFn try_import_memory_ = nullptr;
     mutable bool interop_semaphore_import_attempted_ = false;
@@ -3038,7 +3256,13 @@ public:
     MemoryPage& operator=(MemoryPage&&) = delete;
 
     bool can_allocate(std::uint64_t size, std::uint64_t alignment) const;
-    std::shared_ptr<MemorySlice> allocate(std::uint64_t size, std::uint64_t alignment);
+    // Returns a new, heap-owned MemorySlice (ownership transferred to the
+    // caller -- MemoryManager::allocate() is this method's only caller, and
+    // immediately wraps the result for its own reserve-aware bookkeeping;
+    // see MemoryManager::vk_own()). Not a shared_ptr: a plain make_shared()
+    // here would fix this slice's deleter at construction time, leaving no
+    // way for the manager to later rebind it to its own recycling deleter.
+    MemorySlice* allocate(std::uint64_t size, std::uint64_t alignment);
     void free_memory(std::uint64_t allocated_offset) noexcept;
 
     // Full capacity of this page.

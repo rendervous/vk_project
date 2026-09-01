@@ -74,6 +74,7 @@ from .vk import (
     ADSTriangles,
     Buffer,
     BoolState,
+    Caps,
     CommandBuffer,
     DescriptorSet,
     FloatState,
@@ -111,6 +112,7 @@ from .vk import (
 from ._context import (
     ads,
     buffer,
+    caps,
     command_buffer,
     depth_buffer_image,
     device,
@@ -177,6 +179,7 @@ __all__ = [
     "ADSTriangles",
     "Buffer",
     "BoolState",
+    "Caps",
     "CommandBuffer",
     "DescriptorSet",
     "FloatState",
@@ -212,6 +215,7 @@ __all__ = [
     # Device/engine context (vk._context)
     "ads",
     "buffer",
+    "caps",
     "command_buffer",
     "depth_buffer_image",
     "device",
